@@ -1550,8 +1550,6 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                             effort = "high"
                     elif agent == "codex":
                         effort = "xhigh"
-                    elif agent == "openhands":
-                        effort = "high"  # CLI mode default
 
                 # Detect context window from agent_stats.json modelUsage.
                 # Codex CLI reports the *compressed* context window (95% of the

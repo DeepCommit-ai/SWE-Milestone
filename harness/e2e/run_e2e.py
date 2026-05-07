@@ -1890,7 +1890,7 @@ Example:
         "--reasoning-effort",
         default=None,
         choices=["low", "medium", "high", "xhigh", "max", "none", "off"],
-        help="Reasoning effort (low|medium|high|xhigh|max). Use 'none' or 'off' to explicitly disable for upstreams that reject reasoning_effort (e.g. Moonshot kimi via OpenRouter returns HTTP 400 UnsupportedParamsError). Default: unset → agent uses model's built-in default (e.g. opus-4-7=xhigh, sonnet/opus-4-6=high; OpenHands auto-disables for kimi/moonshot). For claude-code, also passed via CLAUDE_CODE_EFFORT_LEVEL env to work around upstream bug #41028.",
+        help="Reasoning effort (low|medium|high|xhigh|max). Use 'none' or 'off' to explicitly disable the parameter. Default: unset → the agent uses the model/provider default. For claude-code, also passed via CLAUDE_CODE_EFFORT_LEVEL env to work around upstream bug #41028.",
     )
 
     # Config

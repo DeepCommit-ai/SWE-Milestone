@@ -48,7 +48,6 @@ class AgentRunner:
         log_dir: Optional[Path] = None,
         agent_name: str = "claude-code",
         reasoning_effort: Optional[str] = None,
-        use_sdk: bool = False,
         include_directories: Optional[list[str]] = None,
         drop_params: bool = False,
         api_router: bool = False,
@@ -63,7 +62,6 @@ class AgentRunner:
             log_dir: Directory for logs (agent_prompt.txt, agent_stdout.txt, etc.)
             agent_name: Agent framework name (e.g., "claude-code")
             reasoning_effort: Reasoning effort level for Codex ("low", "medium", "high")
-            use_sdk: For OpenHands, use SDK mode instead of CLI mode
             include_directories: Extra directories for agent (e.g., ["/e2e_workspace"])
             drop_params: Deprecated, use api_router instead.
             api_router: If True, don't pass *_BASE_URL env vars to docker exec
@@ -84,8 +82,6 @@ class AgentRunner:
             framework_kwargs["model"] = model
         if reasoning_effort:
             framework_kwargs["reasoning_effort"] = reasoning_effort
-        if use_sdk:
-            framework_kwargs["use_sdk"] = use_sdk
         if include_directories:
             framework_kwargs["include_directories"] = include_directories
 
