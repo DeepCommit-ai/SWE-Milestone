@@ -843,11 +843,8 @@ class OpenHandsLogParser(AgentLogParser):
                 event = json.loads(event_file.read_text(encoding="utf-8"))
                 event_kind = event.get("kind", "")
 
-                # Track timestamps as true min/max — events are walked in lexicographic
-                # path order, which does not match chronological order across resumed
-                # sessions (each session restarts numbering at event-00000 and session
-                # UUIDs sort arbitrarily). Using min/max keeps the duration positive
-                # regardless of iteration order.
+                # Track min/max — events are walked in lex path order, which is not
+                # chronological across resumed sessions.
                 timestamp = self._parse_timestamp(event.get("timestamp"))
                 if timestamp:
                     if first_timestamp is None or timestamp < first_timestamp:
