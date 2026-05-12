@@ -265,3 +265,6 @@ trial_configs/*
 !trial_configs/codex_gpt-5.4.yaml
 !trial_configs/codex_gpt-5.5.yaml
 .evoclaw/
+
+# Ad-hoc analysis notes (not for source control)
+docs/openhands_analysis/
