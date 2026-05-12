@@ -48,6 +48,30 @@ escape_regex() {
     printf '%s' "$1" | sed 's/[.[\(*^$+?{|\\]/\\&/g'
 }
 
+# ── Scan a directory for likely API key patterns ─────────────────────────────
+# Returns 0 if clean, 1 if any pattern matched. Prints offending files to stderr.
+check_no_api_keys() {
+    local DIR="$1"
+    local matches
+    matches=$(grep -rEln \
+        --include='*.json' --include='*.jsonl' --include='*.yaml' --include='*.yml' \
+        --include='*.csv' --include='*.log' --include='*.md' --include='*.txt' \
+        -e 'sk-[a-zA-Z0-9]{20,}' \
+        -e 'sk-ant-[a-zA-Z0-9_-]{20,}' \
+        -e 'AIzaSy[a-zA-Z0-9_-]{20,}' \
+        -e 'hf_[a-zA-Z0-9]{30,}' \
+        -e '[Bb]earer[[:space:]]+[a-zA-Z0-9_.-]{20,}' \
+        -e 'x-api-key["[:space:]:=]+[a-zA-Z0-9_-]{20,}' \
+        -e '(ANTHROPIC|OPENAI|GOOGLE|GEMINI|HF|HUGGINGFACE|MISTRAL|GROQ|OPENROUTER|DEEPSEEK|MOONSHOT|ZHIPU|GLM)_API_KEY["[:space:]:=]+[a-zA-Z0-9_-]{10,}' \
+        "$DIR" 2>/dev/null || true)
+    if [[ -n "$matches" ]]; then
+        echo "  ABORT: Potential API key patterns detected in:" >&2
+        echo "$matches" | sed 's|^|    |' >&2
+        return 1
+    fi
+    return 0
+}
+
 # ── Rename text references inside a directory ────────────────────────────────
 rename_refs() {
     local DIR="$1"
@@ -111,6 +135,13 @@ migrate_one() {
         "$SRC_DIR/" "$DST_DIR/"
     echo "  Copied."
 
+    # Step 1.5: Safety scan — refuse to keep destination if API keys leaked in
+    if ! check_no_api_keys "$DST_DIR"; then
+        echo "  Cleaning up: rm -rf $DST_DIR" >&2
+        rm -rf "$DST_DIR"
+        return 1
+    fi
+
     # Step 2: Rename in text files
     if [[ "$OLD_NAME" != "$NEW_NAME" ]]; then
         rename_refs "$DST_DIR" "$OLD_NAME" "$NEW_NAME"
@@ -154,6 +185,12 @@ if [[ "$1" == "--rename" ]]; then
     echo "  New name:  $NEW_NAME"
     echo "  New path:  $NEW_DIR"
     echo ""
+
+    # Step 0: Safety scan — refuse to rename if API keys are present
+    if ! check_no_api_keys "$TRIAL_DIR"; then
+        echo "ERROR: Refusing to rename due to potential API keys above." >&2
+        exit 1
+    fi
 
     # Step 1: Rename folder
     mv "$TRIAL_DIR" "$NEW_DIR"
