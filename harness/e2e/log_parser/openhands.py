@@ -843,12 +843,14 @@ class OpenHandsLogParser(AgentLogParser):
                 event = json.loads(event_file.read_text(encoding="utf-8"))
                 event_kind = event.get("kind", "")
 
-                # Track timestamps
+                # Track min/max — events are walked in lex path order, which is not
+                # chronological across resumed sessions.
                 timestamp = self._parse_timestamp(event.get("timestamp"))
                 if timestamp:
-                    if first_timestamp is None:
+                    if first_timestamp is None or timestamp < first_timestamp:
                         first_timestamp = timestamp
-                    last_timestamp = timestamp
+                    if last_timestamp is None or timestamp > last_timestamp:
+                        last_timestamp = timestamp
 
                 # Count ActionEvent for tool call breakdown (not turns - turns = LLM API calls)
                 if event_kind == "ActionEvent":
