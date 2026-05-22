@@ -130,9 +130,10 @@ class TestIdNormalizer:
         if "_" in s or "-" in s:
             return False
 
-        # Starts with test/Test/benchmark/Benchmark? Probably meaningful
+        # Starts with a Go test-function prefix (Test/Benchmark/Fuzz/Example)? Probably meaningful.
         lower = s.lower()
-        if lower.startswith("test") or lower.startswith("benchmark"):
+        if (lower.startswith("test") or lower.startswith("benchmark")
+                or lower.startswith("fuzz") or lower.startswith("example")):
             return False
 
         # Looks random!

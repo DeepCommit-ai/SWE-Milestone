@@ -321,6 +321,30 @@ def parse_go_test_jsonl(jsonl_path: Path) -> GoTestSummary:
                 packages[package].action = action
                 packages[package].elapsed = elapsed
 
+    # Some benchmarks emit their `BenchmarkName-N` header and timing payload
+    # in two separate Output events (go test flushes between them when the
+    # benchmark runs long enough). Per-line regex matching misses these.
+    # Recover them here by concatenating all output for any Benchmark* test
+    # that wasn't already captured as a benchmark result.
+    for test_key, test_result in current_tests.items():
+        if not test_result.test_name.startswith("Benchmark"):
+            continue
+        benchmark_key = f"{test_result.package}/{test_result.test_name}"
+        if benchmark_key in benchmark_results:
+            continue
+        combined = "".join(test_result.output_lines)
+        for fragment in combined.split("\n"):
+            benchmark_match = benchmark_pattern.match(fragment.strip())
+            if benchmark_match:
+                benchmark_results[benchmark_key] = GoTestResult(
+                    package=test_result.package,
+                    test_name=test_result.test_name,
+                    action="pass",
+                    elapsed=0.0,
+                    output_lines=list(test_result.output_lines),
+                )
+                break
+
     # Add benchmark results to test results
     for benchmark_key, benchmark_result in benchmark_results.items():
         # Only add benchmarks that don't already exist as regular tests
