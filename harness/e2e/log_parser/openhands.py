@@ -4,12 +4,12 @@ import json
 import logging
 import subprocess
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
+from harness.e2e.log_parser.models import NativeUsageUnit, SessionInfo, ToolCallRecord, TrialStats
 from harness.e2e.pricing import resolve_pricing as _resolve_pricing_shared
 
 logger = logging.getLogger(__name__)
@@ -566,15 +566,29 @@ class OpenHandsLogParser(AgentLogParser):
 
         try:
             if isinstance(timestamp_val, (int, float)):
-                return datetime.fromtimestamp(timestamp_val)
+                return datetime.fromtimestamp(timestamp_val, tz=timezone.utc).replace(tzinfo=None)
             else:
-                # Handle ISO format
                 ts_str = str(timestamp_val)
-                # Remove timezone suffix
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts.tzinfo is not None:
+                    return ts.astimezone(timezone.utc).replace(tzinfo=None)
                 return ts.replace(tzinfo=None)
-        except (ValueError, OSError):
+        except (TypeError, ValueError, OSError, OverflowError):
             return None
+
+    @staticmethod
+    def _conversation_ids_from_event_files(log_dir: Path, event_files: List[Path]) -> set:
+        conversation_ids = set()
+        for event_file in event_files:
+            try:
+                parent = event_file.parent
+                if parent.name == "events" and parent.parent != log_dir:
+                    conversation_ids.add(parent.parent.name)
+                else:
+                    conversation_ids.add(parent.name)
+            except Exception:
+                continue
+        return {sid for sid in conversation_ids if sid}
 
     def parse_tool_results(
         self,
@@ -827,7 +841,6 @@ class OpenHandsLogParser(AgentLogParser):
         total_cost = 0.0
         total_turns = 0
         model_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
-        session_count = 1  # We're parsing a single session's logs
         tool_calls: List[Dict[str, Any]] = []
         tool_call_breakdown: Dict[str, int] = defaultdict(int)
         first_timestamp = None
@@ -837,6 +850,8 @@ class OpenHandsLogParser(AgentLogParser):
         event_files = sorted(log_dir.rglob("event-*.json"))
         if not event_files:
             return {}
+        conversation_ids = self._conversation_ids_from_event_files(log_dir, event_files)
+        session_count = len(conversation_ids) if conversation_ids else 1
 
         for event_file in event_files:
             try:
@@ -976,6 +991,7 @@ class OpenHandsLogParser(AgentLogParser):
                 return bool(json.loads(ef.read_text(encoding="utf-8")).get("llm_response_id"))
             except Exception:
                 return False
+
         actual_llm_calls = sum(1 for ef in event_files if _has_llm_response(ef)) if event_files else 0
 
         if actual_llm_calls > total_turns * 2:
@@ -1030,7 +1046,7 @@ class OpenHandsLogParser(AgentLogParser):
             total_duration_ms = int((last_timestamp - first_timestamp).total_seconds() * 1000)
 
         logger.info(
-            f"Parsed raw logs: {session_count} session, {total_turns} turns, "
+            f"Parsed raw logs: {session_count} sessions, {total_turns} turns, "
             f"${total_cost:.4f}, {len(tool_calls)} tool calls, {total_duration_ms}ms"
         )
 
@@ -1039,7 +1055,7 @@ class OpenHandsLogParser(AgentLogParser):
             "total_turns": total_turns,
             "modelUsage": {k: dict(v) for k, v in model_usage.items()},
             "session_count": session_count,
-            "unique_session_count": session_count,
+            "unique_session_count": len(conversation_ids) if conversation_ids else session_count,
             "duration_ms": total_duration_ms,
             "tool_calls": tool_calls,
             "tool_call_breakdown": dict(tool_call_breakdown),
@@ -1112,9 +1128,10 @@ class OpenHandsLogParser(AgentLogParser):
             # Track timestamps for duration calculation
             timestamp = self._parse_timestamp(event.get("timestamp"))
             if timestamp:
-                if first_timestamp is None:
+                if first_timestamp is None or timestamp < first_timestamp:
                     first_timestamp = timestamp
-                last_timestamp = timestamp
+                if last_timestamp is None or timestamp > last_timestamp:
+                    last_timestamp = timestamp
 
             # Count ActionEvent for tool call breakdown (not turns - turns = LLM API calls)
             # OpenHands CLI uses "kind": "ActionEvent" with nested "action" object
@@ -1224,19 +1241,22 @@ class OpenHandsLogParser(AgentLogParser):
         Returns:
             Complete TrialStats object
         """
-        # Use duration from stdout_stats
-        duration_ms = stdout_stats.get("duration_ms", 0)
-
-        # Calculate start/end time based on duration
-        end_time = datetime.now()
-        start_time = end_time - timedelta(milliseconds=duration_ms) if duration_ms > 0 else end_time
+        # Derive real trial bounds from parsed tool calls. Raw OpenHands stats
+        # may include resume gaps; they are only a fallback when no timestamps exist.
+        timed_tool_calls = [tc for tc in tool_calls if tc.timestamp]
+        if timed_tool_calls:
+            start_time = min(tc.timestamp for tc in timed_tool_calls)
+            end_time = max(tc.timestamp for tc in timed_tool_calls)
+        else:
+            end_time = datetime.now()
+            start_time = end_time
 
         # Compute tool call breakdown
-        tool_call_breakdown = stdout_stats.get("tool_call_breakdown", {})
+        tool_call_breakdown = {}
+        for tc in tool_calls:
+            tool_call_breakdown[tc.name] = tool_call_breakdown.get(tc.name, 0) + 1
         if not tool_call_breakdown:
-            tool_call_breakdown = {}
-            for tc in tool_calls:
-                tool_call_breakdown[tc.name] = tool_call_breakdown.get(tc.name, 0) + 1
+            tool_call_breakdown = stdout_stats.get("tool_call_breakdown", {})
 
         # Count subagent calls
         total_subagent_calls = sum(1 for tc in tool_calls if tc.is_subagent)
@@ -1298,12 +1318,12 @@ class OpenHandsLogParser(AgentLogParser):
         if not sessions:
             sessions = self.detect_sessions_from_tool_calls(tool_calls)
 
-        # Derive session counts from session_history (authoritative) when
-        # available — stdout-based counts can miss sessions whose output was
-        # lost after process restart.
-        if sessions and any(s.session_id for s in sessions):
+        # Prefer parsed sessions even when they come from gap detection; raw
+        # OpenHands stats can undercount resumed conversations.
+        if sessions:
             session_count = len(sessions)
-            unique_session_count = len(set(s.session_id for s in sessions if s.session_id))
+            session_ids = {s.session_id for s in sessions if s.session_id}
+            unique_session_count = len(session_ids) if session_ids else len(sessions)
         else:
             session_count = stdout_stats.get("session_count", 0)
             unique_session_count = stdout_stats.get("unique_session_count", stdout_stats.get("session_count", 0))
@@ -1314,6 +1334,12 @@ class OpenHandsLogParser(AgentLogParser):
         # Classify verification events from Bash tool calls (independent)
         verification_events = self._build_verification_events(tool_calls)
 
+        wall_clock_ms = int((end_time - start_time).total_seconds() * 1000) if start_time and end_time else 0
+        if sessions:
+            duration_ms = sum(s.duration_ms for s in sessions)
+        else:
+            duration_ms = wall_clock_ms or stdout_stats.get("duration_ms", 0)
+
         return TrialStats(
             trial_name=trial_name,
             agent_framework=self.FRAMEWORK_NAME,
@@ -1321,7 +1347,7 @@ class OpenHandsLogParser(AgentLogParser):
             start_time=start_time,
             end_time=end_time,
             duration_ms=duration_ms,
-            wall_clock_ms=duration_ms,  # For OpenHands, API latency is the best we have
+            wall_clock_ms=wall_clock_ms,
             total_cost_usd=stdout_stats.get("total_cost_usd", 0.0),
             total_turns=stdout_stats.get("total_turns", 0),
             total_tool_calls=len(tool_calls),
