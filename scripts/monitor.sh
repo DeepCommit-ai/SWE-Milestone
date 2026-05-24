@@ -103,7 +103,12 @@ if [[ ${#TRIAL_NAMES[@]} -eq 0 ]]; then
     # Auto-detect: find all trial directories across repos
     FOUND_TRIALS=()
     for repo_dir in "$DATA_ROOT"/*/; do
-        [[ ! -f "$repo_dir/metadata.json" ]] && continue
+        # Treat dir as a repo if it has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
+        if [[ ! -f "$repo_dir/metadata.json" ]] \
+           && [[ ! -d "$repo_dir/e2e_trial" ]] \
+           && [[ ! -d "$repo_dir/mstone_trial" ]]; then
+            continue
+        fi
         trial_base="$repo_dir/e2e_trial"
         [[ ! -d "$trial_base" ]] && continue
         for trial_dir in "$trial_base"/*/; do
@@ -162,10 +167,14 @@ done
 # ─────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 
-# Discover repos (directories with metadata.json)
+# Discover repos: has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
 REPO_ENTRIES=""
 for repo_dir in "$DATA_ROOT"/*/; do
-    [[ ! -f "$repo_dir/metadata.json" ]] && continue
+    if [[ ! -f "$repo_dir/metadata.json" ]] \
+       && [[ ! -d "$repo_dir/e2e_trial" ]] \
+       && [[ ! -d "$repo_dir/mstone_trial" ]]; then
+        continue
+    fi
     repo_name=$(basename "$repo_dir")
 
     # If --repos specified, filter
