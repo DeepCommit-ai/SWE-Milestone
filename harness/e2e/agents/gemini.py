@@ -91,7 +91,14 @@ class GeminiFramework(AgentFramework):
         # SSE and breaks gemini-cli's stream parser). run_all.py supplies these.
         self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
         self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
-        # Ignore unsupported kwargs like reasoning_effort
+        # gemini-cli runs thinkingLevel HIGH (dynamic budget, thinkingBudget=-1)
+        # by default and only exposes a thinking on/off toggle — there are no
+        # graded levels and no CLI/settings knob to set one in this version. So
+        # the harness reasoning_effort here is normalized to gemini's range:
+        # default and maximum is "high" (xhigh/max collapse to high); thinking
+        # stays on at the model's native HIGH. Recorded for reporting/parity.
+        _eff = (kwargs.get("reasoning_effort") or "high").lower()
+        self._reasoning_effort = "high" if _eff in ("high", "xhigh", "max") else _eff
 
     def get_container_mounts(self) -> List[str]:
         """Return Docker volume mount arguments for Gemini.

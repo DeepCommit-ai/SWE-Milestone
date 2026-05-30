@@ -1564,6 +1564,11 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                         effort = "xhigh"
                     elif agent == "openhands":
                         effort = "high"  # CLI mode default
+                    elif agent == "gemini-cli":
+                        # gemini-cli runs thinkingLevel HIGH (dynamic budget) by
+                        # default and has no graded levels (only thinking on/off),
+                        # so HIGH is its built-in and maximum reasoning level.
+                        effort = "high"
 
                 # Detect context window from agent_stats.json modelUsage.
                 # Codex CLI reports the *compressed* context window (95% of the
