@@ -49,14 +49,6 @@ timeout: 18000
 # model call (HAIKU/SONNET/OPUS/SUBAGENT).
 # default_haiku_model: glm-5.1
 
-# Deploy the vendored claude-code-router-py inside the container to
-# translate between Anthropic Messages API and OpenAI chat/completions
-# format. Only applies to claude-code agent. Use when running Claude Code
-# against non-Anthropic models (e.g., GLM, GPT, Kimi) through an
-# OpenAI-compatible endpoint. You do NOT need this when using Claude Code
-# with its native model.
-# api_router: true
-
 # ─── Vertex AI (gemini-cli only) ─────────────────────────
 # Route gemini-cli to Google Vertex AI Gemini models. Vertex authenticates with
 # ADC (OAuth), not an API key, so do NOT set UNIFIED_API_KEY / UNIFIED_BASE_URL.

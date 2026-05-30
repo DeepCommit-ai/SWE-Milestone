@@ -12,6 +12,5 @@ model: kimi-k2.6
 # api.kimi.com/coding.
 default_haiku_model: kimi-k2.6
 timeout: 18000
-# No api_router — endpoint is Anthropic-native + supports context_management
-# beta header server-side. This is the point of using api.kimi.com/coding
-# instead of going through OpenRouter.
+# Endpoint is Anthropic-native + supports the context_management beta header
+# server-side — the point of using api.kimi.com/coding instead of OpenRouter.

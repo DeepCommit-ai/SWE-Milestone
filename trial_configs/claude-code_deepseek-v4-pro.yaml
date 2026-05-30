@@ -15,5 +15,5 @@ default_haiku_model: accounts/fireworks/models/deepseek-v4-pro
 reasoning_effort: max
 timeout: 18000
 
-# Fireworks provides an Anthropic-compatible API, so Claude Code can talk to it
-# directly. Leave api_router off to avoid Anthropic <-> OpenAI translation.
+# Fireworks provides an Anthropic-compatible API, so Claude Code talks to it
+# directly — no translation layer needed.

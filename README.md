@@ -163,10 +163,6 @@ python scripts/run_all.py --config trial_config.yaml
 
 > **Resume requires the container to still exist.** All of the agent's in-progress work — code changes, git history, and Claude's conversation memory — lives inside the container, with no copy on the host. If the container is deleted, the whole trial's working state is lost and only `--force` (restart from scratch) is available. Source snapshots of already-evaluated milestones are preserved on the host under `evaluation/`, so prior scores survive, and the full agent logs are copied to the host directory when the trial finishes.
 
-**3. `api_router` is currently unstable for long trials**
-
-The `api_router` path (translating Anthropic ↔ OpenAI so Claude Code can talk to third-party models) is not recommended for full benchmark runs today — context tends to grow past the upstream's body limit on long sessions and some reasoning-model upstreams reject key Anthropic body fields.
-
 ## 🤝 Contributing
 
 We welcome contributions! Whether it's adding support for new agents, new task domains, new datasets, bug fixes, or documentation improvements.
