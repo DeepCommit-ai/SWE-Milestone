@@ -117,18 +117,20 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 A 200 means the model is reachable; 404 means wrong id/location or no access.
 
-## Caveat: context caching is weak on the global endpoint
+## Cost: driven by context volume, not caching
 
-gemini-cli relies on Gemini's **implicit** caching (it does not create explicit
-`CachedContent`). On the **`global`** endpoint, capacity-aware routing spreads
-consecutive requests across data centers, so the per-DC implicit KV cache is
-reused inconsistently — measured cache-hit rate ~48% (a controlled back-to-back
-test saw 0%), vs ~90% for gemini-cli on AI Studio. Pinning to a fixed *regional*
-endpoint normally fixes this, but models that are **global-only** (e.g.
-gemini-3.5-flash) can't be pinned. This only inflates **cost**, not scores. We
-deliberately do **not** add an explicit-caching layer — that would make the
-benchmark measure "gemini-cli + our cache layer" instead of gemini-cli as it
-ships, breaking parity with the other agents.
+gemini-cli relies on Gemini's **implicit** caching (no explicit `CachedContent`),
+and it works well on the `global` endpoint for real multi-turn runs — measured
+cache hit ~**90%** across a full 7-repo trial (`cached/input`; note Gemini's
+`cached` is a subset of `input`). So caching is **not** the cost lever.
+
+What drives cost is **context length per call**: gemini-cli lets the conversation
+grow to the ~700k-token window cap and rarely compacts, so each of ~95 turns per
+milestone re-sends a ~290k-token prompt; ~96% of spend is prompt tokens (even at
+~90% cache). The lever for cheaper runs is context **compaction/summarization**,
+not the cache rate. This affects **cost only, not scores**, and we deliberately
+do not add a custom caching/optimization layer (it would break benchmark parity
+with the other agents, which run with only their own native behavior).
 
 ## Operational notes
 
