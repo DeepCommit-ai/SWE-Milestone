@@ -257,7 +257,9 @@ trial_config.yaml
 # descends into the directory — a trailing-slash directory pattern would
 # suppress the `!` whitelist entries.
 trial_configs/*
+!trial_configs/gemini-cli_gemini-3.5-flash.yaml
 !trial_configs/claude-code_glm-5.1.yaml
+!trial_configs/claude-code_deepseek-v4-pro.yaml
 !trial_configs/claude-code_kimi-k2.6.yaml
 !trial_configs/claude-code_opus-4.6.yaml
 !trial_configs/claude-code_opus-4.7-1m.yaml

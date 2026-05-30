@@ -1,0 +1,18 @@
+data_root: /data2/gangda/EvoClaw-data
+trial_name: gemini-cli_gemini-3.5-flash
+agent: gemini-cli
+
+# Vertex AI mode. gemini-cli talks to the auto-managed LiteLLM bridge using the
+# native Gemini API (GOOGLE_GEMINI_BASE_URL → bridge, GEMINI_API_KEY → bridge
+# master key, both wired by run_all.py). Native Gemini means Vertex implicit
+# caching applies — no Anthropic cache_control translation loss. Auth is ADC
+# (gcloud auth application-default login), held by the bridge on the host.
+# Just run:  python scripts/run_all.py --config trial_configs/gemini-cli_gemini-3.5-flash.yaml
+# See docs/vertex-ai.md.
+model: gemini-3.5-flash
+vertex_ai: true
+vertex_location: global          # gemini-3.5-flash is served in `global`, not regional
+
+timeout: 18000
+# gemini-3.5-flash is a thinking model; reasoning depth is managed by the model
+# (no explicit effort flag for gemini-cli — defaults used per request).

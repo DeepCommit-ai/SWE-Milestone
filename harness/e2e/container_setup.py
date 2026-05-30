@@ -5,6 +5,7 @@ run_milestone.py (single milestone mode) and orchestrator.py (E2E mode).
 """
 
 import logging
+import os
 import socket
 import subprocess
 import time
@@ -27,9 +28,14 @@ WHITELISTED_DOMAINS = [
     "sentry.io",
     "api.openai.com",
     "generativelanguage.googleapis.com",
+    # Vertex AI direct (gemini-cli Route B): the global endpoint + OAuth token
+    # refresh for ADC. Only reachable when EVOCLAW_VERTEX puts ADC in-container.
+    "aiplatform.googleapis.com",
+    "oauth2.googleapis.com",
     "open.bigmodel.cn",
     "api.kimi.com",
     "api.moonshot.ai",
+    "api.fireworks.ai",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",

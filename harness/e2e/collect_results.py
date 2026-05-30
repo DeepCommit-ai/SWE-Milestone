@@ -371,7 +371,19 @@ def load_e2e_trial_turns(workspace_root: Path, trial: str) -> Optional[int]:
     if stats is None:
         return None
     try:
-        return stats.get("summary", {}).get("total_turns")
+        turns = stats.get("summary", {}).get("total_turns")
+        if turns and turns > 0:
+            return turns
+
+        # Older Claude Code agent_stats were written with empty milestone_stats
+        # when git tag timestamps failed to parse. The parser still captured
+        # de-duplicated usage_units, one per LLM API call, so use them as a
+        # display fallback for total turns.
+        usage_units = stats.get("usage_units")
+        if isinstance(usage_units, list) and usage_units:
+            return len(usage_units)
+
+        return turns
     except Exception:
         return None
 

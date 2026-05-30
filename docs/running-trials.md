@@ -61,6 +61,11 @@ Two forms for `trial_name`:
 > name) points all five slots at the same model, keeping every request on
 > your proxy.
 
+> **Google Vertex AI (gemini-cli only):** Vertex doesn't use an API key — it
+> uses ADC. Set `vertex_ai: true` with `agent: gemini-cli`; the ADC is copied
+> into the container and gemini-cli talks to Vertex directly (no proxy). You set
+> neither `UNIFIED_API_KEY` nor `UNIFIED_BASE_URL`. See [`vertex-ai.md`](./vertex-ai.md).
+
 ---
 
 ## Resume / Force / New

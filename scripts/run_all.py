@@ -22,7 +22,20 @@ import sys
 import time
 from pathlib import Path
 
+# Make the project root importable so `from harness.e2e...` works regardless of
+# where run_all.py is invoked from (sys.path[0] would otherwise be scripts/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import yaml
+
+
+def _adc_project() -> str | None:
+    """Read quota_project_id from the host ADC file (Vertex project default)."""
+    cfg = os.environ.get("CLOUDSDK_CONFIG") or os.path.expanduser("~/.config/gcloud")
+    try:
+        return json.loads((Path(cfg) / "application_default_credentials.json").read_text()).get("quota_project_id")
+    except Exception:
+        return None
 
 
 def discover_repos(data_root: Path, repo_filters: list[str] | None = None) -> list[Path]:
@@ -199,6 +212,20 @@ def main():
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
+    # Vertex AI mode: a single yaml flag (vertex_ai: true) routes the agent to
+    # Vertex AI (Gemini, Claude-on-Vertex, Llama, ...) through an auto-managed
+    # LiteLLM bridge container. Auth is ADC, configured once on the host — no
+    # UNIFIED_API_KEY / UNIFIED_BASE_URL to pass. See docs/vertex-ai.md.
+    vertex_ai = cfg.get("vertex_ai", False)
+    vertex_location = cfg.get("vertex_location", "global")
+    vertex_project = cfg.get("vertex_project", None)
+    if vertex_ai:
+        # LiteLLM speaks native Anthropic, so the Anthropic↔OpenAI router must
+        # stay off, and all of Claude Code's model slots default to this model.
+        api_router = False
+        if not default_haiku_model:
+            default_haiku_model = model
+
     # Propagate default_haiku_model to child processes via env var
     # (ClaudeCodeFramework reads UNIFIED_DEFAULT_HAIKU_MODEL)
     if default_haiku_model:
@@ -208,7 +235,7 @@ def main():
     if not data_root.exists():
         print(f"Error: data_root not found: {data_root}", file=sys.stderr)
         sys.exit(1)
-    if not os.environ.get("UNIFIED_API_KEY"):
+    if not vertex_ai and not os.environ.get("UNIFIED_API_KEY"):
         print("Warning: UNIFIED_API_KEY not set. Agents may fail to authenticate.", file=sys.stderr)
 
     # Discover repos
@@ -219,6 +246,27 @@ def main():
 
     # Resolve trial name based on yaml + flags + existing trial dirs
     trial_name = resolve_trial_name(yaml_trial_name, repos, args.force, args.new)
+
+    # Vertex AI wiring (before spawning workers; env is inherited by workers).
+    # Two paths by agent:
+    # Vertex AI = Route B only: gemini-cli's native Vertex mode via ADC copied
+    # into the container (see harness/e2e/agents/gemini.py). No proxy/bridge.
+    # Only gemini-cli is supported — it speaks Gemini natively; other agents
+    # (e.g. claude-code) cannot talk to a Gemini model on Vertex.
+    vertex_info = None
+    if vertex_ai:
+        if agent != "gemini-cli":
+            print(f"Error: vertex_ai is only supported with agent: gemini-cli "
+                  f"(got '{agent}').", file=sys.stderr)
+            sys.exit(1)
+        proj = vertex_project or _adc_project()
+        if not proj:
+            print("Error: set vertex_project (no ADC quota_project_id found)", file=sys.stderr)
+            sys.exit(1)
+        os.environ["EVOCLAW_VERTEX"] = "1"
+        os.environ["EVOCLAW_VERTEX_PROJECT"] = proj
+        os.environ["EVOCLAW_VERTEX_LOCATION"] = vertex_location
+        vertex_info = {"project": proj}
 
     mode_label = (
         "--force (wipe & restart)" if args.force
@@ -233,6 +281,8 @@ def main():
     print(f"  Trial name:   {trial_name}")
     print(f"  Agent:        {agent}")
     print(f"  Model:        {model}")
+    if vertex_info:
+        print(f"  Vertex AI:    {vertex_location} direct/ADC, project={vertex_info['project']}")
     print(f"  Timeout:      {timeout}s")
     print(f"  Repos:        {len(repos)}")
     print(f"  Mode:         {mode_label}")

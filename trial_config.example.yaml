@@ -56,3 +56,14 @@ timeout: 18000
 # OpenAI-compatible endpoint. You do NOT need this when using Claude Code
 # with its native model.
 # api_router: true
+
+# ─── Vertex AI (gemini-cli only) ─────────────────────────
+# Route gemini-cli to Google Vertex AI Gemini models. Vertex authenticates with
+# ADC (OAuth), not an API key, so do NOT set UNIFIED_API_KEY / UNIFIED_BASE_URL.
+# Configure ADC once on the host:  gcloud auth application-default login
+# The gemini-cli framework copies the ADC into the container and talks to Vertex
+# directly (native Gemini, no proxy). `agent` MUST be gemini-cli; `model` is the
+# Vertex model id (e.g. gemini-3.5-flash). See docs/vertex-ai.md.
+# vertex_ai: true
+# vertex_location: global        # default: global (some Gemini models are global-only)
+# vertex_project: my-gcp-project # default: the ADC quota project
