@@ -212,16 +212,26 @@ def main():
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
+    # Secure-eval mode (anti-cheat): block the package registry serving the
+    # repo-under-test's own target-version source, and force the package manager
+    # to an offline local dependency closure. See docs/secure-eval.md. Set via
+    # os.environ (same proven channel as EVOCLAW_VERTEX) so detached workers
+    # inherit it deterministically.
+    secure_eval = cfg.get("secure_eval", None)
+
     # Vertex AI mode: a single yaml flag (vertex_ai: true) routes the agent to
-    # Vertex AI (Gemini, Claude-on-Vertex, Llama, ...) through an auto-managed
-    # LiteLLM bridge container. Auth is ADC, configured once on the host — no
-    # UNIFIED_API_KEY / UNIFIED_BASE_URL to pass. See docs/vertex-ai.md.
+    # Google Vertex AI using the agent's OWN native Vertex support — gemini-cli
+    # (Gemini models) and claude-code (Claude models) both talk to Vertex
+    # directly via ADC (no proxy/bridge). Auth is ADC, configured once on the
+    # host — no UNIFIED_API_KEY / UNIFIED_BASE_URL to pass. See docs/vertex-ai.md.
     vertex_ai = cfg.get("vertex_ai", False)
     vertex_location = cfg.get("vertex_location", "global")
     vertex_project = cfg.get("vertex_project", None)
     if vertex_ai:
-        # LiteLLM speaks native Anthropic, so the Anthropic↔OpenAI router must
-        # stay off, and all of Claude Code's model slots default to this model.
+        # No Anthropic↔OpenAI router in Vertex mode. For claude-code, route all
+        # of Claude Code's class-based model slots to this same Vertex model so
+        # background/subagent calls don't fall back to the hard-coded Anthropic
+        # defaults (which may not be enabled on the Vertex project).
         api_router = False
         if not default_haiku_model:
             default_haiku_model = model
@@ -248,16 +258,16 @@ def main():
     trial_name = resolve_trial_name(yaml_trial_name, repos, args.force, args.new)
 
     # Vertex AI wiring (before spawning workers; env is inherited by workers).
-    # Two paths by agent:
-    # Vertex AI = Route B only: gemini-cli's native Vertex mode via ADC copied
-    # into the container (see harness/e2e/agents/gemini.py). No proxy/bridge.
-    # Only gemini-cli is supported — it speaks Gemini natively; other agents
-    # (e.g. claude-code) cannot talk to a Gemini model on Vertex.
+    # Each agent uses its OWN native Vertex support via ADC copied into the
+    # container — no proxy/bridge:
+    #   gemini-cli  → Gemini models      (harness/e2e/agents/gemini.py)
+    #   claude-code → Claude models via CLAUDE_CODE_USE_VERTEX (claude_code.py)
+    # Other agents (codex, openhands) have no Vertex path here and are rejected.
     vertex_info = None
     if vertex_ai:
-        if agent != "gemini-cli":
+        if agent not in ("gemini-cli", "claude-code"):
             print(f"Error: vertex_ai is only supported with agent: gemini-cli "
-                  f"(got '{agent}').", file=sys.stderr)
+                  f"or claude-code (got '{agent}').", file=sys.stderr)
             sys.exit(1)
         proj = vertex_project or _adc_project()
         if not proj:
@@ -267,6 +277,26 @@ def main():
         os.environ["EVOCLAW_VERTEX_PROJECT"] = proj
         os.environ["EVOCLAW_VERTEX_LOCATION"] = vertex_location
         vertex_info = {"project": proj}
+
+    # Secure-eval: propagate to detached workers via os.environ (inherited by Popen).
+    secure_info = None
+    if secure_eval:
+        dd = secure_eval.get("deny_domains")
+        dc = secure_eval.get("deny_cidrs")
+        wh = secure_eval.get("pip_wheelhouse")
+        if dd:
+            os.environ["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
+        if dc:
+            os.environ["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
+        if wh:
+            wh = str(Path(wh).expanduser().resolve())
+            if not Path(wh).is_dir():
+                print(f"Error: secure_eval.pip_wheelhouse not found: {wh}", file=sys.stderr)
+                sys.exit(1)
+            os.environ["EVOCLAW_PIP_WHEELHOUSE"] = wh
+        secure_info = {"deny_domains": os.environ.get("EVOCLAW_DENY_DOMAINS"),
+                       "deny_cidrs": os.environ.get("EVOCLAW_DENY_CIDRS"),
+                       "wheelhouse": os.environ.get("EVOCLAW_PIP_WHEELHOUSE")}
 
     mode_label = (
         "--force (wipe & restart)" if args.force
@@ -283,6 +313,9 @@ def main():
     print(f"  Model:        {model}")
     if vertex_info:
         print(f"  Vertex AI:    {vertex_location} direct/ADC, project={vertex_info['project']}")
+    if secure_info:
+        print(f"  Secure-eval:  deny_domains={secure_info['deny_domains']} "
+              f"deny_cidrs={secure_info['deny_cidrs']} wheelhouse={secure_info['wheelhouse']}")
     print(f"  Timeout:      {timeout}s")
     print(f"  Repos:        {len(repos)}")
     print(f"  Mode:         {mode_label}")

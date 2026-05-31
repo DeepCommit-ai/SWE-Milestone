@@ -137,7 +137,9 @@ python scripts/run_all.py --config trial_config.yaml
 
 > See [docs/running-trials.md](docs/running-trials.md) for the day-to-day operational runbook (launch, monitor, recover from stuck repos), and [docs/advanced.md](docs/advanced.md) for single-repo / single-milestone debugging, result collection, `e2e_config.yaml`, and lock internals.
 
-> **Running gemini-cli on Google Vertex AI?** Vertex uses ADC (no API key to paste); set `vertex_ai: true` with `agent: gemini-cli` and run `run_all.py` as normal. See [docs/vertex-ai.md](docs/vertex-ai.md) for the credential setup and how it works.
+> **Running on Google Vertex AI?** Vertex uses ADC (no API key to paste); set `vertex_ai: true` with `agent: gemini-cli` (Gemini models) or `agent: claude-code` (Claude models) and run `run_all.py` as normal. See [docs/vertex-ai.md](docs/vertex-ai.md) for the credential setup and how it works.
+
+> **Adding a new model to an existing agent?** See [docs/adding-a-model.md](docs/adding-a-model.md) — the config fields, auth routes (API key vs Vertex/ADC), domain whitelist, and pricing, with a worked example.
 
 ## 🔍 Troubleshooting
 

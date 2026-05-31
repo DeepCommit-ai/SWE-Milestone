@@ -28,8 +28,9 @@ WHITELISTED_DOMAINS = [
     "sentry.io",
     "api.openai.com",
     "generativelanguage.googleapis.com",
-    # Vertex AI direct (gemini-cli Route B): the global endpoint + OAuth token
-    # refresh for ADC. Only reachable when EVOCLAW_VERTEX puts ADC in-container.
+    # Vertex AI direct (gemini-cli + claude-code native Vertex): the aiplatform
+    # endpoint + OAuth token refresh for ADC. Only reachable when EVOCLAW_VERTEX
+    # puts ADC in-container.
     "aiplatform.googleapis.com",
     "oauth2.googleapis.com",
     "open.bigmodel.cn",
@@ -921,7 +922,16 @@ echo "Git history truncated successfully"
             Set of unique IP address strings.
         """
         ips: set[str] = set()
+        # Secure-eval: domains in EVOCLAW_DENY_DOMAINS are NOT resolved/accepted,
+        # so the agent cannot reach that registry (e.g. PyPI) to fetch the
+        # repo-under-test's own target-version source. Pairs with EVOCLAW_DENY_CIDRS
+        # below (needed because a registry's IPs ride a shared CDN range).
+        _deny = {d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()}
+        if _deny:
+            logger.warning(f"EVOCLAW_DENY_DOMAINS active — excluding from whitelist: {sorted(_deny)}")
         for domain in WHITELISTED_DOMAINS:
+            if domain in _deny:
+                continue
             for _attempt in range(3):
                 try:
                     results = socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -929,6 +939,25 @@ echo "Git history truncated successfully"
                         ips.add(sockaddr[0])
                 except socket.gaierror:
                     pass  # domain may not resolve — that's fine
+        # Secure-eval: drop any resolved IP that falls inside a denied CIDR. A
+        # shared CDN (e.g. Fastly) serves the blocked registry from its WHOLE IP
+        # range via SNI, so an allowed Fastly-fronted domain (deb.debian.org)
+        # would otherwise re-admit IPs the agent can `curl --resolve` the registry
+        # through. Removing them here closes that SNI-routing hole.
+        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
+        if _deny_cidrs:
+            import ipaddress
+            nets = []
+            for c in _deny_cidrs:
+                try:
+                    nets.append(ipaddress.ip_network(c, strict=False))
+                except ValueError:
+                    pass
+            before = len(ips)
+            ips = {ip for ip in ips
+                   if not any(ipaddress.ip_address(ip) in n for n in nets)}
+            if before != len(ips):
+                logger.warning(f"EVOCLAW_DENY_CIDRS pruned {before - len(ips)} resolved IPs in denied ranges")
         return ips
 
     def lock_network(self) -> None:
@@ -985,7 +1014,18 @@ echo "Git history truncated successfully"
         accept_lines = []
         for ip in sorted(whitelisted_ips):
             accept_lines.append(f"iptables -A OUTPUT -d {ip} -j ACCEPT")
+        # Secure-eval mode: CIDRs in EVOCLAW_DENY_CIDRS are NOT accepted, so a
+        # registry fronted by that CDN becomes unreachable even via raw curl.
+        # Needed because EVOCLAW_DENY_DOMAINS only drops DNS-resolved IPs, while
+        # registries like PyPI ride a shared CDN range (Fastly 151.101.0.0/16)
+        # that CDN_CIDR_RANGES would otherwise accept wholesale. Keep Google
+        # (Vertex) and Cloudflare (claude.ai) ranges so the LLM path survives.
+        _deny_cidrs = {c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()}
+        if _deny_cidrs:
+            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges: {sorted(_deny_cidrs)}")
         for cidr in CDN_CIDR_RANGES:
+            if cidr in _deny_cidrs:
+                continue
             accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
 
         accept_block = "\n".join(accept_lines)
