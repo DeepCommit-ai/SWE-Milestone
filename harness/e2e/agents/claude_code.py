@@ -212,10 +212,9 @@ class ClaudeCodeFramework(AgentFramework):
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_EFFORT_LEVEL={self.EFFORT_MAP[self._reasoning_effort]}",
             ])
-        # Secure-eval mode: force pip to the offline wheelhouse (no PyPI index).
-        # Belt to the EVOCLAW_DENY_DOMAINS firewall suspenders.
-        if os.environ.get("EVOCLAW_PIP_WHEELHOUSE"):
-            env_vars.extend(["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"])
+        # Quarantine mode: force pip to the offline wheelhouse (shared base
+        # helper so gemini-cli & co. get the same treatment).
+        env_vars.extend(self.get_quarantine_env_vars())
         return env_vars
 
     def get_container_mounts(self) -> List[str]:
@@ -234,10 +233,18 @@ class ClaudeCodeFramework(AgentFramework):
         # agent user's home. No API key / credentials file is used in this mode.
         if self._vertex:
             adc_dir = os.environ.get("CLOUDSDK_CONFIG") or str(home / ".config/gcloud")
-            if os.path.isdir(adc_dir):
-                mounts.extend(["-v", f"{adc_dir}:/tmp/host-adc:ro"])
+            adc_file = os.path.join(adc_dir, "application_default_credentials.json")
+            if os.path.isfile(adc_file):
+                # Mount ONLY the ADC file, not the whole ~/.config/gcloud dir
+                # (which also holds access_tokens.db, legacy_credentials/, and
+                # possibly SA-key JSONs) into the --yolo container. The init
+                # script copies it into the agent user's home.
+                mounts.extend([
+                    "-v",
+                    f"{adc_file}:/tmp/host-adc/application_default_credentials.json:ro",
+                ])
             else:
-                logger.warning(f"Vertex mode but ADC dir not found: {adc_dir}")
+                logger.warning(f"Vertex mode but ADC file not found: {adc_file}")
 
         # Claude credentials (optional when using API mode)
         claude_creds = home / ".claude/.credentials.json"
@@ -262,14 +269,8 @@ class ClaudeCodeFramework(AgentFramework):
         else:
             logger.warning("extract_claude_logs.py not found - claude-extract will not be available")
 
-        # Secure-eval mode: mount an offline pip wheelhouse (the repo's vetted,
-        # scikit-learn-free dependency closure) so installs + build isolation work
-        # without PyPI. With EVOCLAW_DENY_DOMAINS=pypi.org,files.pythonhosted.org
-        # this stops the agent fetching its own target-version source while keeping
-        # legitimate dependencies available.
-        _wh = os.environ.get("EVOCLAW_PIP_WHEELHOUSE")
-        if _wh and os.path.isdir(_wh):
-            mounts.extend(["-v", f"{_wh}:/wheelhouse:ro"])
+        # Quarantine mode: mount an offline pip wheelhouse (shared base helper).
+        mounts.extend(self.get_quarantine_mounts())
 
         return mounts
 

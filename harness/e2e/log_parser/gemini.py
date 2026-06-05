@@ -2,11 +2,17 @@
 
 import json
 import logging
+import re
 import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# gemini message ids are globally-unique UUIDs; the session dedup relies on that.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
 from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
@@ -217,8 +223,10 @@ class GeminiLogParser(AgentLogParser):
         """
         all_calls = []
 
-        # First, try to parse from session log files (preferred - has input/output details)
-        session_files = list(log_dir.rglob("session-*.json"))
+        # First, try to parse from session log files (preferred - has input/output
+        # details). Current gemini-cli writes append-logs (session-*.jsonl); older
+        # builds wrote single-document session-*.json. Support both.
+        session_files = sorted(log_dir.rglob("session-*.jsonl")) + sorted(log_dir.rglob("session-*.json"))
         if session_files:
             for session_file in session_files:
                 try:
@@ -322,73 +330,106 @@ class GeminiLogParser(AgentLogParser):
         calls = []
 
         try:
-            with open(session_file, encoding="utf-8") as f:
-                data = json.load(f)
+            if session_file.suffix == ".jsonl":
+                # Append-log (current gemini-cli): one JSON object per line. The
+                # single-document .json `messages` array doesn't exist here, so
+                # collect gemini messages carrying toolCalls line-by-line. A call
+                # can be emitted on multiple lines, so dedup by tool id below.
+                messages = []
+                with open(session_file, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if '"toolCalls"' not in line:  # fast-skip non-tool lines
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict):
+                            messages.append(obj)
+            else:
+                with open(session_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                messages = data.get("messages", [])
 
-            messages = data.get("messages", [])
-
+            seen_ids = set()
             for message in messages:
                 if message.get("type") != "gemini":
                     continue
-
-                tool_calls = message.get("toolCalls", [])
-                for tc in tool_calls:
-                    tool_id = tc.get("id", "")
-                    tool_name = tc.get("name", "unknown")
-                    args = tc.get("args", {})
-                    status = tc.get("status", "")
-                    timestamp_str = tc.get("timestamp")
-
-                    # Calculate input size from args
-                    input_size = len(json.dumps(args, ensure_ascii=False).encode("utf-8"))
-
-                    # Calculate output size from result
-                    output_size = 0
-                    results = tc.get("result", [])
-                    for result in results:
-                        if isinstance(result, dict):
-                            func_response = result.get("functionResponse", {})
-                            response = func_response.get("response", {})
-                            output = response.get("output", "")
-                            if isinstance(output, str):
-                                output_size += len(output.encode("utf-8"))
-                            elif isinstance(output, (dict, list)):
-                                output_size += len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
-
-                    # Parse timestamp
-                    timestamp = None
-                    if timestamp_str:
-                        try:
-                            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                            timestamp = timestamp.replace(tzinfo=None)
-                        except ValueError:
-                            timestamp = datetime.now()
-                    else:
-                        timestamp = datetime.now()
-
-                    # Extract raw command for shell tool calls (used by verification classifier)
-                    bash_command = None
-                    if tool_name == "run_shell_command" and isinstance(args, dict):
-                        bash_command = args.get("command")
-
-                    calls.append(
-                        ToolCallRecord(
-                            id=tool_id,
-                            name=tool_name,
-                            timestamp=timestamp,
-                            success=status == "success",
-                            input_size=input_size,
-                            output_size=output_size,
-                            milestone_id=None,
-                            is_subagent=False,
-                            _bash_command=bash_command,
-                        )
-                    )
+                for tc in message.get("toolCalls", []):
+                    record = self._tool_record_from_call(tc)
+                    if record is None:
+                        continue
+                    # Dedup by id (no-op for single-doc .json where each call is
+                    # unique; collapses the repeated emissions in .jsonl).
+                    if record.id and record.id in seen_ids:
+                        continue
+                    if record.id:
+                        seen_ids.add(record.id)
+                    calls.append(record)
 
         except Exception as e:
             logger.warning(f"Error parsing session log {session_file}: {e}")
 
         return calls
+
+    def _tool_record_from_call(self, tc: Dict[str, Any]) -> Optional[ToolCallRecord]:
+        """Build a ToolCallRecord from one gemini ``toolCalls`` entry.
+
+        Shared by the single-document (.json) and append-log (.jsonl) session
+        parsers so both formats yield identical records.
+        """
+        if not isinstance(tc, dict):
+            return None
+        tool_id = tc.get("id", "")
+        tool_name = tc.get("name", "unknown")
+        args = tc.get("args", {})
+        status = tc.get("status", "")
+        timestamp_str = tc.get("timestamp")
+
+        # Calculate input size from args
+        input_size = len(json.dumps(args, ensure_ascii=False).encode("utf-8"))
+
+        # Calculate output size from result
+        output_size = 0
+        results = tc.get("result", [])
+        if isinstance(results, list):
+            for result in results:
+                if isinstance(result, dict):
+                    func_response = result.get("functionResponse", {})
+                    response = func_response.get("response", {})
+                    output = response.get("output", "")
+                    if isinstance(output, str):
+                        output_size += len(output.encode("utf-8"))
+                    elif isinstance(output, (dict, list)):
+                        output_size += len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
+
+        # Parse timestamp
+        timestamp = None
+        if timestamp_str:
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                timestamp = timestamp.replace(tzinfo=None)
+            except ValueError:
+                timestamp = datetime.now()
+        else:
+            timestamp = datetime.now()
+
+        # Extract raw command for shell tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name == "run_shell_command" and isinstance(args, dict):
+            bash_command = args.get("command")
+
+        return ToolCallRecord(
+            id=tool_id,
+            name=tool_name,
+            timestamp=timestamp,
+            success=status == "success",
+            input_size=input_size,
+            output_size=output_size,
+            milestone_id=None,
+            is_subagent=False,
+            _bash_command=bash_command,
+        )
 
     def _parse_json_file(self, json_path: Path) -> List[ToolCallRecord]:
         """Parse a single JSON/JSONL file for tool calls.
@@ -1055,7 +1096,7 @@ class GeminiLogParser(AgentLogParser):
 
         by_id: Dict[str, Dict[str, Any]] = {}
 
-        def consider(msg: Any, fallback_id: str) -> None:
+        def consider(msg: Any, file_name: str, idx: int) -> None:
             if not isinstance(msg, dict) or msg.get("type") != "gemini":
                 return
             tok = msg.get("tokens")
@@ -1063,7 +1104,19 @@ class GeminiLogParser(AgentLogParser):
                 return
             if not (tok.get("input") or tok.get("output") or tok.get("cached") or tok.get("thoughts")):
                 return
-            mid = str(msg.get("id") or fallback_id)
+            raw_id = msg.get("id")
+            # Cross-file / cross-resume dedup relies on `id` being a globally-
+            # unique UUID (verified against real gemini logs). Guard against a
+            # future format emitting non-UUID ids (e.g. per-session counters):
+            # scope those to the file so distinct calls in different sessions
+            # can't collide into one, while still deduping the with/without-
+            # toolCalls pair within a file.
+            if raw_id and _UUID_RE.match(str(raw_id)):
+                mid = str(raw_id)
+            elif raw_id:
+                mid = f"{file_name}|{raw_id}"
+            else:
+                mid = f"{file_name}:{idx}"
             prev = by_id.get(mid)
             if prev is None or (not prev.get("toolCalls") and msg.get("toolCalls")):
                 by_id[mid] = msg
@@ -1079,12 +1132,12 @@ class GeminiLogParser(AgentLogParser):
                                 obj = json.loads(line)
                             except Exception:
                                 continue
-                            consider(obj, f"{sf.name}:{i}")
+                            consider(obj, sf.name, i)
                 else:
                     doc = json.loads(open(sf, encoding="utf-8", errors="replace").read())
                     if isinstance(doc, dict):
                         for i, m in enumerate(doc.get("messages", []) or []):
-                            consider(m, f"{sf.name}:{i}")
+                            consider(m, sf.name, i)
             except Exception as e:
                 logger.warning(f"Error reading session log {sf}: {e}")
 

@@ -1,5 +1,6 @@
 """Abstract base class for agent frameworks."""
 
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Type
@@ -93,6 +94,30 @@ class AgentFramework(ABC):
         Returns:
             List of -e arguments for docker run (e.g., ["-e", "KEY=value"])
         """
+        return []
+
+    def get_quarantine_mounts(self) -> List[str]:
+        """Quarantine: mount the offline pip wheelhouse read-only.
+
+        Shared across agents so EVERY framework (not just claude-code) gets the
+        offline dependency closure when EVOCLAW_PIP_WHEELHOUSE is set. Without
+        this, a non-claude agent under quarantine has PyPI firewalled but no
+        offline index, so legitimate dependency installs break. Pairs with
+        get_quarantine_env_vars(). See docs/quarantine.md.
+        """
+        wh = os.environ.get("EVOCLAW_PIP_WHEELHOUSE")
+        if wh and os.path.isdir(wh):
+            return ["-v", f"{wh}:/wheelhouse:ro"]
+        return []
+
+    def get_quarantine_env_vars(self) -> List[str]:
+        """Quarantine: force pip offline to the wheelhouse (no PyPI index).
+
+        Belt to the EVOCLAW_DENY_* firewall suspenders, shared across agents.
+        See docs/quarantine.md.
+        """
+        if os.environ.get("EVOCLAW_PIP_WHEELHOUSE"):
+            return ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
         return []
 
     def get_effective_reasoning_effort(self) -> Optional[str]:

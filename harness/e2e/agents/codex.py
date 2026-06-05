@@ -115,20 +115,19 @@ class CodexFramework(AgentFramework):
         Returns:
             List of -v arguments for docker run
         """
-        if self.api_key:
-            # API mode doesn't need file mounts - key is passed via env var
-            return []
-
         mounts: List[str] = []
 
-        # Minimal OAuth credential mount.
-        if self._codex_auth_file.exists():
-            mounts.extend(["-v", f"{self._codex_auth_file}:/tmp/host-codex/auth.json:ro"])
-            if self._codex_config_file.exists():
-                mounts.extend(["-v", f"{self._codex_config_file}:/tmp/host-codex/config.toml:ro"])
-        else:
-            logger.warning("No API key and no ~/.codex/auth.json found - Codex authentication may fail")
+        if not self.api_key:
+            # Minimal OAuth credential mount (API mode passes the key via env).
+            if self._codex_auth_file.exists():
+                mounts.extend(["-v", f"{self._codex_auth_file}:/tmp/host-codex/auth.json:ro"])
+                if self._codex_config_file.exists():
+                    mounts.extend(["-v", f"{self._codex_config_file}:/tmp/host-codex/config.toml:ro"])
+            else:
+                logger.warning("No API key and no ~/.codex/auth.json found - Codex authentication may fail")
 
+        # Quarantine mode: offline pip wheelhouse (shared base helper).
+        mounts.extend(self.get_quarantine_mounts())
         return mounts
 
     def get_container_env_vars(self) -> List[str]:
@@ -147,6 +146,8 @@ class CodexFramework(AgentFramework):
             env_vars.extend(["-e", f"CODEX_API_KEY={self.api_key}"])
         if self.base_url:
             env_vars.extend(["-e", f"OPENAI_BASE_URL={self.base_url}"])
+        # Quarantine mode: force pip offline to the wheelhouse (shared base helper).
+        env_vars.extend(self.get_quarantine_env_vars())
         return env_vars
 
     def get_container_init_script(self, agent_name: str) -> str:

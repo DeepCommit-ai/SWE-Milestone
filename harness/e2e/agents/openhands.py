@@ -145,8 +145,9 @@ class OpenHandsFramework(AgentFramework):
         Returns:
             List of -v arguments for docker run (empty for API mode)
         """
-        # API mode doesn't need file mounts - key is passed via env var
-        return []
+        # API mode doesn't need file mounts - key is passed via env var.
+        # Quarantine mode: offline pip wheelhouse (shared base helper).
+        return self.get_quarantine_mounts()
 
     def _get_effective_base_url(self) -> Optional[str]:
         """Return the effective base URL, using passthrough for supported models."""
@@ -186,6 +187,8 @@ class OpenHandsFramework(AgentFramework):
                 "Passthrough models (e.g. gpt-5.3-codex) will fail with 'no healthy deployments'. "
                 "Set UNIFIED_BASE_URL in your environment."
             )
+        # Quarantine mode: force pip offline to the wheelhouse (shared base helper).
+        env_vars.extend(self.get_quarantine_env_vars())
         return env_vars
 
     def get_container_init_script(self, agent_name: str) -> str:

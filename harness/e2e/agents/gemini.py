@@ -113,13 +113,23 @@ class GeminiFramework(AgentFramework):
         # can mint Vertex tokens. Mounted read-only at /tmp/host-adc; the init
         # script copies it to fakeroot's home + chowns (a 0600 bind mount owned by
         # the host user isn't readable by the in-container fakeroot uid).
+        mounts: List[str] = []
         if self._vertex:
             adc_dir = os.environ.get("CLOUDSDK_CONFIG") or os.path.expanduser("~/.config/gcloud")
-            if os.path.isdir(adc_dir):
-                return ["-v", f"{adc_dir}:/tmp/host-adc:ro"]
-            logger.warning(f"Vertex mode but ADC dir not found: {adc_dir}")
-        # API mode doesn't need file mounts - key is passed via env var
-        return []
+            adc_file = os.path.join(adc_dir, "application_default_credentials.json")
+            if os.path.isfile(adc_file):
+                # Mount ONLY the ADC file, not the whole ~/.config/gcloud dir
+                # (which also holds access_tokens.db, legacy_credentials/, and
+                # possibly SA-key JSONs). The init script copies it + chowns.
+                mounts.extend([
+                    "-v",
+                    f"{adc_file}:/tmp/host-adc/application_default_credentials.json:ro",
+                ])
+            else:
+                logger.warning(f"Vertex mode but ADC file not found: {adc_file}")
+        # Quarantine mode: offline pip wheelhouse (shared base helper).
+        mounts.extend(self.get_quarantine_mounts())
+        return mounts
 
     def get_container_env_vars(self) -> List[str]:
         """Return Docker environment variable arguments.
@@ -139,6 +149,7 @@ class GeminiFramework(AgentFramework):
             if self._vertex_project:
                 env_vars.extend(["-e", f"GOOGLE_CLOUD_PROJECT={self._vertex_project}"])
             env_vars.extend(["-e", f"GOOGLE_CLOUD_LOCATION={self._vertex_location}"])
+            env_vars.extend(self.get_quarantine_env_vars())
             return env_vars
         if self._api_key:
             env_vars.extend(["-e", f"GEMINI_API_KEY={self._api_key}"])
@@ -148,6 +159,7 @@ class GeminiFramework(AgentFramework):
             env_vars.extend(["-e", "GEMINI_DEFAULT_AUTH_TYPE=gemini-api-key"])
         if self._base_url:
             env_vars.extend(["-e", f"GOOGLE_GEMINI_BASE_URL={self._base_url}"])
+        env_vars.extend(self.get_quarantine_env_vars())
         return env_vars
 
     def get_container_init_script(self, agent_name: str) -> str:

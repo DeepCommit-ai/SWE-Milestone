@@ -302,7 +302,8 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
     """Recalculate total cost from a modelUsage dict (as stored in agent_stats).
 
     Handles both Claude-style fields (``cacheReadInputTokens``,
-    ``cacheCreationInputTokens``) and OpenAI-style (``cachedInputTokens``).
+    ``cacheCreationInputTokens``), OpenAI-style (``cachedInputTokens``), and
+    Gemini-style (``cachedTokens``, ``thoughtsTokens``).
 
     Returns None if model_usage is empty.
     """
@@ -316,10 +317,20 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
         total += calculate_cost(
             model=model_id,
             input_tokens=usage.get("inputTokens", 0),
-            output_tokens=usage.get("outputTokens", 0),
+            # Reasoning ("thoughts") output is billed at the output rate by
+            # Gemini, and Codex/OpenHands report reasoning output separately.
+            # Fold them in so the recomputed per-milestone cost matches the
+            # parser's own _calculate_cost (mirrors load_e2e_trial_output_tokens).
+            output_tokens=(
+                usage.get("outputTokens", 0)
+                + usage.get("thoughtsTokens", 0)
+                + usage.get("reasoningOutputTokens", 0)
+                + usage.get("reasoningTokens", 0)
+            ),
             cache_read_tokens=(
                 usage.get("cacheReadInputTokens", 0)
                 or usage.get("cachedInputTokens", 0)
+                or usage.get("cachedTokens", 0)  # Gemini parser field
             ),
             cache_write_tokens=usage.get("cacheCreationInputTokens", 0),
         )

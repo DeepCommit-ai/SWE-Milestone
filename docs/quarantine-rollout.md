@@ -1,11 +1,11 @@
-# Secure-eval rollout to all ecosystems — risk study & plan
+# Quarantine rollout to all ecosystems — risk study & plan
 
 **Status:** research / proposal (pip implemented & verified; cargo/go/maven/npm NOT yet wired)
-**Related:** [`docs/secure-eval.md`](secure-eval.md) (the design + the pip implementation)
+**Related:** [`docs/quarantine.md`](quarantine.md) (the design + the pip implementation)
 
 ## Why this doc exists
 
-secure-eval blocks the cheat where an agent downloads the **repo-under-test's own
+quarantine blocks the cheat where an agent downloads the **repo-under-test's own
 target-version source** from a package registry (confirmed on scikit-learn:
 `pip download scikit-learn==1.6.0` → copied the answer). The fix is *default-deny +
 offline dependency closure*. pip is done. This doc studies **extending it to the
@@ -203,7 +203,7 @@ go `go mod download`, maven `mvn dependency:get`, npm `npm install`.
 
 - Do we want **prevention** (SNI proxy, more infra) or is **manager-offline +
   /etc/hosts-pin + post-hoc audit** acceptable for the leaderboard?
-- Should secure-eval be **default-on** for all official runs, or opt-in per trial?
+- Should quarantine be **default-on** for all official runs, or opt-in per trial?
   (It changes the environment, so re-running historical results for parity is a
   separate cost.)
 - The wheelhouse/vendor closures are built from the **clean base image** — do we

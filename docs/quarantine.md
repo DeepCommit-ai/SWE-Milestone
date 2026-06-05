@@ -79,9 +79,26 @@ it is never in the provisioned index — same guarantee across languages.
 
 ## How it's wired in EvoClaw
 
-Secure-eval mode is opt-in via env vars consumed by `harness/e2e/container_setup.py`
-and the agent framework (`harness/e2e/agents/claude_code.py`). Three layers,
-defense-in-depth (any one alone is insufficient — see "Why … not enough"):
+**Per-repo config (configure once).** A repo's quarantine policy is
+**repo-intrinsic** (which registry serves *that* repo's answer), so it lives once
+in `quarantine_configs/<repo>.yaml` and is **auto-on**: `run_all.py` applies it to
+that repo's container whenever the file exists — no trial-config flag. To run an
+unprotected baseline for a repo, move its file aside. Policy fields:
+
+```yaml
+# quarantine_configs/scikit-learn_scikit-learn_1.5.2_1.6.0.yaml
+deny_domains:   [pypi.org, files.pythonhosted.org]
+deny_cidrs:     [151.101.0.0/16, 146.75.0.0/16]    # Fastly fronts PyPI
+pip_wheelhouse: /host/path/to/wheelhouse            # host-specific
+wheelhouse_forbid: [scikit-learn, scikit_learn, sklearn]
+```
+
+`load_quarantine_env()` in `run_all.py` reads that file and passes the policy to
+**only that repo's** worker via the env vars below, consumed by
+`harness/e2e/container_setup.py` and the shared agent base
+(`harness/e2e/agents/base.py` — so every agent, not just claude-code, gets the
+offline wheelhouse). Three layers, defense-in-depth (any one alone is
+insufficient — see "Why … not enough"):
 
 1. **Network (the real block).** Make the registry unreachable at the IP layer.
    `EVOCLAW_DENY_DOMAINS` and `EVOCLAW_DENY_CIDRS` are applied in **two** places
@@ -111,7 +128,7 @@ defense-in-depth (any one alone is insufficient — see "Why … not enough"):
    > CONNFAIL, and legit wheelhouse installs + Vertex still work.
    >
    > Practical implication: cutting Fastly also cuts `deb.debian.org`, so
-   > **`apt-get` breaks** under secure-eval. Fine when the eval image is
+   > **`apt-get` breaks** under quarantine. Fine when the eval image is
    > pre-provisioned (toolchain baked in); provision any needed system package
    > into the image rather than reopening the range.
 2. **Package manager.** Force the manager offline against the local closure:
@@ -121,21 +138,26 @@ defense-in-depth (any one alone is insufficient — see "Why … not enough"):
 
 ### Building the closure (pip example)
 
-Run in the **clean base image** (so the list is authoritative and excludes the
-editable self-install):
+Use the committed, fail-closed builder `scripts/build_quarantine_wheelhouse.py`. Run
+it in the **clean base image** (so the freeze list is authoritative and the
+editable self-install is excluded):
 
 ```bash
-docker run --rm -v /path/wheelhouse:/wh <repo>/base:latest bash -lc '
-  pip freeze | grep -vE "^-e |scikit[-_]learn|git\+|^#" > /tmp/allow.txt
-  pip download -r /tmp/allow.txt -d /wh
-  pip download pip setuptools wheel ninja -d /wh   # build bootstrap
-'
+docker run --rm -v /path/wheelhouse:/wh <repo>/base:latest \
+  python3 /path/to/scripts/build_quarantine_wheelhouse.py \
+    --out /wh --forbid scikit-learn scikit_learn sklearn
 ```
 
 The clean image reports scikit-learn as `-e /testbed` (editable, dev version),
 **not** a PyPI pin — so it is absent from the `==`-pinned closure by construction.
-**Assert** the builder strips/【rejects】any non-editable `scikit-learn==` line, in
-case a future image ever installs it from PyPI.
+The builder additionally runs a **fail-closed post-audit**: if any forbidden
+artifact (the repo's own package, any version/alias) reaches the wheelhouse it is
+deleted and the build exits non-zero.
+
+This is enforced a second time at trial startup: the `wheelhouse_forbid` list in
+`quarantine_configs/<repo>.yaml` makes `run_all.py` refuse to launch
+(`_assert_wheelhouse_excludes`) if the wheelhouse contains a forbidden artifact —
+so a tampered/un-audited wheelhouse is caught even if the builder was bypassed.
 
 ## Verification protocol (run before trusting a secure re-run)
 
@@ -173,5 +195,5 @@ pip-only block missed).
 
 - pip / scikit-learn: implemented + verified (first instance of this design).
 - Other ecosystems (cargo/Go/Maven/npm): design specified above; not yet wired.
-  When you secure-eval those repos, add the per-ecosystem offline switch from the
+  When you quarantine those repos, add the per-ecosystem offline switch from the
   table and extend the verification protocol with that manager's download command.

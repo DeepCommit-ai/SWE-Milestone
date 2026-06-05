@@ -136,7 +136,9 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+# .env is the committed PUBLIC template; .env_private holds real host paths.
+.env_private
+.env.*
 .venv
 .venv/
 .venv-py312
