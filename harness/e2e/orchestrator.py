@@ -259,11 +259,20 @@ class E2EOrchestrator:
         # Trial-level overrides: selected_milestone_ids.txt and additional_dependencies.csv
         # (run_e2e.py copies workspace-level selected_milestone_ids.txt to trial_root on creation,
         #  but the trial copy can be manually edited to run a subset of milestones)
+        # --milestones writes a dependency-closed subset to milestone_selection.txt; it takes
+        # precedence over selected_milestone_ids.txt (the dataset's curated set) when present.
+        trial_milestone_selection = self.trial_root / "milestone_selection.txt"
         trial_selected_ids = self.trial_root / "selected_milestone_ids.txt"
+        if trial_milestone_selection.exists():
+            selected_ids_file = trial_milestone_selection
+        elif trial_selected_ids.exists():
+            selected_ids_file = trial_selected_ids
+        else:
+            selected_ids_file = None
         additional_deps = self.trial_root / "additional_dependencies.csv"
         self.dag = DAGManager(
             dag_path,
-            selected_ids_file=trial_selected_ids if trial_selected_ids.exists() else None,
+            selected_ids_file=selected_ids_file,
             ignore_weak_dependencies=self.config.ignore_weak_dependencies,
             additional_dependencies_csv=additional_deps if additional_deps.exists() else None,
         )
