@@ -1881,6 +1881,17 @@ Example:
     parser.add_argument("--model", default="claude-sonnet-4-5-20250929", help="Claude model ID")
     parser.add_argument("--prompt-version", default="v2", help="Prompt template version (e.g., v1 or v2)")
     parser.add_argument(
+        "--milestones",
+        default=None,
+        help=(
+            "Run only a dependency-closed prefix of the milestone DAG. Accepts a count "
+            "('10') or a percentage ('50%%'). Selection is the first N in topological order "
+            "(ascending-ID tiebreak), so prerequisites are always included; percentages round "
+            "UP (ceil). Writes the chosen IDs to <trial_root>/milestone_selection.txt without "
+            "touching the dataset's selected_milestone_ids.txt."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=3600,
@@ -2134,6 +2145,27 @@ Example:
         elif src.exists():
             shutil.copy(src, dst)
             logger.info(f"Copied {csv_name} to trial directory")
+
+    # --milestones: write a dependency-closed prefix to a NEW trial-level file
+    # (milestone_selection.txt), read by the orchestrator in preference to
+    # selected_milestone_ids.txt. The dataset's selected_milestone_ids.txt is never modified.
+    if getattr(args, "milestones", None):
+        from harness.e2e.milestone_selection import (
+            select_prefix, read_base_ids, write_selection,
+        )
+        deps_csv = trial_root / "dependencies.csv"
+        ms_csv = trial_root / "milestones.csv"
+        base_ids = read_base_ids(trial_root / "selected_milestone_ids.txt")  # dataset copy, if any
+        selected = select_prefix(
+            deps_csv, args.milestones,
+            milestones_csv=ms_csv if ms_csv.exists() else None,
+            base_ids=base_ids,
+        )
+        sel_path = write_selection(selected, trial_root / "milestone_selection.txt")
+        logger.info(
+            f"--milestones {args.milestones}: selected {len(selected)} milestone(s) "
+            f"(dependency-closed) -> {sel_path.name}: {selected}"
+        )
 
     # Save trial metadata (including model info)
     from datetime import datetime
