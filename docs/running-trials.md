@@ -13,11 +13,14 @@ For single-milestone debugging, raw `run_e2e` invocation, result collection,
 ## Quick Start
 
 ```bash
-# 1. Configure
-cp trial_config.example.yaml trial_config.yaml
-# Edit: data_root, trial_name, agent, model
+# 1. Host paths — set once, auto-loaded every run (persists across shells)
+cp .env .env_private                     # then set EVOCLAW_DATA_ROOT in .env_private
 
-# 2. API credentials
+# 2. Trial config
+cp trial_config.example.yaml trial_config.yaml
+# Edit: trial_name, agent, model  (data_root defaults to ${EVOCLAW_DATA_ROOT})
+
+# 3. API credentials  (skip for Vertex/ADC; can also live in .env_private)
 export UNIFIED_API_KEY="sk-..."
 export UNIFIED_BASE_URL="https://..."   # optional, for proxy / custom endpoint
 
@@ -60,6 +63,11 @@ Two forms for `trial_name`:
 > billing a separate Anthropic account. `default_haiku_model` (despite the
 > name) points all five slots at the same model, keeping every request on
 > your proxy.
+
+> **Google Vertex AI (gemini-cli only):** Vertex doesn't use an API key — it
+> uses ADC. Set `vertex_ai: true` with `agent: gemini-cli`; the ADC is copied
+> into the container and gemini-cli talks to Vertex directly (no proxy). You set
+> neither `UNIFIED_API_KEY` nor `UNIFIED_BASE_URL`. See [`vertex-ai.md`](./vertex-ai.md).
 
 ---
 
@@ -388,3 +396,17 @@ Unified API:
 > whitelist, add it to `WHITELISTED_DOMAINS` in
 > `harness/e2e/container_setup.py` — agent containers block all other
 > outbound traffic.
+
+Host paths (set once in `.env_private`, auto-loaded by `run_all.py`; a real
+shell-exported var still wins):
+
+| Variable | Description |
+|---|---|
+| `EVOCLAW_DATA_ROOT` | Where you downloaded EvoClaw-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
+| `EVOCLAW_WHEELHOUSE_DIR` | Base dir of the offline pip wheelhouses. Only needed for quarantine runs. |
+
+> **Quarantine (anti-cheat) is zero-touch.** It auto-applies to any repo that has
+> a `quarantine_configs/<repo>.yaml` policy — nothing to pass per run (a `🔒` marker
+> shows at launch). To run an **unprotected baseline** for such a repo, move its
+> `quarantine_configs/<repo>.yaml` aside. Full design + how to add a repo:
+> [`quarantine.md`](./quarantine.md).

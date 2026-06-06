@@ -7,8 +7,10 @@
 # Monitor progress:
 #   ./scripts/monitor.sh <trial_name>
 
-# Path to EvoClaw-data (cloned from HuggingFace)
-data_root: /path/to/EvoClaw-data
+# Path to EvoClaw-data (cloned from HuggingFace).
+# Recommended: leave this as ${EVOCLAW_DATA_ROOT} and set the real path ONCE in
+# .env_private (auto-loaded). Or hardcode an absolute path here.
+data_root: ${EVOCLAW_DATA_ROOT}
 
 # Trial name. Two forms:
 #   "my_experiment"     → run_all.py picks the latest matching _NNN
@@ -49,10 +51,14 @@ timeout: 18000
 # model call (HAIKU/SONNET/OPUS/SUBAGENT).
 # default_haiku_model: glm-5.1
 
-# Deploy the vendored claude-code-router-py inside the container to
-# translate between Anthropic Messages API and OpenAI chat/completions
-# format. Only applies to claude-code agent. Use when running Claude Code
-# against non-Anthropic models (e.g., GLM, GPT, Kimi) through an
-# OpenAI-compatible endpoint. You do NOT need this when using Claude Code
-# with its native model.
-# api_router: true
+# ─── Vertex AI (gemini-cli or claude-code) ───────────────
+# Route the agent to Google Vertex AI using its native Vertex support. Vertex
+# authenticates with ADC (OAuth), not an API key, so do NOT set UNIFIED_API_KEY /
+# UNIFIED_BASE_URL. Configure ADC once on the host:
+#   gcloud auth application-default login
+# The framework copies the ADC into the container and talks to Vertex directly
+# (no proxy). `agent` must be gemini-cli (Gemini ids, e.g. gemini-3.5-flash) or
+# claude-code (Claude ids, e.g. claude-opus-4-8). See docs/vertex-ai.md.
+# vertex_ai: true
+# vertex_location: global        # default: global (some models are global-only)
+# vertex_project: my-gcp-project # default: the ADC quota project

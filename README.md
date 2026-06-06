@@ -9,7 +9,8 @@
 <p align="center">
   <a href="https://evo-claw.com"><img src="https://img.shields.io/badge/Website-evo--claw.com-blue.svg" alt="Website" /></a>
   <a href="https://arxiv.org/abs/2603.13428"><img src="https://img.shields.io/badge/arXiv-2603.13428-b31b1b.svg" alt="arXiv" /></a>
-  <a href="https://huggingface.co/datasets/hyd2apse/EvoClaw-data"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Dataset-orange.svg" alt="HuggingFace Dataset" /></a>
+  <a href="https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Dataset-orange.svg" alt="HuggingFace Dataset" /></a>
+  <a href="https://github.com/DeepCommit-ai/DeepCommit"><img src="https://img.shields.io/badge/Data%20Pipeline-DeepCommit-blue?logo=github&logoColor=white" alt="DeepCommit Data Pipeline" /></a>
   <a href="https://hub.docker.com/u/hyd2apse"><img src="https://img.shields.io/badge/Docker-hyd2apse-2496ED?logo=docker&logoColor=white" alt="DockerHub" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-%3E%3D3.10-blue.svg" alt="Python 3.10+" /></a>
@@ -18,13 +19,7 @@
 ---
 
 > [!NOTE]
-> 🆕 **Claude Opus 4.7** (xhigh, 200K context) leads the overall leaderboard at **39.81%**.
->
-> 🆕 **GPT-5.5** (xhigh, 272K context) takes the #2 official spot at **37.77%**.
->
-> 🆕 **Kimi K2.6** is the best open-source model at **34.69%**, but uses the most turns; **GLM-5.1** ranks #2 open-source at **28.77%** with about half the turns.
->
-> See the [leaderboard](https://evo-claw.com) for more details!
+> 🆕 **[DeepCommit](https://github.com/DeepCommit-ai/DeepCommit)**, the agentic data pipeline that builds the EvoClaw benchmark from real-world commit histories, is now open-source!
 
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 
@@ -81,18 +76,29 @@ uv sync
 
 **2. Data & Docker Images**
 
-Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/hyd2apse/EvoClaw-data). Docker images are hosted on [DockerHub](https://hub.docker.com/u/hyd2apse).
+Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data). Docker images are hosted on [DockerHub](https://hub.docker.com/u/hyd2apse).
 
 ```bash
 # Download workspace data
 git lfs install
-git clone https://huggingface.co/datasets/hyd2apse/EvoClaw-data
+git clone https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data
 
 # Pull all repos at once
 ./scripts/pull_images.sh
 ```
 
 > See [docs/setup.md](docs/setup.md) for the full data layout, Docker image naming conventions, and manual retag instructions.
+
+**3. Host paths (configure once)**
+
+EvoClaw reads host-specific paths from `.env_private` (gitignored), auto-loaded by `run_all.py` on every launch — set them **once** and they persist across shells, no re-exporting. Copy the template and edit the one path that matters (where you downloaded the data):
+
+```bash
+cp .env .env_private
+# edit .env_private →  EVOCLAW_DATA_ROOT=/abs/path/to/EvoClaw-data
+```
+
+Trial configs then use `data_root: ${EVOCLAW_DATA_ROOT}` — no host path to repeat. (Only anti-cheat *quarantine* runs also need `EVOCLAW_WHEELHOUSE_DIR`; see [docs/quarantine.md](docs/quarantine.md).)
 
 ## 🚀 Usage
 
@@ -106,7 +112,7 @@ cp trial_config.example.yaml trial_config.yaml
 
 ```yaml
 # modify trial_config.yaml 
-data_root: /path/to/EvoClaw-data       # where you cloned the HuggingFace dataset
+data_root: ${EVOCLAW_DATA_ROOT}        # set once in .env_private (or hardcode a path)
 trial_name: my_experiment              # name for this evaluation run
 agent: claude-code                     # agent: claude-code | codex | gemini-cli | openhands
 model: claude-opus-4-7                 # model identifier (use claude-opus-4-7[1m] for 1M context)
@@ -137,6 +143,10 @@ python scripts/run_all.py --config trial_config.yaml
 
 > See [docs/running-trials.md](docs/running-trials.md) for the day-to-day operational runbook (launch, monitor, recover from stuck repos), and [docs/advanced.md](docs/advanced.md) for single-repo / single-milestone debugging, result collection, `e2e_config.yaml`, and lock internals.
 
+> **Running on Google Vertex AI?** Vertex uses ADC (no API key to paste); set `vertex_ai: true` with `agent: gemini-cli` (Gemini models) or `agent: claude-code` (Claude models) and run `run_all.py` as normal. See [docs/vertex-ai.md](docs/vertex-ai.md) for the credential setup and how it works.
+
+> **Adding a new model to an existing agent?** See [docs/adding-a-model.md](docs/adding-a-model.md) — the config fields, auth routes (API key vs Vertex/ADC), domain whitelist, and pricing, with a worked example.
+
 ## 🔍 Troubleshooting
 
 Below are common issues you may encounter when running evaluations, along with solutions.
@@ -160,10 +170,6 @@ python scripts/run_all.py --config trial_config.yaml
 > ⚠️ **Not every "no progress" is the agent's fault.** Rate-limit (HTTP 429), quota exhaustion, or auth (HTTP 401/403) errors also cause workers to exit with no submissions. Rotating the agent session won't help — the next request hits the same error. Check the session jsonl for `api_error_status: 429` / `"reached your usage limit"` / `401`; if present, fix the API key (top up or rotate) **before** resuming.
 
 > **Resume requires the container to still exist.** All of the agent's in-progress work — code changes, git history, and Claude's conversation memory — lives inside the container, with no copy on the host. If the container is deleted, the whole trial's working state is lost and only `--force` (restart from scratch) is available. Source snapshots of already-evaluated milestones are preserved on the host under `evaluation/`, so prior scores survive, and the full agent logs are copied to the host directory when the trial finishes.
-
-**3. `api_router` is currently unstable for long trials**
-
-The `api_router` path (translating Anthropic ↔ OpenAI so Claude Code can talk to third-party models) is not recommended for full benchmark runs today — context tends to grow past the upstream's body limit on long sessions and some reasoning-model upstreams reject key Anthropic body fields.
 
 ## 🤝 Contributing
 

@@ -163,14 +163,22 @@ class AgentLogParser(ABC):
                     continue
 
                 try:
-                    # Parse ISO 8601 timestamp and convert to naive datetime
-                    end_time = datetime.fromisoformat(timestamp_str.strip())
+                    # Git's %(creatordate:iso8601) uses "+0000" timezones,
+                    # which datetime.fromisoformat() does not accept.
+                    end_time = datetime.strptime(timestamp_str.strip(), "%Y-%m-%d %H:%M:%S %z")
                     # Remove timezone info for consistent comparison
                     if end_time.tzinfo is not None:
                         end_time = end_time.replace(tzinfo=None)
-                except ValueError as e:
-                    logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
-                    continue
+                except ValueError:
+                    try:
+                        # Keep the old parser as a fallback for ISO strings
+                        # with colonized offsets, e.g. "+00:00".
+                        end_time = datetime.fromisoformat(timestamp_str.strip())
+                        if end_time.tzinfo is not None:
+                            end_time = end_time.replace(tzinfo=None)
+                    except ValueError as e:
+                        logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
+                        continue
 
                 milestone_times[milestone_id] = {
                     "start_time": previous_end_time,  # Will be None for first milestone

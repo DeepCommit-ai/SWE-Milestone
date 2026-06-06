@@ -5,6 +5,7 @@ run_milestone.py (single milestone mode) and orchestrator.py (E2E mode).
 """
 
 import logging
+import os
 import socket
 import subprocess
 import time
@@ -27,13 +28,22 @@ WHITELISTED_DOMAINS = [
     "sentry.io",
     "api.openai.com",
     "generativelanguage.googleapis.com",
+    # Vertex AI direct (gemini-cli + claude-code native Vertex): the aiplatform
+    # endpoint + OAuth token refresh for ADC. Only reachable when EVOCLAW_VERTEX
+    # puts ADC in-container.
+    "aiplatform.googleapis.com",
+    "oauth2.googleapis.com",
     "open.bigmodel.cn",
     "api.kimi.com",
     "api.moonshot.ai",
+    "api.fireworks.ai",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",
-    "storage.googleapis.com",
+    # NOTE: storage.googleapis.com / dl.google.com intentionally NOT whitelisted.
+    # They are arbitrary public-object hosts (any bucket / GCS-hosted pip index)
+    # usable as a generic "fetch the answer" channel, and are not needed by the
+    # agent at runtime. (Inherited from the AgentBench sync; removed here.)
     "golang.org",
     "pkg.go.dev",
     "goproxy.io",
@@ -77,7 +87,6 @@ WHITELISTED_DOMAINS = [
     "gradle.org",
     "plugins.gradle.org",
     "apache.org",
-    "dl.google.com",
     # === Container registries (tools only, NOT ghcr.io) ===
     "docker.com",
     "docker.io",
@@ -915,7 +924,26 @@ echo "Git history truncated successfully"
             Set of unique IP address strings.
         """
         ips: set[str] = set()
-        for domain in WHITELISTED_DOMAINS:
+        # Quarantine: domains in EVOCLAW_DENY_DOMAINS are NOT resolved/accepted,
+        # so the agent cannot reach that registry (e.g. PyPI) to fetch the
+        # repo-under-test's own target-version source. Pairs with EVOCLAW_DENY_CIDRS
+        # below (needed because a registry's IPs ride a shared CDN range).
+        _deny = {d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()}
+        if _deny:
+            logger.warning(f"EVOCLAW_DENY_DOMAINS active — excluding from whitelist: {sorted(_deny)}")
+        # Vertex regional endpoints: a non-"global" location routes to
+        # "{LOC}-aiplatform.googleapis.com" (the bare aiplatform.googleapis.com
+        # host in WHITELISTED_DOMAINS only covers the `global` endpoint). Resolve
+        # the regional host too, else the documented region-switch (e.g.
+        # us-east5 once quota lands) dies under the always-on network lockdown.
+        domains = list(WHITELISTED_DOMAINS)
+        _vloc = os.environ.get("EVOCLAW_VERTEX_LOCATION", "").strip()
+        if _vloc and _vloc != "global":
+            domains.append(f"{_vloc}-aiplatform.googleapis.com")
+            logger.info(f"  Vertex location={_vloc}: whitelisting {_vloc}-aiplatform.googleapis.com")
+        for domain in domains:
+            if domain in _deny:
+                continue
             for _attempt in range(3):
                 try:
                     results = socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -923,6 +951,25 @@ echo "Git history truncated successfully"
                         ips.add(sockaddr[0])
                 except socket.gaierror:
                     pass  # domain may not resolve — that's fine
+        # Quarantine: drop any resolved IP that falls inside a denied CIDR. A
+        # shared CDN (e.g. Fastly) serves the blocked registry from its WHOLE IP
+        # range via SNI, so an allowed Fastly-fronted domain (deb.debian.org)
+        # would otherwise re-admit IPs the agent can `curl --resolve` the registry
+        # through. Removing them here closes that SNI-routing hole.
+        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
+        if _deny_cidrs:
+            import ipaddress
+            nets = []
+            for c in _deny_cidrs:
+                try:
+                    nets.append(ipaddress.ip_network(c, strict=False))
+                except ValueError:
+                    pass
+            before = len(ips)
+            ips = {ip for ip in ips
+                   if not any(ipaddress.ip_address(ip) in n for n in nets)}
+            if before != len(ips):
+                logger.warning(f"EVOCLAW_DENY_CIDRS pruned {before - len(ips)} resolved IPs in denied ranges")
         return ips
 
     def lock_network(self) -> None:
@@ -979,7 +1026,18 @@ echo "Git history truncated successfully"
         accept_lines = []
         for ip in sorted(whitelisted_ips):
             accept_lines.append(f"iptables -A OUTPUT -d {ip} -j ACCEPT")
+        # Quarantine mode: CIDRs in EVOCLAW_DENY_CIDRS are NOT accepted, so a
+        # registry fronted by that CDN becomes unreachable even via raw curl.
+        # Needed because EVOCLAW_DENY_DOMAINS only drops DNS-resolved IPs, while
+        # registries like PyPI ride a shared CDN range (Fastly 151.101.0.0/16)
+        # that CDN_CIDR_RANGES would otherwise accept wholesale. Keep Google
+        # (Vertex) and Cloudflare (claude.ai) ranges so the LLM path survives.
+        _deny_cidrs = {c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()}
+        if _deny_cidrs:
+            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges: {sorted(_deny_cidrs)}")
         for cidr in CDN_CIDR_RANGES:
+            if cidr in _deny_cidrs:
+                continue
             accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
 
         accept_block = "\n".join(accept_lines)
@@ -995,9 +1053,20 @@ iptables -A OUTPUT -o lo -j ACCEPT
 # Allow established/related connections
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# Allow DNS (UDP+TCP port 53) so domain resolution works
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+# Allow DNS only to the container's configured resolver(s), not arbitrary DNS
+# servers (blocks DNS-over-:53 exfil / recursive lookups to outside resolvers).
+# The Docker embedded resolver (127.0.0.11) rides loopback, already accepted.
+_ns=$(awk '/^nameserver/ {{print $2}}' /etc/resolv.conf 2>/dev/null)
+if [ -n "$_ns" ]; then
+  for ns in $_ns; do
+    iptables -A OUTPUT -p udp -d "$ns" --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp -d "$ns" --dport 53 -j ACCEPT
+  done
+else
+  # No resolver parsed — keep DNS open so resolution still works (fail-open).
+  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+fi
 
 # Allow whitelisted IPs and CDN CIDRs
 {accept_block}
@@ -1144,6 +1213,32 @@ echo "Go env vars configured"
         )
         if curl_result.returncode == 0 and curl_result.stdout.strip().startswith("2"):
             raise RuntimeError("Network lockdown verification failed: github.com is reachable")
+
+        # Quarantine: assert the denied registry hosts are actually unreachable
+        # — the whole point of EVOCLAW_DENY_*. The github.com probe above only
+        # covers code hosting; a typo'd deny CIDR/domain would otherwise pass
+        # verification while leaving the exact cheat channel (e.g. PyPI) open.
+        _deny_domains = [d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()]
+        for host in _deny_domains:
+            probe = subprocess.run(
+                [
+                    "docker", "exec", "--user", "fakeroot",
+                    "-e", "HOME=/home/fakeroot", self.container_name,
+                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    "--connect-timeout", "3", "--max-time", "5",
+                    f"https://{host}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if probe.returncode == 0 and probe.stdout.strip().startswith("2"):
+                raise RuntimeError(
+                    f"Quarantine verification failed: denied host '{host}' is still "
+                    f"reachable — EVOCLAW_DENY_DOMAINS/EVOCLAW_DENY_CIDRS not effective"
+                )
+        if _deny_domains:
+            logger.info(f"  Quarantine verified: {len(_deny_domains)} denied host(s) unreachable")
 
         # Verify sudo is revoked
         sudo_result = subprocess.run(

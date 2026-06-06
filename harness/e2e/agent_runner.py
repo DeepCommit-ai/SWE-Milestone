@@ -95,6 +95,12 @@ class AgentRunner:
         self.logger = logging.getLogger(f"agent.{container_name}")
         self._last_auth_error = False  # Set by _execute_with_streaming on auth failures
         self._last_rate_limit = False  # Set by _execute_with_streaming on rate limit
+        self._rate_limit_reset_seconds: Optional[int] = None  # Seconds until rate limit resets
+        # Set when repeated 500 errors suggest a possible model/backend compatibility issue (inferred).
+        self._last_model_unavailable = False
+        self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
+        self._last_invalid_session = False  # Set when resume session ID is invalid
+        self._last_fatal_error: Optional[str] = None  # Set on fatal config errors (no retry)
 
     def _get_exec_env_vars(self) -> list[str]:
         """Return env var args for docker exec.
@@ -114,12 +120,6 @@ class AgentRunner:
             filtered.append(env_vars[i])
             i += 1
         return filtered
-        self._rate_limit_reset_seconds: Optional[int] = None  # Seconds until rate limit resets
-        # Set when repeated 500 errors suggest a possible model/backend compatibility issue (inferred).
-        self._last_model_unavailable = False
-        self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
-        self._last_invalid_session = False  # Set when resume session ID is invalid
-        self._last_fatal_error: Optional[str] = None  # Set on fatal config errors (no retry)
 
     # Auth error patterns from agent CLI/API responses
     _AUTH_ERROR_PATTERNS = [

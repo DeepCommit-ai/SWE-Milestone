@@ -71,6 +71,10 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "gpt-3.5-turbo": {"input": 0.50, "cache_read": 0.25, "output": 1.50},
     # ── Google Gemini ─────────────────────────────────────────────────────
     # https://ai.google.dev/gemini-api/docs/pricing
+    # gemini-3.5-flash — official Standard-tier pricing
+    # (ai.google.dev/gemini-api/docs/pricing, retrieved 2026-05-29).
+    # Output price includes thinking tokens.
+    "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cache_read": 0.15},
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00, "cache_read": 0.05},
     "gemini-3-pro-preview": {
         "tiers": [
@@ -98,6 +102,8 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # ── Moonshot Kimi ─────────────────────────────────────────────────────
     "kimi-k2.5": {"input": 0.6, "output": 3.0, "cache_read": 0.1},
     "kimi-k2.6": {"input": 0.95, "output": 4.0, "cache_read": 0.16},
+    # ── DeepSeek ──────────────────────────────────────────────────────────
+    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache_read": 0.003625, "cache_write": 0.435},
     # ── MiniMax ───────────────────────────────────────────────────────────
     "minimax-2.5": {"input": 0.3, "output": 2.4, "cache_read": 0.03, "cache_write": 0.375},
 }
@@ -149,6 +155,7 @@ _MATCH_ORDER = [
     ("gpt-3.5", "gpt-3.5-turbo"),         # "gpt-3.5-turbo-0125" etc.
     # Gemini (short names → full key with "-preview" suffix)
     ("gemini-3.1-pro", "gemini-3.1-pro-preview"),
+    ("gemini-3.5-flash", "gemini-3.5-flash"),  # must come before gemini-3-flash
     ("gemini-3-pro", "gemini-3-pro-preview"),
     ("gemini-3-flash", "gemini-3-flash-preview"),
     ("gemini-2.5-flash-lite", "gemini-2.5-flash-lite"),  # must come before "gemini-2.5-flash"
@@ -165,6 +172,8 @@ _MATCH_ORDER = [
     # Kimi
     ("kimi-k2.6", "kimi-k2.6"),  # must come before "kimi-k2"
     ("kimi-k2", "kimi-k2.5"),    # "kimi-k2" or "kimi-k2.5-xxxxx"
+    # DeepSeek
+    ("deepseek-v4-pro", "deepseek-v4-pro"),
     # MiniMax
     ("minimax", "minimax-2.5"),   # "minimax-xxxxx" → minimax-2.5
 ]
@@ -293,7 +302,8 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
     """Recalculate total cost from a modelUsage dict (as stored in agent_stats).
 
     Handles both Claude-style fields (``cacheReadInputTokens``,
-    ``cacheCreationInputTokens``) and OpenAI-style (``cachedInputTokens``).
+    ``cacheCreationInputTokens``), OpenAI-style (``cachedInputTokens``), and
+    Gemini-style (``cachedTokens``, ``thoughtsTokens``).
 
     Returns None if model_usage is empty.
     """
@@ -307,10 +317,20 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
         total += calculate_cost(
             model=model_id,
             input_tokens=usage.get("inputTokens", 0),
-            output_tokens=usage.get("outputTokens", 0),
+            # Reasoning ("thoughts") output is billed at the output rate by
+            # Gemini, and Codex/OpenHands report reasoning output separately.
+            # Fold them in so the recomputed per-milestone cost matches the
+            # parser's own _calculate_cost (mirrors load_e2e_trial_output_tokens).
+            output_tokens=(
+                usage.get("outputTokens", 0)
+                + usage.get("thoughtsTokens", 0)
+                + usage.get("reasoningOutputTokens", 0)
+                + usage.get("reasoningTokens", 0)
+            ),
             cache_read_tokens=(
                 usage.get("cacheReadInputTokens", 0)
                 or usage.get("cachedInputTokens", 0)
+                or usage.get("cachedTokens", 0)  # Gemini parser field
             ),
             cache_write_tokens=usage.get("cacheCreationInputTokens", 0),
         )

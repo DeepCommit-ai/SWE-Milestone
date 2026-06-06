@@ -7,6 +7,8 @@ model: "claude-opus-4-7"
 timeout: 18000
 default_haiku_model: "claude-opus-4-7"
 # reasoning_effort intentionally unset — let opus-4-7 use its built-in
-# default (xhigh). Setting `max` triggers claude-code bug #48051 where it
-# runs as medium instead, collapsing thinking depth and trial score.
+# default (xhigh). (Bug #48051 — forced high/max collapsing to medium — is
+# fixed in current claude-code: effort now rides in output_config.effort
+# server-side, verified on 2.1.158, so `max` is safe if you ever want it
+# explicitly. Left unset here to keep this trial on the built-in xhigh.)
 

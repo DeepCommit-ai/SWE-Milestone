@@ -2,11 +2,17 @@
 
 import json
 import logging
+import re
 import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# gemini message ids are globally-unique UUIDs; the session dedup relies on that.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
 from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
@@ -217,8 +223,10 @@ class GeminiLogParser(AgentLogParser):
         """
         all_calls = []
 
-        # First, try to parse from session log files (preferred - has input/output details)
-        session_files = list(log_dir.rglob("session-*.json"))
+        # First, try to parse from session log files (preferred - has input/output
+        # details). Current gemini-cli writes append-logs (session-*.jsonl); older
+        # builds wrote single-document session-*.json. Support both.
+        session_files = sorted(log_dir.rglob("session-*.jsonl")) + sorted(log_dir.rglob("session-*.json"))
         if session_files:
             for session_file in session_files:
                 try:
@@ -322,73 +330,106 @@ class GeminiLogParser(AgentLogParser):
         calls = []
 
         try:
-            with open(session_file, encoding="utf-8") as f:
-                data = json.load(f)
+            if session_file.suffix == ".jsonl":
+                # Append-log (current gemini-cli): one JSON object per line. The
+                # single-document .json `messages` array doesn't exist here, so
+                # collect gemini messages carrying toolCalls line-by-line. A call
+                # can be emitted on multiple lines, so dedup by tool id below.
+                messages = []
+                with open(session_file, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if '"toolCalls"' not in line:  # fast-skip non-tool lines
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict):
+                            messages.append(obj)
+            else:
+                with open(session_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                messages = data.get("messages", [])
 
-            messages = data.get("messages", [])
-
+            seen_ids = set()
             for message in messages:
                 if message.get("type") != "gemini":
                     continue
-
-                tool_calls = message.get("toolCalls", [])
-                for tc in tool_calls:
-                    tool_id = tc.get("id", "")
-                    tool_name = tc.get("name", "unknown")
-                    args = tc.get("args", {})
-                    status = tc.get("status", "")
-                    timestamp_str = tc.get("timestamp")
-
-                    # Calculate input size from args
-                    input_size = len(json.dumps(args, ensure_ascii=False).encode("utf-8"))
-
-                    # Calculate output size from result
-                    output_size = 0
-                    results = tc.get("result", [])
-                    for result in results:
-                        if isinstance(result, dict):
-                            func_response = result.get("functionResponse", {})
-                            response = func_response.get("response", {})
-                            output = response.get("output", "")
-                            if isinstance(output, str):
-                                output_size += len(output.encode("utf-8"))
-                            elif isinstance(output, (dict, list)):
-                                output_size += len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
-
-                    # Parse timestamp
-                    timestamp = None
-                    if timestamp_str:
-                        try:
-                            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                            timestamp = timestamp.replace(tzinfo=None)
-                        except ValueError:
-                            timestamp = datetime.now()
-                    else:
-                        timestamp = datetime.now()
-
-                    # Extract raw command for shell tool calls (used by verification classifier)
-                    bash_command = None
-                    if tool_name == "run_shell_command" and isinstance(args, dict):
-                        bash_command = args.get("command")
-
-                    calls.append(
-                        ToolCallRecord(
-                            id=tool_id,
-                            name=tool_name,
-                            timestamp=timestamp,
-                            success=status == "success",
-                            input_size=input_size,
-                            output_size=output_size,
-                            milestone_id=None,
-                            is_subagent=False,
-                            _bash_command=bash_command,
-                        )
-                    )
+                for tc in message.get("toolCalls", []):
+                    record = self._tool_record_from_call(tc)
+                    if record is None:
+                        continue
+                    # Dedup by id (no-op for single-doc .json where each call is
+                    # unique; collapses the repeated emissions in .jsonl).
+                    if record.id and record.id in seen_ids:
+                        continue
+                    if record.id:
+                        seen_ids.add(record.id)
+                    calls.append(record)
 
         except Exception as e:
             logger.warning(f"Error parsing session log {session_file}: {e}")
 
         return calls
+
+    def _tool_record_from_call(self, tc: Dict[str, Any]) -> Optional[ToolCallRecord]:
+        """Build a ToolCallRecord from one gemini ``toolCalls`` entry.
+
+        Shared by the single-document (.json) and append-log (.jsonl) session
+        parsers so both formats yield identical records.
+        """
+        if not isinstance(tc, dict):
+            return None
+        tool_id = tc.get("id", "")
+        tool_name = tc.get("name", "unknown")
+        args = tc.get("args", {})
+        status = tc.get("status", "")
+        timestamp_str = tc.get("timestamp")
+
+        # Calculate input size from args
+        input_size = len(json.dumps(args, ensure_ascii=False).encode("utf-8"))
+
+        # Calculate output size from result
+        output_size = 0
+        results = tc.get("result", [])
+        if isinstance(results, list):
+            for result in results:
+                if isinstance(result, dict):
+                    func_response = result.get("functionResponse", {})
+                    response = func_response.get("response", {})
+                    output = response.get("output", "")
+                    if isinstance(output, str):
+                        output_size += len(output.encode("utf-8"))
+                    elif isinstance(output, (dict, list)):
+                        output_size += len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
+
+        # Parse timestamp
+        timestamp = None
+        if timestamp_str:
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                timestamp = timestamp.replace(tzinfo=None)
+            except ValueError:
+                timestamp = datetime.now()
+        else:
+            timestamp = datetime.now()
+
+        # Extract raw command for shell tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name == "run_shell_command" and isinstance(args, dict):
+            bash_command = args.get("command")
+
+        return ToolCallRecord(
+            id=tool_id,
+            name=tool_name,
+            timestamp=timestamp,
+            success=status == "success",
+            input_size=input_size,
+            output_size=output_size,
+            milestone_id=None,
+            is_subagent=False,
+            _bash_command=bash_command,
+        )
 
     def _parse_json_file(self, json_path: Path) -> List[ToolCallRecord]:
         """Parse a single JSON/JSONL file for tool calls.
@@ -702,8 +743,11 @@ class GeminiLogParser(AgentLogParser):
             stdout_cost = usage.get("costUSD", 0.0)
             stdout_reqs = usage.get("apiRequests", 0)
 
-            if self._has_tiered_pricing(model) and model in per_model_session:
-                # Use session JSON cost (per-message tiered) + residual
+            if model in per_model_session:
+                # Session logs are the complete per-call record (stdout under-
+                # counts across resumes), and _calculate_cost handles both flat
+                # and tiered pricing. Use session cost + residual for any model
+                # that has session data, not just tiered ones.
                 session_data = per_model_session[model]
                 session_cost = session_data["cost_usd"]
                 session_turns = session_data["turns"]
@@ -964,27 +1008,40 @@ class GeminiLogParser(AgentLogParser):
         # Convert defaultdicts to regular dicts
         model_usage_dict = {model: dict(usage) for model, usage in model_usage.items()}
 
-        # Merge with session JSON for accurate tiered pricing
-        if logs_dir and model_usage_dict:
+        # Reconcile with the session JSON logs — the complete per-call record.
+        # stdout under-counts across resumes (and may label the model
+        # differently, e.g. "gemini-3-flash-preview" vs "gemini-3.5-flash"),
+        # which makes a naive merge double-count. When the session logs captured
+        # at least as many turns as stdout, treat them as authoritative.
+        if logs_dir:
             session_stats = self._parse_session_logs(logs_dir)
-            if session_stats.get("total_turns", 0) > 0:
+            session_turns = session_stats.get("total_turns", 0)
+            if session_turns > 0 and session_turns >= total_turns:
+                model_usage_dict = {}
+                for model_name, md in session_stats.get("per_model", {}).items():
+                    tu = md["token_usage"]
+                    model_usage_dict[model_name] = {
+                        "inputTokens": tu["new_input_tokens"],
+                        "outputTokens": tu["output_tokens"],
+                        "thoughtsTokens": tu["thoughts_tokens"],
+                        "cachedTokens": tu["cached_tokens"],
+                        "apiRequests": md["turns"],
+                        "costUSD": md["cost_usd"],
+                    }
+                total_cost = session_stats.get("total_cost_usd", 0.0)
+                total_turns = session_turns
+            elif model_usage_dict and session_turns > 0:
+                # Session less complete than stdout — merge (session cost for
+                # accurate per-message pricing + residual for stdout-only calls).
                 merged = self._merge_stats(
                     {"modelUsage": model_usage_dict, "total_cost_usd": total_cost},
                     session_stats,
                 )
                 total_cost = merged["total_cost_usd"]
-                # Add turns for session-only models (in session JSON but not stdout)
                 for model_name in merged["modelUsage"]:
                     if model_name not in model_usage_dict:
                         total_turns += merged["modelUsage"][model_name].get("apiRequests", 0)
                 model_usage_dict = merged["modelUsage"]
-                # duration, tool stats stay from stdout
-        elif total_turns == 0 and logs_dir:
-            # No stdout model data but maybe session logs have turn counts
-            session_turns = self._count_turns_from_session_logs(logs_dir)
-            if session_turns > 0:
-                total_turns = session_turns
-                logger.info(f"Counted {session_turns} turns from session log files")
 
         logger.info(
             f"Parsed stdout: {session_count} sessions, {len(unique_session_ids) if unique_session_ids else session_count} unique sessions, "
@@ -1017,6 +1074,74 @@ class GeminiLogParser(AgentLogParser):
         """
         stats = self._parse_session_logs(logs_dir)
         return stats.get("total_turns", 0)
+
+    def _iter_session_messages(self, logs_dir: Path) -> List[Dict[str, Any]]:
+        """Return de-duplicated gemini assistant messages (with per-call token
+        usage) from the session logs — the single source of truth for
+        turns/tokens/cost.
+
+        Current gemini-cli writes JSONL append-logs (`session-*.jsonl`): the real
+        per-call usage lives on bare top-level lines `{"type":"gemini","id":...,
+        "tokens":{...},...}`. The interleaved `{"$set":{"messages":[...]}}`
+        snapshots carry `tokens:null` (ignored), and each call is emitted twice
+        (with/without `toolCalls`) sharing one `id` — so we dedup by `id`,
+        preferring the copy that carries `toolCalls` (needed for milestone
+        attribution). Older single-document `session-*.json` files (top-level
+        `messages` array with populated tokens) are still supported.
+        """
+        gemini_dir = logs_dir / "gemini"
+        if not gemini_dir.exists():
+            gemini_dir = logs_dir
+        files = sorted(gemini_dir.rglob("session-*.jsonl")) + sorted(gemini_dir.rglob("session-*.json"))
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+
+        def consider(msg: Any, file_name: str, idx: int) -> None:
+            if not isinstance(msg, dict) or msg.get("type") != "gemini":
+                return
+            tok = msg.get("tokens")
+            if not isinstance(tok, dict):
+                return
+            if not (tok.get("input") or tok.get("output") or tok.get("cached") or tok.get("thoughts")):
+                return
+            raw_id = msg.get("id")
+            # Cross-file / cross-resume dedup relies on `id` being a globally-
+            # unique UUID (verified against real gemini logs). Guard against a
+            # future format emitting non-UUID ids (e.g. per-session counters):
+            # scope those to the file so distinct calls in different sessions
+            # can't collide into one, while still deduping the with/without-
+            # toolCalls pair within a file.
+            if raw_id and _UUID_RE.match(str(raw_id)):
+                mid = str(raw_id)
+            elif raw_id:
+                mid = f"{file_name}|{raw_id}"
+            else:
+                mid = f"{file_name}:{idx}"
+            prev = by_id.get(mid)
+            if prev is None or (not prev.get("toolCalls") and msg.get("toolCalls")):
+                by_id[mid] = msg
+
+        for sf in files:
+            try:
+                if sf.suffix == ".jsonl":
+                    with open(sf, encoding="utf-8", errors="replace") as f:
+                        for i, line in enumerate(f):
+                            if '"tokens"' not in line:  # fast-skip heartbeat/snapshot lines
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            consider(obj, sf.name, i)
+                else:
+                    doc = json.loads(open(sf, encoding="utf-8", errors="replace").read())
+                    if isinstance(doc, dict):
+                        for i, m in enumerate(doc.get("messages", []) or []):
+                            consider(m, sf.name, i)
+            except Exception as e:
+                logger.warning(f"Error reading session log {sf}: {e}")
+
+        return list(by_id.values())
 
     def _parse_session_logs(self, logs_dir: Path) -> Dict:
         """Parse Gemini session log files for turns, tokens, and cost.
@@ -1063,56 +1188,38 @@ class GeminiLogParser(AgentLogParser):
         )
         fallback_model = "gemini-3-flash-preview"
 
-        # Look for session files in logs_dir/gemini/chats/
-        gemini_dir = logs_dir / "gemini"
-        if not gemini_dir.exists():
-            gemini_dir = logs_dir
+        for msg in self._iter_session_messages(logs_dir):
+            msg_model = msg.get("model") or fallback_model
+            total_turns += 1
+            entry = per_model[msg_model]
+            entry["turns"] += 1
 
-        session_files = list(gemini_dir.rglob("session-*.json"))
+            tokens = msg.get("tokens", {})
+            if tokens:
+                msg_input = tokens.get("input", 0)
+                msg_output = tokens.get("output", tokens.get("candidates", 0))
+                msg_thoughts = tokens.get("thoughts", 0)
+                msg_cached = tokens.get("cached", 0)
+                msg_new_input = max(0, msg_input - msg_cached)
 
-        for session_file in session_files:
-            try:
-                with open(session_file, encoding="utf-8") as f:
-                    data = json.load(f)
+                tu = entry["token_usage"]
+                tu["input_tokens"] += msg_input
+                tu["cached_tokens"] += msg_cached
+                tu["new_input_tokens"] += msg_new_input
+                tu["output_tokens"] += msg_output
+                tu["thoughts_tokens"] += msg_thoughts
 
-                messages = data.get("messages", [])
-                for msg in messages:
-                    if msg.get("type") == "gemini":
-                        msg_model = msg.get("model") or fallback_model
-                        total_turns += 1
-                        entry = per_model[msg_model]
-                        entry["turns"] += 1
-
-                        tokens = msg.get("tokens", {})
-                        if tokens:
-                            msg_input = tokens.get("input", 0)
-                            msg_output = tokens.get("output", tokens.get("candidates", 0))
-                            msg_thoughts = tokens.get("thoughts", 0)
-                            msg_cached = tokens.get("cached", 0)
-                            msg_new_input = max(0, msg_input - msg_cached)
-
-                            tu = entry["token_usage"]
-                            tu["input_tokens"] += msg_input
-                            tu["cached_tokens"] += msg_cached
-                            tu["new_input_tokens"] += msg_new_input
-                            tu["output_tokens"] += msg_output
-                            tu["thoughts_tokens"] += msg_thoughts
-
-                            # Per-message cost for accurate tiered pricing
-                            msg_total_output = msg_output + msg_thoughts
-                            msg_cost = self._calculate_cost(
-                                msg_model,
-                                msg_new_input,
-                                msg_total_output,
-                                msg_cached,
-                                prompt_tokens=msg_input,
-                            )
-                            entry["cost_usd"] += msg_cost
-                            total_cost += msg_cost
-
-                logger.debug(f"Parsed {session_file.name}: found messages with tokens")
-            except Exception as e:
-                logger.warning(f"Error parsing session log {session_file}: {e}")
+                # Per-message cost for accurate tiered pricing
+                msg_total_output = msg_output + msg_thoughts
+                msg_cost = self._calculate_cost(
+                    msg_model,
+                    msg_new_input,
+                    msg_total_output,
+                    msg_cached,
+                    prompt_tokens=msg_input,
+                )
+                entry["cost_usd"] += msg_cost
+                total_cost += msg_cost
 
         # Log summary
         for model_name, data in per_model.items():
@@ -1139,108 +1246,82 @@ class GeminiLogParser(AgentLogParser):
     ) -> List[NativeUsageUnit]:
         """Parse native message-level usage units from Gemini session logs."""
         units: List[NativeUsageUnit] = []
-        gemini_dir = log_dir / "gemini"
-        if not gemini_dir.exists():
-            gemini_dir = log_dir
+        for mi, msg in enumerate(self._iter_session_messages(log_dir)):
+            tokens = msg.get("tokens", {})
+            if not isinstance(tokens, dict):
+                continue
 
-        session_files = sorted(gemini_dir.rglob("session-*.json"))
-        if not session_files:
-            return units
+            msg_input = int(tokens.get("input", 0) or 0)
+            msg_output = int(tokens.get("output", tokens.get("candidates", 0)) or 0)
+            msg_thoughts = int(tokens.get("thoughts", 0) or 0)
+            msg_cached = int(tokens.get("cached", 0) or 0)
+            if msg_input <= 0 and msg_output <= 0 and msg_thoughts <= 0 and msg_cached <= 0:
+                continue
 
-        seen_ids = set()
-        for session_file in session_files:
-            try:
-                with open(session_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                messages = data.get("messages", [])
-                for idx, msg in enumerate(messages):
-                    if not isinstance(msg, dict) or msg.get("type") != "gemini":
-                        continue
-                    tokens = msg.get("tokens", {})
-                    if not isinstance(tokens, dict):
-                        continue
+            model = str(msg.get("model") or "gemini-3-flash-preview")
+            msg_new_input = max(0, msg_input - msg_cached)
+            msg_total_output = msg_output + msg_thoughts
+            msg_cost = self._calculate_cost(
+                model,
+                msg_new_input,
+                msg_total_output,
+                msg_cached,
+                prompt_tokens=msg_input,
+            )
 
-                    msg_input = int(tokens.get("input", 0) or 0)
-                    msg_output = int(tokens.get("output", tokens.get("candidates", 0)) or 0)
-                    msg_thoughts = int(tokens.get("thoughts", 0) or 0)
-                    msg_cached = int(tokens.get("cached", 0) or 0)
-                    if msg_input <= 0 and msg_output <= 0 and msg_thoughts <= 0 and msg_cached <= 0:
-                        continue
-
-                    model = str(msg.get("model") or "gemini-3-flash-preview")
-                    msg_new_input = max(0, msg_input - msg_cached)
-                    msg_total_output = msg_output + msg_thoughts
-                    msg_cost = self._calculate_cost(
-                        model,
-                        msg_new_input,
-                        msg_total_output,
-                        msg_cached,
-                        prompt_tokens=msg_input,
-                    )
-
+            timestamp = None
+            ts_val = msg.get("timestamp")
+            if isinstance(ts_val, str) and ts_val:
+                try:
+                    timestamp = datetime.fromisoformat(ts_val.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
                     timestamp = None
-                    ts_val = msg.get("timestamp")
-                    if isinstance(ts_val, str) and ts_val:
+
+            msg_id = str(msg.get("id") or f"msg{mi}")
+            msg_token_usage = {
+                "inputTokens": msg_input,
+                "outputTokens": msg_total_output,
+                "cacheReadInputTokens": msg_cached,
+                "thoughtsTokens": msg_thoughts,
+            }
+
+            # Expand multi-toolCall messages (v0.29.5+) into one NativeUsageUnit
+            # per tool call so each tool call counts as one turn and gets
+            # assigned to the correct milestone via its own timestamp.
+            tool_calls = msg.get("toolCalls", [])
+            if len(tool_calls) > 1:
+                n_tc = len(tool_calls)
+                split_tokens = {k: v // n_tc for k, v in msg_token_usage.items()}
+                split_cost = msg_cost / n_tc
+                for tc_idx, tc in enumerate(tool_calls):
+                    tc_ts = None
+                    tc_ts_val = tc.get("timestamp") if isinstance(tc, dict) else None
+                    if isinstance(tc_ts_val, str) and tc_ts_val:
                         try:
-                            timestamp = datetime.fromisoformat(ts_val.replace("Z", "+00:00")).replace(tzinfo=None)
+                            tc_ts = datetime.fromisoformat(tc_ts_val.replace("Z", "+00:00")).replace(tzinfo=None)
                         except ValueError:
-                            timestamp = None
-
-                    msg_id = str(msg.get("id") or f"{session_file.name}:{idx}")
-                    dedupe_key = (session_file.name, msg_id)
-                    if dedupe_key in seen_ids:
-                        continue
-                    seen_ids.add(dedupe_key)
-
-                    msg_token_usage = {
-                        "inputTokens": msg_input,
-                        "outputTokens": msg_total_output,
-                        "cacheReadInputTokens": msg_cached,
-                        "thoughtsTokens": msg_thoughts,
-                    }
-
-                    # Expand multi-toolCall messages (v0.29.5+) into
-                    # one NativeUsageUnit per tool call so that each
-                    # tool call counts as one turn and gets assigned to
-                    # the correct milestone via its own timestamp.
-                    tool_calls = msg.get("toolCalls", [])
-                    if len(tool_calls) > 1:
-                        n_tc = len(tool_calls)
-                        split_tokens = {k: v // n_tc for k, v in msg_token_usage.items()}
-                        split_cost = msg_cost / n_tc
-                        for tc_idx, tc in enumerate(tool_calls):
                             tc_ts = None
-                            tc_ts_val = tc.get("timestamp") if isinstance(tc, dict) else None
-                            if isinstance(tc_ts_val, str) and tc_ts_val:
-                                try:
-                                    tc_ts = datetime.fromisoformat(tc_ts_val.replace("Z", "+00:00")).replace(
-                                        tzinfo=None
-                                    )
-                                except ValueError:
-                                    tc_ts = None
-                            units.append(
-                                NativeUsageUnit(
-                                    id=f"{session_file.name}:{msg_id}:tc{tc_idx}",
-                                    source_type="tool_call",
-                                    timestamp=tc_ts or timestamp,
-                                    model=model,
-                                    token_usage=dict(split_tokens),
-                                    cost_usd=split_cost,
-                                )
-                            )
-                    else:
-                        units.append(
-                            NativeUsageUnit(
-                                id=f"{session_file.name}:{msg_id}",
-                                source_type="message",
-                                timestamp=timestamp,
-                                model=model,
-                                token_usage=msg_token_usage,
-                                cost_usd=msg_cost,
-                            )
+                    units.append(
+                        NativeUsageUnit(
+                            id=f"{msg_id}:tc{tc_idx}",
+                            source_type="tool_call",
+                            timestamp=tc_ts or timestamp,
+                            model=model,
+                            token_usage=dict(split_tokens),
+                            cost_usd=split_cost,
                         )
-            except Exception as e:
-                logger.warning(f"Error parsing native usage units from {session_file}: {e}")
+                    )
+            else:
+                units.append(
+                    NativeUsageUnit(
+                        id=msg_id,
+                        source_type="message",
+                        timestamp=timestamp,
+                        model=model,
+                        token_usage=msg_token_usage,
+                        cost_usd=msg_cost,
+                    )
+                )
 
         logger.info(f"Parsed {len(units)} native usage units from Gemini logs")
         return units

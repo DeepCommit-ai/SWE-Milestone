@@ -11,15 +11,49 @@ from harness.e2e.model_aliases import resolve_model_alias
 logger = logging.getLogger(__name__)
 
 
+# Vertex (native CLAUDE_CODE_USE_VERTEX): copy the mounted host ADC into
+# fakeroot's home so Claude Code's google-auth discovers it at the well-known
+# path. A 0600 bind mount owned by the host uid isn't readable by the in-
+# container fakeroot uid, so we copy + chown + chmod. Mirrors the gemini-cli
+# Vertex path (harness/e2e/agents/gemini.py).
+_CLAUDE_ADC_COPY = '''
+# === Claude Code: install ADC for native Vertex auth ===
+try:
+    import os, shutil, pwd
+    _fake = pwd.getpwnam('fakeroot')
+    _uid, _gid = _fake.pw_uid, _fake.pw_gid
+    _src = '/tmp/host-adc/application_default_credentials.json'
+    _dst_dir = '/home/fakeroot/.config/gcloud'
+    if os.path.exists(_src):
+        os.makedirs(_dst_dir, exist_ok=True)
+        _dst = os.path.join(_dst_dir, 'application_default_credentials.json')
+        shutil.copy2(_src, _dst)
+        os.chmod(_dst, 0o600)
+        for _root, _dirs, _files in os.walk('/home/fakeroot/.config'):
+            os.chown(_root, _uid, _gid)
+            for _fn in _files:
+                os.chown(os.path.join(_root, _fn), _uid, _gid)
+        print("Installed ADC for Vertex (claude-code)")
+    else:
+        print("WARNING: ADC not mounted at /tmp/host-adc - Vertex auth will fail")
+except Exception as _e:
+    print(f"Error installing ADC: {_e}")
+'''
+
+
 @register_framework("claude-code")
 class ClaudeCodeFramework(AgentFramework):
     """Agent framework implementation for Claude Code CLI.
 
-    Supports two authentication modes:
+    Supports three authentication modes:
     1. API mode: Uses UNIFIED_API_KEY and UNIFIED_BASE_URL environment variables
     2. File mode: Uses ~/.claude/.credentials.json file mount
+    3. Vertex mode: Claude Code's native CLAUDE_CODE_USE_VERTEX path — talks to
+       Vertex AI's Anthropic endpoint via ADC (no API key). Selected when
+       run_all.py sets EVOCLAW_VERTEX (vertex_ai: true in the trial config).
 
-    API mode takes precedence when UNIFIED_API_KEY is set.
+    API mode takes precedence when UNIFIED_API_KEY is set; Vertex mode is
+    selected by EVOCLAW_VERTEX and ignores the API key / base URL.
 
     Environment variables:
         UNIFIED_API_KEY: API key (mapped to ANTHROPIC_API_KEY in container)
@@ -62,9 +96,12 @@ class ClaudeCodeFramework(AgentFramework):
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
-        # None means "don't set anything" — let opus-4-7 use its own default
-        # (xhigh) rather than forcing "high". Forcing "high" also triggered
-        # claude-code #48051 where the CLI-level setting runs as medium.
+        # None means "don't set anything" — let the model use its own default
+        # (Opus: xhigh). Historically forcing high/max also tripped claude-code
+        # #48051 (effort collapsed to medium); fixed in current builds, where
+        # effort is sent server-side via output_config.effort (verified 2.1.158:
+        # max transmits faithfully and is honored, ~2.6x low's thinking). Unset
+        # stays a safe default for any older pinned claude.
         self._reasoning_effort = reasoning_effort
         # Apply short-name aliasing (e.g. "kimi-k2.6" →
         # "openrouter/moonshotai/kimi-k2.6") so every env var and --model flag
@@ -72,6 +109,14 @@ class ClaudeCodeFramework(AgentFramework):
         # expects. Passthrough for unknown/native names.
         raw_haiku = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
         self._default_haiku_model = resolve_model_alias(raw_haiku) if raw_haiku else None
+        # Vertex AI mode (run_all.py sets EVOCLAW_VERTEX when vertex_ai: true).
+        # Claude Code has built-in Vertex support (CLAUDE_CODE_USE_VERTEX): it
+        # talks to Vertex's Anthropic endpoint directly using ADC — no API key,
+        # no proxy. The `model` stays the bare Vertex id (e.g. claude-opus-4-8);
+        # CLOUD_ML_REGION may be a region (us-east5, ...) or "global".
+        self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
+        self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
+        self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
@@ -109,10 +154,29 @@ class ClaudeCodeFramework(AgentFramework):
             List of -e arguments for docker run
         """
         env_vars = []
-        if self._api_key:
-            env_vars.extend(["-e", f"ANTHROPIC_API_KEY={self._api_key}"])
-        if self._base_url:
-            env_vars.extend(["-e", f"ANTHROPIC_BASE_URL={self._base_url}"])
+        if self._vertex:
+            # Claude Code's native Vertex mode: talk to Vertex's Anthropic
+            # endpoint directly via ADC. Do NOT set ANTHROPIC_API_KEY /
+            # ANTHROPIC_BASE_URL — those would route back to the Anthropic API
+            # or a custom proxy instead of Vertex. CLOUD_ML_REGION accepts a
+            # region (e.g. us-east5) or "global".
+            env_vars.extend(["-e", "CLAUDE_CODE_USE_VERTEX=1"])
+            if self._vertex_project:
+                env_vars.extend(["-e", f"ANTHROPIC_VERTEX_PROJECT_ID={self._vertex_project}"])
+            env_vars.extend(["-e", f"CLOUD_ML_REGION={self._vertex_location}"])
+            # Point google-auth straight at the ADC the init script installs, so
+            # token minting doesn't depend on HOME/well-known-path discovery
+            # inside the container (init copies ADC to fakeroot's ~/.config/gcloud).
+            env_vars.extend([
+                "-e",
+                "GOOGLE_APPLICATION_CREDENTIALS=/home/fakeroot/.config/gcloud/"
+                "application_default_credentials.json",
+            ])
+        else:
+            if self._api_key:
+                env_vars.extend(["-e", f"ANTHROPIC_API_KEY={self._api_key}"])
+            if self._base_url:
+                env_vars.extend(["-e", f"ANTHROPIC_BASE_URL={self._base_url}"])
         if self._default_haiku_model:
             # Route ALL of Claude Code's class-based model slots to the same
             # model. Claude Code has five decision points where it picks a
@@ -148,6 +212,9 @@ class ClaudeCodeFramework(AgentFramework):
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_EFFORT_LEVEL={self.EFFORT_MAP[self._reasoning_effort]}",
             ])
+        # Quarantine mode: force pip to the offline wheelhouse (shared base
+        # helper so gemini-cli & co. get the same treatment).
+        env_vars.extend(self.get_quarantine_env_vars())
         return env_vars
 
     def get_container_mounts(self) -> List[str]:
@@ -161,11 +228,29 @@ class ClaudeCodeFramework(AgentFramework):
         mounts = []
         home = Path.home()
 
+        # Vertex (native CLAUDE_CODE_USE_VERTEX): mount the host ADC read-only so
+        # Claude Code can mint Vertex tokens; the init script copies it into the
+        # agent user's home. No API key / credentials file is used in this mode.
+        if self._vertex:
+            adc_dir = os.environ.get("CLOUDSDK_CONFIG") or str(home / ".config/gcloud")
+            adc_file = os.path.join(adc_dir, "application_default_credentials.json")
+            if os.path.isfile(adc_file):
+                # Mount ONLY the ADC file, not the whole ~/.config/gcloud dir
+                # (which also holds access_tokens.db, legacy_credentials/, and
+                # possibly SA-key JSONs) into the --yolo container. The init
+                # script copies it into the agent user's home.
+                mounts.extend([
+                    "-v",
+                    f"{adc_file}:/tmp/host-adc/application_default_credentials.json:ro",
+                ])
+            else:
+                logger.warning(f"Vertex mode but ADC file not found: {adc_file}")
+
         # Claude credentials (optional when using API mode)
         claude_creds = home / ".claude/.credentials.json"
         if claude_creds.exists():
             mounts.extend(["-v", f"{claude_creds}:/tmp/host-claude-credentials/.credentials.json:ro"])
-        elif not self._api_key:
+        elif not self._api_key and not self._vertex:
             logger.warning("No API key and no credentials file found - authentication may fail")
 
         # Claude share directory (config files)
@@ -183,6 +268,9 @@ class ClaudeCodeFramework(AgentFramework):
             logger.debug(f"Mounted extract_claude_logs.py from {extract_script}")
         else:
             logger.warning("extract_claude_logs.py not found - claude-extract will not be available")
+
+        # Quarantine mode: mount an offline pip wheelhouse (shared base helper).
+        mounts.extend(self.get_quarantine_mounts())
 
         return mounts
 
@@ -215,7 +303,7 @@ class ClaudeCodeFramework(AgentFramework):
         Returns:
             Python script as a string
         """
-        return f'''
+        script = f'''
 # === Claude Code: Install standalone binary ===
 try:
     import subprocess
@@ -347,6 +435,11 @@ sys.exit(launch_interactive())
 except Exception as e:
     print(f"Error creating claude-extract wrapper: {{e}}")
 '''
+        # Vertex (native CLAUDE_CODE_USE_VERTEX): install the mounted host ADC
+        # into the agent user's home so Claude Code can mint Vertex tokens.
+        if self._vertex:
+            script += _CLAUDE_ADC_COPY
+        return script
 
     def build_run_command(
         self,

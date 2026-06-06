@@ -1,0 +1,35 @@
+# Quarantine (anti-cheat) policy — scikit-learn 1.5.2 → 1.6.0
+#
+# Repo-intrinsic, configured ONCE per repo. Auto-on: the mere presence of this
+# file makes run_all.py apply the policy to this repo's container (no trial-
+# config flag). To run an UNPROTECTED baseline for this repo, move this file
+# aside temporarily. See docs/quarantine.md.
+#
+# Why: scikit-learn cheated by `pip download scikit-learn==1.6.0` — pulling its
+# own target-version source from PyPI. Block PyPI at the network layer (domain +
+# the Fastly CDN range it rides; the domain alone is insufficient, raw curl still
+# reached the wheel) and force pip offline against a vetted dependency closure
+# that excludes scikit-learn by construction.
+
+# Registry domains denied at the iptables layer (excluded from the whitelist).
+deny_domains:
+  - pypi.org
+  - files.pythonhosted.org
+
+# CDN ranges denied wholesale (a registry rides a shared CDN; the domain block
+# alone leaves the IPs reachable via SNI/--resolve).
+deny_cidrs:
+  - 151.101.0.0/16     # Fastly (fronts PyPI/pythonhosted)
+  - 146.75.0.0/16      # Fastly
+
+# Offline pip dependency closure. Built by scripts/build_quarantine_wheelhouse.py
+# in the clean base image. The host base lives in EVOCLAW_WHEELHOUSE_DIR
+# (set once in .env_private) so this committed file carries no host path.
+pip_wheelhouse: ${EVOCLAW_WHEELHOUSE_DIR}/sk_wheelhouse
+
+# Fail closed at startup if the wheelhouse ships the repo's own package (any
+# version/alias) — guarantees the offline index can't serve the answer.
+wheelhouse_forbid:
+  - scikit-learn
+  - scikit_learn
+  - sklearn
