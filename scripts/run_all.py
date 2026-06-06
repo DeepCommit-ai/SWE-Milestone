@@ -268,6 +268,7 @@ def build_cmd(
     reasoning_effort: str | None,
     api_router: bool,
     force: bool,
+    milestones: str | None = None,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
@@ -275,6 +276,9 @@ def build_cmd(
     metadata_path = trial_dir / "trial_metadata.json"
 
     if not force and trial_dir.exists() and metadata_path.exists():
+        # Resume reuses the existing trial dir, where --milestones already wrote
+        # milestone_selection.txt on first run (the orchestrator still reads it),
+        # so the prefix is preserved without re-passing --milestones here.
         return (
             [sys.executable, "-m", "harness.e2e.run_e2e", "--resume-trial", str(trial_dir)],
             "resume",
@@ -293,6 +297,8 @@ def build_cmd(
     ]
     if reasoning_effort:
         cmd.extend(["--reasoning-effort", reasoning_effort])
+    if milestones:
+        cmd.extend(["--milestones", str(milestones)])
     if api_router:
         cmd.append("--api-router")
     if force:
@@ -314,6 +320,13 @@ def main():
     parser.add_argument(
         "--new", action="store_true",
         help="Create a new trial with the next available _NNN suffix (max+1).",
+    )
+    parser.add_argument(
+        "--milestones", default=None,
+        help="Run only a dependency-closed prefix of each repo's milestone DAG: a count "
+             "('10') or a percentage ('50%%'). Overrides 'milestones:' in the trial config. "
+             "Selection is the first N in topological order (prerequisites always included), "
+             "written per-trial to milestone_selection.txt; the dataset is never modified.",
     )
     args = parser.parse_args()
 
@@ -341,6 +354,9 @@ def main():
     model = cfg.get("model", "claude-sonnet-4-5-20250929")
     timeout = cfg.get("timeout", 18000)
     reasoning_effort = cfg.get("reasoning_effort", None)
+    # Optional milestone-prefix: run only the first N (or P%) of each repo's DAG,
+    # dependency-closed. CLI --milestones overrides the trial config's 'milestones:'.
+    milestones = args.milestones if args.milestones is not None else cfg.get("milestones", None)
     api_router = cfg.get("api_router", cfg.get("drop_params", False))
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
@@ -432,6 +448,8 @@ def main():
     if vertex_info:
         print(f"  Vertex AI:    {vertex_location} direct/ADC, project={vertex_info['project']}")
     print(f"  Timeout:      {timeout}s")
+    if milestones:
+        print(f"  Milestones:   prefix {milestones} (dependency-closed)")
     print(f"  Repos:        {len(repos)}")
     print(f"  Mode:         {mode_label}")
     print("=" * 60)
@@ -460,6 +478,7 @@ def main():
         cmd, mode = build_cmd(
             repo, agent, model, timeout, trial_name,
             reasoning_effort, api_router, args.force,
+            milestones,
         )
         # Per-repo quarantine: apply this repo's anti-cheat policy (if any) only
         # to its own container, via the worker subprocess env (not global).
