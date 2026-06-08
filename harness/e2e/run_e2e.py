@@ -1875,7 +1875,7 @@ Example:
     parser.add_argument(
         "--agent",
         default="claude-code",
-        choices=["claude-code", "codex", "gemini-cli", "openhands"],
+        choices=["claude-code", "codex", "gemini-cli", "openhands", "harnessed"],
         help="Agent framework to use (default: claude-code)",
     )
     parser.add_argument("--model", default="claude-sonnet-4-5-20250929", help="Claude model ID")
