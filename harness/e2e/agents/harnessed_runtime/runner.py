@@ -72,11 +72,14 @@ def run_claude(prompt_text, args, label):
     pf = os.path.join(work, f"{label}.prompt.txt")
     with open(pf, "w", encoding="utf-8") as f:
         f.write(prompt_text)
+    sid = str(uuid.uuid4())
     cmd = ["claude", "--model", args.model, "--output-format", "json",
-           "--dangerously-skip-permissions", "--session-id", str(uuid.uuid4())]
+           "--dangerously-skip-permissions", "--session-id", sid]
     if args.effort:
         cmd += ["--effort", args.effort]
-    log(f"-> claude [{label}] ({len(prompt_text)} chars in)")
+    # session=<sid> lets the harnessed log_parser map this call's raw transcript
+    # (claude_code/<sid>.jsonl) back to its role → log/roles/<label>.jsonl.
+    log(f"-> claude [{label}] session={sid} ({len(prompt_text)} chars in)")
     t0 = time.time()
     try:
         with open(pf, encoding="utf-8") as fin:
