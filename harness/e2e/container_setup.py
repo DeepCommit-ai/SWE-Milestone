@@ -37,6 +37,12 @@ WHITELISTED_DOMAINS = [
     "api.kimi.com",
     "api.moonshot.ai",
     "api.fireworks.ai",
+    # === Host services: EvoHarness Gitea coordination substrate (multi-role harness) ===
+    # Resolves via --add-host=host.docker.internal:host-gateway to the host gateway IP, so the
+    # in-container multi-role agents can push/pull/PR against the host Gitea. NOTE: this whitelists
+    # the host gateway IP (no per-port iptables here), so it opens the host generally — acceptable
+    # for the benchmark: code hosting (github/gitlab) + the repo's own source registry stay blocked.
+    "host.docker.internal",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",

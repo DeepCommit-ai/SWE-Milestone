@@ -7,6 +7,7 @@ that drives a Dev -> Reviewer -> QA refinement pipeline and creates the `git tag
 submission signal. EvoClaw's watcher + grader then score the tag exactly as for the bare arm, so the
 multi-role-vs-bare A/B is decided by the same grader on the same milestones in the same container.
 """
+import os
 from pathlib import Path
 from typing import List
 
@@ -38,17 +39,30 @@ class HarnessedFramework(ClaudeCodeFramework):
         mounts.extend(["-v", f"{_RUNTIME_DIR}:{_CONTAINER_RUNTIME}:ro"])
         return mounts
 
-    def _runner_cmd(self, model: str, session_id: str, prompt_path: str) -> str:
+    def get_container_env_vars(self) -> List[str]:
+        env = super().get_container_env_vars()
+        # Pass the host Gitea coordination creds into the container. localhost→host.docker.internal
+        # so the in-container controller reaches the host Gitea through the whitelisted gateway.
+        url = os.environ.get("GITEA_URL", "http://localhost:3000")
+        for h in ("localhost", "127.0.0.1"):
+            url = url.replace(h, "host.docker.internal")
+        env.extend([
+            "-e", f"GITEA_URL={url}",
+            "-e", f"GITEA_TOKEN={os.environ.get('GITEA_TOKEN', '')}",
+            "-e", f"GITEA_ORG={os.environ.get('GITEA_ORG', 'evoclaw')}",
+        ])
+        return env
+
+    def _controller_cmd(self, model: str, session_id: str) -> str:
         parts = [
-            "python3", f"{_CONTAINER_RUNTIME}/runner.py",
+            "python3", f"{_CONTAINER_RUNTIME}/controller.py",
             "--model", resolve_model_alias(model),
-            "--session-base", session_id,
-            "--base-prompt", prompt_path,
+            "--trial", session_id,
             "--roles-dir", f"{_CONTAINER_RUNTIME}/roles",
             "--workspace", "/e2e_workspace",
-            "--workdir", "/testbed",
-            "--max-review-iters", str(self._max_review_iters),
-            "--max-qa-iters", str(self._max_qa_iters),
+            "--testbed", "/testbed",
+            "--event-log", "/e2e_workspace/harnessed_events.jsonl",
+            "--max-bounces", str(self._max_review_iters + self._max_qa_iters),
         ]
         effort = self.get_effective_reasoning_effort()
         if effort:
@@ -56,9 +70,8 @@ class HarnessedFramework(ClaudeCodeFramework):
         return " ".join(parts)
 
     def build_run_command(self, model: str, session_id: str, prompt_path: str) -> str:
-        return self._runner_cmd(model, session_id, prompt_path)
+        return self._controller_cmd(model, session_id)
 
     def build_resume_command(self, model: str, session_id: str, message_path: str) -> str:
-        # The runner is idempotent — it skips milestones already tagged agent-impl-* and picks up
-        # any newly-unlocked ones — so "resume" is simply re-running it.
-        return self._runner_cmd(model, session_id, message_path)
+        # Idempotent: the controller skips milestones already tagged agent-impl-* in /testbed.
+        return self._controller_cmd(model, session_id)
