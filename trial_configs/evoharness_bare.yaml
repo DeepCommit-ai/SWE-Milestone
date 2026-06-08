@@ -1,0 +1,9 @@
+# EvoHarness Phase-3 — BARE arm (vanilla EvoClaw single agent), real run @ Opus 4.7 high.
+# A/B control. Run: python scripts/run_all.py --config trial_configs/evoharness_bare.yaml --repos navidrome --milestones 3
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: evoharness_bare
+agent: claude-code
+model: claude-opus-4-7
+default_haiku_model: claude-opus-4-7   # pin all Claude Code model slots to the same model (fair vs harnessed)
+reasoning_effort: high
+timeout: 18000

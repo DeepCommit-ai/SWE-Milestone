@@ -1,0 +1,10 @@
+# EvoHarness Phase-3 — HARNESSED arm (in-container Dev→Reviewer→QA→tag), real run @ Opus 4.7 high.
+# The one standard harnessed setting for the A/B.
+# Run: python scripts/run_all.py --config trial_configs/evoharness_harnessed.yaml --repos navidrome --milestones 3
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: evoharness_harnessed
+agent: harnessed
+model: claude-opus-4-7
+default_haiku_model: claude-opus-4-7   # same model config as the bare arm — keeps the A/B fair
+reasoning_effort: high
+timeout: 18000
