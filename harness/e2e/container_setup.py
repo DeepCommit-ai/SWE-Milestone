@@ -38,11 +38,12 @@ WHITELISTED_DOMAINS = [
     "api.moonshot.ai",
     "api.fireworks.ai",
     # === Host services: EvoHarness Gitea coordination substrate (multi-role harness) ===
-    # Resolves via --add-host=host.docker.internal:host-gateway to the host gateway IP, so the
-    # in-container multi-role agents can push/pull/PR against the host Gitea. NOTE: this whitelists
-    # the host gateway IP (no per-port iptables here), so it opens the host generally — acceptable
-    # for the benchmark: code hosting (github/gitlab) + the repo's own source registry stay blocked.
-    "host.docker.internal",
+    # The host's Gitea. In-container the agents reach it at host.docker.internal:3000, which Docker
+    # maps to the bridge gateway 172.17.0.1. WHITELISTED_DOMAINS are resolved HOST-SIDE, where
+    # host.docker.internal does NOT exist — so we whitelist the gateway IP directly (getaddrinfo
+    # passes IP literals through). Opens the host gateway generally — fine for the benchmark:
+    # github/code-hosting + the repo's own source registry stay blocked.
+    "172.17.0.1",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",
@@ -132,6 +133,10 @@ CDN_CIDR_RANGES = [
     "104.16.0.0/13",  # Cloudflare
     "142.250.0.0/15",  # Google
     "216.239.32.0/19",  # Google
+    # Docker bridge subnet — lets the multi-role harness reach the host's Gitea CONTAINER directly
+    # (container-to-container on the default bridge; the gateway/host-published-port path is blocked
+    # on this host). EvoHarness Gitea coordination only — no external code hosting is on the bridge.
+    "172.17.0.0/16",
 ]
 
 

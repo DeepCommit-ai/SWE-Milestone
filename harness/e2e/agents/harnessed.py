@@ -8,6 +8,8 @@ submission signal. EvoClaw's watcher + grader then score the tag exactly as for 
 multi-role-vs-bare A/B is decided by the same grader on the same milestones in the same container.
 """
 import os
+import re
+import subprocess
 from pathlib import Path
 from typing import List
 
@@ -39,13 +41,29 @@ class HarnessedFramework(ClaudeCodeFramework):
         mounts.extend(["-v", f"{_RUNTIME_DIR}:{_CONTAINER_RUNTIME}:ro"])
         return mounts
 
+    @staticmethod
+    def _gitea_container_ip() -> str:
+        """Gitea's docker-bridge container IP — the in-container agent reaches it directly there
+        (the gateway / host-published-port path is blocked on this host)."""
+        name = os.environ.get("GITEA_CONTAINER", "evoharness-gitea")
+        try:
+            r = subprocess.run(
+                ["docker", "inspect", name, "--format",
+                 "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
+                capture_output=True, text=True, timeout=10)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
     def get_container_env_vars(self) -> List[str]:
         env = super().get_container_env_vars()
-        # Pass the host Gitea coordination creds into the container. localhost→host.docker.internal
-        # so the in-container controller reaches the host Gitea through the whitelisted gateway.
-        url = os.environ.get("GITEA_URL", "http://localhost:3000")
-        for h in ("localhost", "127.0.0.1"):
-            url = url.replace(h, "host.docker.internal")
+        # Point GITEA_URL at Gitea's bridge container IP (not localhost / not the gateway).
+        port = "3000"
+        m = re.search(r":(\d+)", os.environ.get("GITEA_URL", ""))
+        if m:
+            port = m.group(1)
+        ip = self._gitea_container_ip()
+        url = f"http://{ip}:{port}" if ip else os.environ.get("GITEA_URL", "http://172.17.0.3:3000")
         env.extend([
             "-e", f"GITEA_URL={url}",
             "-e", f"GITEA_TOKEN={os.environ.get('GITEA_TOKEN', '')}",
