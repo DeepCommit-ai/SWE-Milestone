@@ -17,6 +17,7 @@ verbatim — the roles are just multiple ordinary Claude Code sessions.
 import logging
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +37,12 @@ class HarnessedLogParser(ClaudeCodeLogParser):
     FRAMEWORK_NAME = "harnessed"
 
     def extract_raw_logs(self, container_name: str, output_dir: Path, session_id: Optional[str] = None) -> Path:
-        logs_dir = super().extract_raw_logs(container_name, output_dir, session_id)
+        # harnessed role sessions live under MULTIPLE project dirs (claude runs in the working clone
+        # /tmp/ctl_work AND /testbed), so copy the WHOLE projects tree, not just -testbed.
+        logs_dir = Path(output_dir) / "claude_code"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["docker", "cp", f"{container_name}:{self.PROJECTS_DIR}/.", str(logs_dir)],
+                       capture_output=True, text=True, timeout=120)
         try:
             self._organize_role_sessions(Path(output_dir), logs_dir)
         except Exception as e:  # the per-role view is a nicety — never block stats on it
@@ -60,8 +66,8 @@ class HarnessedLogParser(ClaudeCodeLogParser):
         roles_dir.mkdir(parents=True, exist_ok=True)
         n = 0
         for sid, label in label_by_sid.items():
-            src = logs_dir / f"{sid}.jsonl"
-            if src.exists():
+            src = next(iter(logs_dir.rglob(f"{sid}.jsonl")), None)
+            if src and src.exists():
                 shutil.copy2(src, roles_dir / f"{label}.jsonl")
                 n += 1
         logger.info(f"[harnessed] organized {n}/{len(label_by_sid)} role transcripts → {roles_dir}")

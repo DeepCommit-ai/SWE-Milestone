@@ -179,7 +179,14 @@ class Controller:
         _, out, _ = git(self.testbed, "tag", "-l", "agent-impl-*")
         for t in out.split():
             self.tagged.add(t.replace("agent-impl-", ""))
-        log(f"[setup] gitea repo={self.repo} pushed + cloned; already-tagged={sorted(self.tagged)}")
+        # idempotent across EvoClaw recovery restarts: rebuild the milestone→issue map from the
+        # existing Gitea state, so a restart resumes instead of re-bootstrapping duplicate issues.
+        for iss in self.gc.list_issues(self.repo, labels=["evoclaw-task"], state="all"):
+            m = re.match(r"\[([^\]]+)\]", iss.get("title", ""))
+            if m:
+                self.issued[m.group(1)] = iss["number"]
+        log(f"[setup] gitea repo={self.repo} pushed + cloned; tagged={sorted(self.tagged)} "
+            f"existing-issues={len(self.issued)}")
         self.event(type="setup", repo=self.repo)
 
     # --- milestone inputs -------------------------------------------
@@ -239,6 +246,14 @@ class Controller:
     # --- role actions -----------------------------------------------
     def dev_open(self, mid, issue_num):
         branch = f"task-{re.sub(r'[^A-Za-z0-9_.-]', '-', mid)}"
+        # idempotent across restarts: if a PR for this branch already exists, just mark has-pr and
+        # skip — avoids re-running the expensive Dev claude call AND a 409 on create_pr.
+        existing = next((p for p in self.gc.list_prs(self.repo, state="all")
+                         if (p.get("head") or {}).get("ref") == branch), None)
+        if existing:
+            self.gc.add_labels(self.repo, issue_num, ["has-pr"])
+            log(f"[dev] PR for {mid} already exists (#{existing['number']}) — skip open")
+            return
         self._wc_checkout("main")
         git(self.work, "checkout", "-B", branch, "main")
         srs = self.srs_of(mid)
@@ -248,8 +263,15 @@ class Controller:
         run_claude(task, self.args, f"dev-open-{mid}", self.work)
         git_commit_all(self.work, f"{mid}: implement")
         git(self.work, "push", "-f", "origin", branch)
-        pr = self.gc.create_pr(self.repo, head=branch, base="main", title=f"Implement {mid}",
-                               body=f"milestone_id: {mid}", labels=["needs-review"])
+        try:
+            pr = self.gc.create_pr(self.repo, head=branch, base="main", title=f"Implement {mid}",
+                                   body=f"milestone_id: {mid}", labels=["needs-review"])
+        except GiteaError as e:
+            if "409" in str(e):
+                self.gc.add_labels(self.repo, issue_num, ["has-pr"])
+                log(f"[dev] PR for {mid} already existed (409) — marked has-pr")
+                return
+            raise
         self.gc.add_labels(self.repo, issue_num, ["has-pr"])
         log(f"[dev] opened PR #{pr} for {mid} (needs-review)")
         self.event(type="pr_opened", milestone=mid, pr=pr)
@@ -381,57 +403,63 @@ class Controller:
             self.event(type="stall_alert", pr=pr["number"], state=state, age_min=int(age_min))
 
     # --- pacer loop --------------------------------------------------
+    def _safe(self, label, fn, *args):
+        try:
+            fn(*args)
+        except Exception as e:  # one bad action must NOT crash the controller (→ EvoClaw restart loop)
+            log(f"[error] {label}: {str(e)[:200]}")
+            self.event(type="action_error", label=label, error=str(e)[:200])
+
     def run(self):
         self.setup()
         idle = 0
+        last_sig = None
         for _pass in range(self.args.max_passes):
-            self.sync_issues()
-            progressed = False
+            self._safe("sync_issues", self.sync_issues)
             prs = self.gc.list_prs(self.repo, state="open")
             issues = self.gc.list_issues(self.repo, labels=["evoclaw-task"], state="open")
-
-            # Dev: fix bounced PRs, then open PRs for un-PR'd issues
             for pr in prs:
                 st = self._pr_state(pr)
                 if st in ("needs-code-changes:R", "needs-code-changes:Q"):
-                    self.dev_fix(pr, st); progressed = True
+                    self._safe("dev_fix", self.dev_fix, pr, st)
             for iss in issues:
                 if "has-pr" in self._labels(iss):
                     continue
                 mid = next((m for m, n in self.issued.items() if n == iss["number"]), None)
                 if mid and mid not in self.tagged:
-                    self.dev_open(mid, iss["number"]); progressed = True
-
-            prs = self.gc.list_prs(self.repo, state="open")
-            for pr in prs:
-                self.run_ci(pr)  # CI on every open PR head (idempotent per sha)
-            for pr in prs:
-                st = self._pr_state(pr)
-                if st == "needs-review" and self.ci_done.get(self._head_sha(pr)) == "success":
-                    self.reviewer(pr); progressed = True
-            prs = self.gc.list_prs(self.repo, state="open")
-            for pr in prs:
+                    self._safe("dev_open", self.dev_open, mid, iss["number"])
+            for pr in self.gc.list_prs(self.repo, state="open"):
+                self._safe("ci", self.run_ci, pr)
+            for pr in self.gc.list_prs(self.repo, state="open"):
+                if self._pr_state(pr) == "needs-review" and self.ci_done.get(self._head_sha(pr)) == "success":
+                    self._safe("reviewer", self.reviewer, pr)
+            for pr in self.gc.list_prs(self.repo, state="open"):
                 if self._pr_state(pr) == "needs-qa":
-                    self.qa(pr); progressed = True
-            prs = self.gc.list_prs(self.repo, state="open")
-            for pr in prs:
+                    self._safe("qa", self.qa, pr)
+            for pr in self.gc.list_prs(self.repo, state="open"):
                 if self._pr_state(pr) == "ready-to-merge":
-                    self.merge_gate(pr); progressed = True
+                    self._safe("merge", self.merge_gate, pr)
                 else:
-                    self.observer(pr)
+                    self._safe("observer", self.observer, pr)
 
             mids, no_more = self.available_milestones()
-            if all(m in self.tagged for m in mids) and no_more:
+            if mids and all(m in self.tagged for m in mids) and no_more:
                 log("[pacer] all milestones tagged + queue drained — done")
                 break
-            if progressed:
-                idle = 0
-            else:
+            # idle = a full pass that changed no Gitea state (robust vs idempotent no-op skips)
+            now = self.gc.list_prs(self.repo, state="all")
+            sig = (len(self.tagged),
+                   tuple(sorted((p["number"], "|".join(sorted(self._labels(p)))) for p in now)))
+            if sig == last_sig:
                 idle += 1
                 if idle >= self.args.max_idle:
-                    log(f"[pacer] idle limit ({self.args.max_idle}) — exiting"); break
+                    log(f"[pacer] idle limit ({self.args.max_idle}) — exiting")
+                    break
                 log(f"[pacer] idle {idle}/{self.args.max_idle}; tagged={sorted(self.tagged)}")
                 time.sleep(self.args.poll_secs)
+            else:
+                idle = 0
+            last_sig = sig
         log(f"[pacer] done; tagged {len(self.tagged)}: {sorted(self.tagged)}")
 
 
