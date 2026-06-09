@@ -28,12 +28,11 @@ class HarnessedFramework(ClaudeCodeFramework):
 
     FRAMEWORK_NAME = "harnessed"
 
-    def __init__(self, max_review_iters: int = 1, max_qa_iters: int = 1, **kwargs):
+    def __init__(self, max_bounces: int = 10, **kwargs):
         super().__init__(**kwargs)
-        # Per-milestone refinement budget. Low default keeps debug runs cheap; raise via the
-        # trial config (passed through as framework kwargs) for the real run.
-        self._max_review_iters = int(max_review_iters)
-        self._max_qa_iters = int(max_qa_iters)
+        # Per-role retry budget (Reviewer / QA / CI-fix each get this many independently). Large by
+        # default so the refinement loop runs to genuine convergence instead of force-passing early.
+        self._max_bounces = int(max_bounces)
 
     def get_container_mounts(self) -> List[str]:
         # Inherit claude credential/share/extract mounts, then add the runner + role prompts.
@@ -86,7 +85,7 @@ class HarnessedFramework(ClaudeCodeFramework):
             "--workspace", "/e2e_workspace",
             "--testbed", "/testbed",
             "--event-log", "/e2e_workspace/harnessed_events.jsonl",
-            "--max-bounces", str(self._max_review_iters + self._max_qa_iters),
+            "--max-bounces", str(self._max_bounces),
         ]
         effort = self.get_effective_reasoning_effort()
         if effort:

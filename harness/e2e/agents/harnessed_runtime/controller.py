@@ -34,7 +34,6 @@ from gitea_client import GiteaClient, GiteaError  # noqa: E402
 from labels import next_state  # noqa: E402
 
 SRS_CAP = 20000
-DIFF_CAP = 40000
 OUT_CAP = 16000
 
 
@@ -152,7 +151,12 @@ class Controller:
         self.events = os.path.join(args.event_log)
         self.issued = {}                    # mid -> issue number
         self.tagged = set()
-        self.bounces = {}                   # mid -> times bounced (:R/:Q) — budget for termination
+        # SEPARATE per-role retry budgets (each capped at args.max_bounces). A milestone's review
+        # loop must NOT consume QA's budget (that was force-skipping QA), so reviewer/qa/ci-fix each
+        # count independently.
+        self.rev_bounces = {}               # mid -> times Reviewer requested changes
+        self.qa_bounces = {}                # mid -> times QA found a bug
+        self.ci_bounces = {}                # mid -> times Dev fixed red CI
         self.ci_done = {}                   # head_sha -> "success"/"failure"
         self.ci_out = {}                    # head_sha -> build log (for Dev to fix red CI)
         self.main_builds = None             # None=unknown; True/False once probed (baseline-aware CI)
@@ -183,11 +187,11 @@ class Controller:
         git(self.testbed, "fetch", "gitea")  # so /testbed knows gitea/main for later sync
         # working clone
         subprocess.run(["rm", "-rf", self.work])
-        # shallow clone: navidrome et al. have large histories; the roles only need the tip, and a
-        # smaller working tree reduces the container footprint (which mattered under host pressure).
-        r = subprocess.run(["git", "clone", "--depth", "1", rem, self.work], capture_output=True, text=True)
-        if not os.path.isdir(os.path.join(self.work, ".git")):
-            r = subprocess.run(["git", "clone", rem, self.work], capture_output=True, text=True)
+        # FULL clone: roles diff branches against main with `git diff origin/main...HEAD` (three-dot),
+        # which needs the merge-base present — a shallow clone breaks that and gives the reviewer a
+        # wrong/empty diff. (The earlier shallow clone was a mis-fix for container deaths that were
+        # actually an external container-reaper, not footprint.)
+        r = subprocess.run(["git", "clone", rem, self.work], capture_output=True, text=True)
         if not os.path.isdir(os.path.join(self.work, ".git")):
             raise RuntimeError(f"clone failed: {r.stderr[:300]}")
         # resume-safe: skip milestones already tagged in /testbed from a prior run
@@ -297,10 +301,12 @@ class Controller:
         self._wc_checkout(branch)
         comments = self.gc.comments(self.repo, pr["number"]) or []
         feedback = comments[-1]["body"][:OUT_CAP] if comments else "(see review)"
-        task = (f"{role_prompt(self.args.roles_dir, 'dev')}\n\n## Milestone: {mid}\nThe team requested changes:\n\n"
-                f"{feedback}\n\nAddress them in the current repo ({self.work}) and leave changes ready to commit. "
+        n = self.rev_bounces.get(mid, 0) + self.qa_bounces.get(mid, 0)
+        task = (f"{role_prompt(self.args.roles_dir, 'dev')}\n\n## Milestone: {mid}\n## Requirement (SRS)\n"
+                f"{self.srs_of(mid)}\n\nThe team requested changes on your PR:\n\n{feedback}\n\n"
+                f"Address them in the current repo ({self.work}) and leave changes ready to commit. "
                 f"Do NOT git tag or open a PR.")
-        run_claude(task, self.args, f"dev-fix-{mid}-{self.bounces.get(mid,0)}", self.work)
+        run_claude(task, self.args, f"dev-fix-{mid}-{n}", self.work)
         git_commit_all(self.work, f"{mid}: address feedback")
         git(self.work, "push", "-f", "origin", branch)
         self._relabel(pr, state, next_state(state, actor="dev", verdict="fixed"))
@@ -352,32 +358,34 @@ class Controller:
         task = (f"{role_prompt(self.args.roles_dir, 'dev')}\n\n## Milestone: {mid}\nThe project CI build is RED. "
                 f"Fix the build in the current repo ({self.work}) so it compiles. Build output:\n\n"
                 f"{build_log}\n\nLeave changes ready to commit. Do NOT git tag or open a PR.")
-        run_claude(task, self.args, f"dev-ci-{mid}-{self.bounces.get(mid,0)}", self.work)
+        run_claude(task, self.args, f"dev-ci-{mid}-{self.ci_bounces.get(mid,0)}", self.work)
         git_commit_all(self.work, f"{mid}: fix CI build")
         git(self.work, "push", "-f", "origin", branch)
-        self.bounces[mid] = self.bounces.get(mid, 0) + 1
-        log(f"[dev] fixed red CI on PR #{pr['number']} (bounce {self.bounces[mid]})")
+        self.ci_bounces[mid] = self.ci_bounces.get(mid, 0) + 1
+        log(f"[dev] fixed red CI on PR #{pr['number']} (ci_bounce {self.ci_bounces[mid]}/{self.args.max_bounces})")
         self.event(type="dev_fix_ci", milestone=mid, pr=pr["number"])
 
     def reviewer(self, pr):
         mid = self._mid_of_pr(pr)
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
-        _, diff, _ = git(self.work, "diff", "origin/main", "HEAD")  # two-dot: works with shallow clones
-        forced = self.bounces.get(mid, 0) >= self.args.max_bounces
-        if forced:
+        if self.rev_bounces.get(mid, 0) >= self.args.max_bounces:
             verdict = "approve"
             log(f"[reviewer] PR #{pr['number']} budget exhausted -> force approve")
         else:
-            task = (f"{role_prompt(self.args.roles_dir, 'reviewer')}\n\n## Milestone {mid}\n## SRS\n{self.srs_of(mid)}\n\n"
-                    f"## Proposed change (diff)\n```diff\n{diff[:DIFF_CAP]}\n```\n\nGive your verdict.")
-            out = run_claude(task, self.args, f"review-{mid}-{self.bounces.get(mid,0)}", self.work)
+            # The reviewer explores the REAL checked-out PR with its own tools (git diff / read code) —
+            # no truncated diff string in the prompt (that caused empty/cut-off diffs and shallow review).
+            task = (f"{role_prompt(self.args.roles_dir, 'reviewer')}\n\n## Milestone under review: {mid}\n"
+                    f"The PR branch is checked out in your current working directory ({self.work}); its base "
+                    f"is `origin/main`. Use git and read the files to review the actual change.\n\n"
+                    f"## Requirement (SRS)\n{self.srs_of(mid)}\n\nReview it and give your verdict.")
+            out = run_claude(task, self.args, f"review-{mid}-{self.rev_bounces.get(mid,0)}", self.work)
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
             verdict = "approve" if parse_verdict(out, "APPROVE", "REQUEST_CHANGES") != "REQUEST_CHANGES" else "request-changes"
         if verdict == "request-changes":
-            self.bounces[mid] = self.bounces.get(mid, 0) + 1
+            self.rev_bounces[mid] = self.rev_bounces.get(mid, 0) + 1
         self._relabel(pr, "needs-review", next_state("needs-review", actor="reviewer", verdict=verdict))
-        log(f"[reviewer] PR #{pr['number']} -> {verdict}")
+        log(f"[reviewer] PR #{pr['number']} -> {verdict} (rev_bounce {self.rev_bounces.get(mid,0)}/{self.args.max_bounces})")
         self.event(type="review_verdict", milestone=mid, pr=pr["number"], verdict=verdict)
 
     def qa(self, pr):
@@ -385,32 +393,34 @@ class Controller:
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
         sha = self._head_sha(pr)
-        forced = self.bounces.get(mid, 0) >= self.args.max_bounces
-        if forced:
+        if self.qa_bounces.get(mid, 0) >= self.args.max_bounces:
             verdict = "pass"
             log(f"[qa] PR #{pr['number']} budget exhausted -> force pass")
         else:
-            task = (f"{role_prompt(self.args.roles_dir, 'qa')}\n\n## Milestone {mid}\n## SRS\n{self.srs_of(mid)}\n\n"
-                    f"Build and run the project's tests in the current repo ({self.work}) to verify the "
-                    f"implementation, then give your verdict.")
-            out = run_claude(task, self.args, f"qa-{mid}-{self.bounces.get(mid,0)}", self.work)
+            task = (f"{role_prompt(self.args.roles_dir, 'qa')}\n\n## Milestone under test: {mid}\n"
+                    f"The PR branch is checked out in your current working directory ({self.work}); its base "
+                    f"is `origin/main`.\n\n## Requirement (SRS)\n{self.srs_of(mid)}\n\n"
+                    f"Build the project and run the tests to verify it, then give your verdict.")
+            out = run_claude(task, self.args, f"qa-{mid}-{self.qa_bounces.get(mid,0)}", self.work)
             verdict = "pass" if parse_verdict(out, "PASS", "FAIL") != "FAIL" else "bug"
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
         if verdict == "pass":
             self.gc.comment(self.repo, pr["number"], f"qa_passed@{sha[:12]}")
             self._relabel(pr, "needs-qa", "ready-to-merge")
         else:
-            self.bounces[mid] = self.bounces.get(mid, 0) + 1
+            self.qa_bounces[mid] = self.qa_bounces.get(mid, 0) + 1
             self._relabel(pr, "needs-qa", "needs-code-changes:Q")
-        log(f"[qa] PR #{pr['number']} -> {verdict}")
+        log(f"[qa] PR #{pr['number']} -> {verdict} (qa_bounce {self.qa_bounces.get(mid,0)}/{self.args.max_bounces})")
         self.event(type="qa_verdict", milestone=mid, pr=pr["number"], verdict=verdict)
 
     def _ready(self, pr):
         sha = self._head_sha(pr)
-        forced = self.bounces.get(self._mid_of_pr(pr), 0) >= self.args.max_bounces
-        qa_ok = forced or any(c.get("body", "").strip().startswith(f"qa_passed@{sha[:12]}")
-                              for c in (self.gc.comments(self.repo, pr["number"]) or []))
-        ci_ok = forced or self.ci_done.get(sha) == "success"
+        mid = self._mid_of_pr(pr)
+        qa_forced = self.qa_bounces.get(mid, 0) >= self.args.max_bounces
+        ci_forced = self.ci_bounces.get(mid, 0) >= self.args.max_bounces
+        qa_ok = qa_forced or any(c.get("body", "").strip().startswith(f"qa_passed@{sha[:12]}")
+                                 for c in (self.gc.comments(self.repo, pr["number"]) or []))
+        ci_ok = ci_forced or self.ci_done.get(sha) == "success"
         return qa_ok and ci_ok
 
     def merge_gate(self, pr):
@@ -485,7 +495,7 @@ class Controller:
             for pr in self.gc.list_prs(self.repo, state="open"):
                 sha = self._head_sha(pr)
                 if self._pr_state(pr) in ("needs-review", "needs-qa") and self.ci_done.get(sha) == "failure":
-                    if self.bounces.get(self._mid_of_pr(pr), 0) >= self.args.max_bounces:
+                    if self.ci_bounces.get(self._mid_of_pr(pr), 0) >= self.args.max_bounces:
                         self.ci_done[sha] = "success"
                         self.gc.set_commit_status(self.repo, sha, state="success", context="ci/build",
                                                   description="forced (budget exhausted)")
@@ -538,7 +548,7 @@ def main():
     ap.add_argument("--work", default="/tmp/ctl_work")
     ap.add_argument("--event-log", default="/e2e_workspace/harnessed_events.jsonl")
     ap.add_argument("--call-timeout", type=int, default=2400)
-    ap.add_argument("--max-bounces", type=int, default=2)
+    ap.add_argument("--max-bounces", type=int, default=10)  # per-role cap (reviewer / qa / ci each)
     ap.add_argument("--max-passes", type=int, default=200)
     ap.add_argument("--max-idle", type=int, default=16)
     ap.add_argument("--poll-secs", type=int, default=10)
