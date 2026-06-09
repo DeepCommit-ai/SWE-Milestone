@@ -155,6 +155,7 @@ class Controller:
         self.bounces = {}                   # mid -> times bounced (:R/:Q) — budget for termination
         self.ci_done = {}                   # head_sha -> "success"/"failure"
         self.ci_out = {}                    # head_sha -> build log (for Dev to fix red CI)
+        self.main_builds = None             # None=unknown; True/False once probed (baseline-aware CI)
         os.makedirs(os.path.dirname(self.events), exist_ok=True)
 
     @staticmethod
@@ -302,23 +303,41 @@ class Controller:
         log(f"[dev] fixed PR #{pr['number']} ({state} -> next)")
         self.event(type="dev_fix", milestone=mid, pr=pr["number"], frm=state)
 
+    def _build(self):
+        cmd = detect_ci_cmd(self.work)
+        r = subprocess.run(["/bin/sh", "-c", cmd], cwd=self.work, capture_output=True, text=True,
+                           timeout=self.args.call_timeout)
+        return r.returncode == 0, (r.stdout + r.stderr)[-OUT_CAP:], cmd
+
+    def _probe_main_builds(self):
+        """Baseline-aware CI: does the repo's own main build in THIS env? Some repos (e.g. navidrome's
+        cgo/taglib) don't build with a generic command — we must not red-flag every PR for that. If
+        main doesn't build, CI becomes advisory (a PR only fails CI if it regresses a buildable base)."""
+        if self.main_builds is not None:
+            return
+        self._wc_checkout("main")
+        ok, _out, cmd = self._build()
+        self.main_builds = ok
+        log(f"[ci] baseline probe: main builds={ok} ({cmd[:60]}) -> CI is {'gating' if ok else 'ADVISORY'}")
+        self.event(type="ci_baseline", main_builds=ok)
+
     def run_ci(self, pr):
         sha = self._head_sha(pr)
         if not sha or self.ci_done.get(sha):
             return
+        self._probe_main_builds()
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
-        cmd = detect_ci_cmd(self.work)
-        log(f"[ci] PR #{pr['number']} head={sha[:8]} running: {cmd}")
-        r = subprocess.run(["/bin/sh", "-c", cmd], cwd=self.work, capture_output=True, text=True,
-                           timeout=self.args.call_timeout)
-        state = "success" if r.returncode == 0 else "failure"
-        self.gc.set_commit_status(self.repo, sha, state=state, context="ci/build",
-                                  description=cmd[:80])
+        ok, out, cmd = self._build()
+        # Advisory when the baseline itself can't build in this env: don't gate on a broken base.
+        state = "success" if (ok or not self.main_builds) else "failure"
+        desc = cmd[:70] + ("" if self.main_builds else " [advisory: base unbuildable]")
+        self.gc.set_commit_status(self.repo, sha, state=state, context="ci/build", description=desc[:90])
         self.ci_done[sha] = state
-        self.ci_out[sha] = (r.stdout + r.stderr)[-OUT_CAP:]  # build log for Dev to fix red CI
-        log(f"[ci] PR #{pr['number']} -> {state}")
-        self.event(type="ci_run", pr=pr["number"], result=state, sha=sha[:12])
+        self.ci_out[sha] = out
+        log(f"[ci] PR #{pr['number']} head={sha[:8]} build_ok={ok} -> {state}"
+            f"{'' if self.main_builds else ' (advisory)'}")
+        self.event(type="ci_run", pr=pr["number"], result=state, build_ok=ok, sha=sha[:12])
 
     def dev_fix_ci(self, pr):
         """Spec §3.1: project CI red → Dev fixes it (without bothering Reviewer/QA)."""
