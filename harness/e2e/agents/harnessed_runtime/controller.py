@@ -117,8 +117,10 @@ def role_prompt(roles_dir, role):
 
 
 # Toolchain bin dirs prepended to PATH for CI — the controller subprocess env doesn't reliably carry
-# them (e.g. go lives at /usr/local/go/bin), so `go build` returned 127 "not found". Make CI robust.
-_CI_PATH = "export PATH=\"/usr/local/go/bin:/go/bin:$HOME/go/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH\"; "
+# them (e.g. go lives at /usr/local/go/bin), so `go build` returned 127 "not found". Also pin build
+# caches to /tmp (always writable) so go/cargo don't fail on a non-writable HOME/.cache. Make CI robust.
+_CI_PATH = ('export PATH="/usr/local/go/bin:/go/bin:$HOME/go/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH"; '
+            'export GOCACHE=/tmp/ci-gocache GOFLAGS=-mod=mod CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"; ')
 
 
 def detect_ci_cmd(cwd):
