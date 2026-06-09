@@ -183,7 +183,11 @@ class Controller:
         git(self.testbed, "fetch", "gitea")  # so /testbed knows gitea/main for later sync
         # working clone
         subprocess.run(["rm", "-rf", self.work])
-        r = subprocess.run(["git", "clone", rem, self.work], capture_output=True, text=True)
+        # shallow clone: navidrome et al. have large histories; the roles only need the tip, and a
+        # smaller working tree reduces the container footprint (which mattered under host pressure).
+        r = subprocess.run(["git", "clone", "--depth", "1", rem, self.work], capture_output=True, text=True)
+        if not os.path.isdir(os.path.join(self.work, ".git")):
+            r = subprocess.run(["git", "clone", rem, self.work], capture_output=True, text=True)
         if not os.path.isdir(os.path.join(self.work, ".git")):
             raise RuntimeError(f"clone failed: {r.stderr[:300]}")
         # resume-safe: skip milestones already tagged in /testbed from a prior run
@@ -359,7 +363,7 @@ class Controller:
         mid = self._mid_of_pr(pr)
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
-        _, diff, _ = git(self.work, "diff", "origin/main...HEAD")
+        _, diff, _ = git(self.work, "diff", "origin/main", "HEAD")  # two-dot: works with shallow clones
         forced = self.bounces.get(mid, 0) >= self.args.max_bounces
         if forced:
             verdict = "approve"
