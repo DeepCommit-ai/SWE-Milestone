@@ -116,20 +116,27 @@ def role_prompt(roles_dir, role):
     return read_file(os.path.join(roles_dir, f"{role}.md")).strip()
 
 
+# Toolchain bin dirs prepended to PATH for CI — the controller subprocess env doesn't reliably carry
+# them (e.g. go lives at /usr/local/go/bin), so `go build` returned 127 "not found". Make CI robust.
+_CI_PATH = "export PATH=\"/usr/local/go/bin:/go/bin:$HOME/go/bin:$HOME/.cargo/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH\"; "
+
+
 def detect_ci_cmd(cwd):
     """Fast CI gate = build/compile (the red-light check). Full test suite is QA's job."""
     has = lambda f: os.path.exists(os.path.join(cwd, f))  # noqa: E731
     if has("go.mod"):
-        return "go build ./..."
-    if has("Cargo.toml"):
-        return "cargo build --workspace 2>&1 | tail -40"
-    if has("pom.xml"):
-        return "mvn -q -B -DskipTests compile"
-    if has("pyproject.toml") or has("setup.py"):
-        return "python -m compileall -q . >/dev/null 2>&1 || true; echo ok"
-    if has("package.json"):
-        return "npm run build --if-present 2>&1 | tail -40 || true"
-    return "echo '(no build system detected — CI pass)'"
+        cmd = "go build ./... 2>&1 | tail -40"
+    elif has("Cargo.toml"):
+        cmd = "cargo build --workspace 2>&1 | tail -40"
+    elif has("pom.xml"):
+        cmd = "mvn -q -B -DskipTests compile 2>&1 | tail -40"
+    elif has("pyproject.toml") or has("setup.py"):
+        cmd = "python -m compileall -q . >/dev/null 2>&1 || true; echo ok"
+    elif has("package.json"):
+        cmd = "npm run build --if-present 2>&1 | tail -40 || true"
+    else:
+        return "echo '(no build system detected — CI pass)'"
+    return _CI_PATH + cmd
 
 
 class Controller:
@@ -145,6 +152,7 @@ class Controller:
         self.tagged = set()
         self.bounces = {}                   # mid -> times bounced (:R/:Q) — budget for termination
         self.ci_done = {}                   # head_sha -> "success"/"failure"
+        self.ci_out = {}                    # head_sha -> build log (for Dev to fix red CI)
         os.makedirs(os.path.dirname(self.events), exist_ok=True)
 
     @staticmethod
@@ -306,8 +314,25 @@ class Controller:
         self.gc.set_commit_status(self.repo, sha, state=state, context="ci/build",
                                   description=cmd[:80])
         self.ci_done[sha] = state
+        self.ci_out[sha] = (r.stdout + r.stderr)[-OUT_CAP:]  # build log for Dev to fix red CI
         log(f"[ci] PR #{pr['number']} -> {state}")
         self.event(type="ci_run", pr=pr["number"], result=state, sha=sha[:12])
+
+    def dev_fix_ci(self, pr):
+        """Spec §3.1: project CI red → Dev fixes it (without bothering Reviewer/QA)."""
+        mid = self._mid_of_pr(pr)
+        branch = (pr.get("head") or {}).get("ref")
+        self._wc_checkout(branch)
+        build_log = self.ci_out.get(self._head_sha(pr), "(build failed)")
+        task = (f"{role_prompt(self.args.roles_dir, 'dev')}\n\n## Milestone: {mid}\nThe project CI build is RED. "
+                f"Fix the build in the current repo ({self.work}) so it compiles. Build output:\n\n"
+                f"{build_log}\n\nLeave changes ready to commit. Do NOT git tag or open a PR.")
+        run_claude(task, self.args, f"dev-ci-{mid}-{self.bounces.get(mid,0)}", self.work)
+        git_commit_all(self.work, f"{mid}: fix CI build")
+        git(self.work, "push", "-f", "origin", branch)
+        self.bounces[mid] = self.bounces.get(mid, 0) + 1
+        log(f"[dev] fixed red CI on PR #{pr['number']} (bounce {self.bounces[mid]})")
+        self.event(type="dev_fix_ci", milestone=mid, pr=pr["number"])
 
     def reviewer(self, pr):
         mid = self._mid_of_pr(pr)
@@ -430,6 +455,18 @@ class Controller:
                     self._safe("dev_open", self.dev_open, mid, iss["number"])
             for pr in self.gc.list_prs(self.repo, state="open"):
                 self._safe("ci", self.run_ci, pr)
+            # Red CI on an active PR → Dev fixes it (spec §3.1: don't bother Reviewer/QA). Budget-bounded:
+            # once a milestone exhausts its bounce budget, force CI green so it can proceed (avoid stall).
+            for pr in self.gc.list_prs(self.repo, state="open"):
+                sha = self._head_sha(pr)
+                if self._pr_state(pr) in ("needs-review", "needs-qa") and self.ci_done.get(sha) == "failure":
+                    if self.bounces.get(self._mid_of_pr(pr), 0) >= self.args.max_bounces:
+                        self.ci_done[sha] = "success"
+                        self.gc.set_commit_status(self.repo, sha, state="success", context="ci/build",
+                                                  description="forced (budget exhausted)")
+                        log(f"[ci] PR #{pr['number']} budget exhausted -> force CI green")
+                    else:
+                        self._safe("dev_fix_ci", self.dev_fix_ci, pr)
             for pr in self.gc.list_prs(self.repo, state="open"):
                 if self._pr_state(pr) == "needs-review" and self.ci_done.get(self._head_sha(pr)) == "success":
                     self._safe("reviewer", self.reviewer, pr)
@@ -446,10 +483,12 @@ class Controller:
             if mids and all(m in self.tagged for m in mids) and no_more:
                 log("[pacer] all milestones tagged + queue drained — done")
                 break
-            # idle = a full pass that changed no Gitea state (robust vs idempotent no-op skips)
+            # idle = a full pass that changed no Gitea state (robust vs idempotent no-op skips).
+            # Include head sha so a Dev CI-fix (new commit, same label) counts as progress, not idle.
             now = self.gc.list_prs(self.repo, state="all")
             sig = (len(self.tagged),
-                   tuple(sorted((p["number"], "|".join(sorted(self._labels(p)))) for p in now)))
+                   tuple(sorted((p["number"], "|".join(sorted(self._labels(p))), self._head_sha(p)[:8])
+                                for p in now)))
             if sig == last_sig:
                 idle += 1
                 if idle >= self.args.max_idle:
