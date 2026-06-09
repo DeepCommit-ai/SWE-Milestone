@@ -361,6 +361,14 @@ def main():
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
+    # Harnessed-agent knobs (read from the trial config so each config-group is a self-contained yaml).
+    # Exported to the env the detached workers inherit; HarnessedFramework reads them. A shell-exported
+    # var still wins (setdefault). harnessed_session e.g. "dev:B,reviewer:C,qa:C"; harnessed_max_bounces e.g. 10.
+    if cfg.get("harnessed_session"):
+        os.environ.setdefault("HARNESSED_SESSION", str(cfg["harnessed_session"]))
+    if cfg.get("harnessed_max_bounces") is not None:
+        os.environ.setdefault("HARNESSED_MAX_BOUNCES", str(cfg["harnessed_max_bounces"]))
+
     # Anti-cheat ("quarantine") is now PER-REPO and auto-on: each repo's policy
     # lives in quarantine_configs/<repo>.yaml and is applied only to that repo's
     # container at spawn time (load_quarantine_env). No trial-config block. Warn

@@ -197,6 +197,8 @@ class Controller:
         self.ci_out = {}                    # head_sha -> CI log (for Dev to fix red CI)
         self.main_ci_ok = None              # None=unprobed; does untouched main pass the project CI?
         self.sessions = Sessions(parse_session_config(args.session_config))
+        self._seen = set()                  # (role, mid) already called once — distinguishes a new-milestone
+                                            # resume (strategy B) from a same-milestone iteration in _call.
         os.makedirs(os.path.dirname(self.events), exist_ok=True)
 
     @staticmethod
@@ -360,14 +362,25 @@ class Controller:
         git(self.work, "checkout", "-B", ref, f"origin/{ref}")
 
     def _call(self, role, mid, fresh_task, label_suffix, resume_task=None):
-        """Run the role's claude. Fresh session → full role.md system prompt + fresh_task. Resume → a
-        short "(continuing as <role>)" header + resume_task (a lean delta: which PR/milestone, what
-        happened — request rejected / new code pushed — WITHOUT re-pasting the SRS the session already read)."""
+        """Run the role's claude with the right prompt for one of THREE situations:
+          1. fresh session              → full role.md system prompt + fresh_task;
+          2. resumed session, but the FIRST task for THIS milestone (strategy B carried the session over
+             from a prior milestone) → "(continuing — new milestone)" + fresh_task (new assignment, no
+             role.md re-sent);
+          3. resumed session, an ITERATION on the same milestone (re-review / re-fix / re-test) → a lean
+             "(continuing)" + resume_task delta (which PR/milestone, what happened; SRS by path, not pasted).
+        Distinguishing (2) from (3) is essential: without it, B's first review of milestone N+1 would wrongly
+        get the 're-review, you requested changes' delta for a PR the role never saw."""
         sid, resume = self.sessions.acquire(role, mid)
-        if resume:
-            prompt = f"(Continuing your work as {role}.)\n\n{resume_task or fresh_task}"
-        else:
+        first_for_mid = (role, mid) not in self._seen
+        self._seen.add((role, mid))
+        if not resume:
             prompt = f"{role_prompt(self.args.roles_dir, role)}\n\n{fresh_task}"
+        elif first_for_mid:
+            prompt = (f"(Continuing as {role} — now on a NEW milestone; your working tree has been reset to it.)"
+                      f"\n\n{fresh_task}")
+        else:
+            prompt = f"(Continuing your work as {role}.)\n\n{resume_task or fresh_task}"
         return run_claude(prompt, self.args, f"{role}-{label_suffix}", self.work, sid, resume)
 
     # --- role actions -----------------------------------------------
