@@ -1,28 +1,49 @@
 ---
 name: ci-maintenance-check
-description: Reviewer skill — audit whether the Dev genuinely maintains the project CI pipeline (ci.sh + .gitea/workflows/ci.yaml) and has not weakened it to make a PR pass.
+description: Use when reviewing pull requests or code changes that touch build, tests, CI workflows, test runners, dependencies, or release safety; audits whether CI remains real, change-covering, unweakened, reproducible, secure, and locally green.
 ---
 
-# CI Maintenance Check (Reviewer)
+# CI Maintenance Check
 
-The Dev owns and must continuously maintain the project's CI pipeline. When you review a PR, audit that
-ownership. Run these checks in the checked-out branch and fold the result into your review verdict.
+The change author owns the project's CI signal. During review, audit whether the repository still has a
+real, trustworthy build-and-test path for the changed code. Run these checks in the checked-out branch
+and fold the result into your review verdict.
 
-1. **The pipeline exists and is real.** `ci.sh` (repo root) and `.gitea/workflows/ci.yaml` are present;
-   the workflow runs `ci.sh` on push/PR. `ci.sh` must actually **build the project AND run its test
-   suite** for the affected area — not a stub, not `echo ok`.
+1. **Discover the CI entrypoint.** Identify how this repo expects CI to run: workflow files
+   (`.github/workflows`, `.gitea/workflows`, `.gitlab-ci.yml`, etc.), CI wrapper scripts
+   (`ci.sh`, `scripts/ci*`), `Makefile` targets, package scripts, or language-native build files
+   (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, and similar). Prefer the documented
+   one-command CI path when it exists.
 
-2. **It covers this change.** If the PR adds or changes behavior, CI must build and test that code path
-   (the right package/crate/module is in scope, not excluded).
+2. **The pipeline exists and is real.** CI must actually build the project and run the relevant test
+   suite for the affected area. It is not acceptable for CI to be a stub, an `echo ok`, a metadata-only
+   check, or a command that silently no-ops when tools are missing.
 
-3. **It was NOT weakened to pass (the key audit).** REQUEST_CHANGES if you find any of:
-   - test or build steps removed / commented out / scoped away from the changed code;
-   - failures masked: `|| true`, `continue-on-error`, `--no-fail-fast` used to hide red, `set -e` removed;
-   - assertions deleted or weakened; tests skipped / `#[ignore]` / `t.Skip` / `xfail` added to dodge them;
+3. **It covers this change.** If the PR adds or changes behavior, CI must build and test that code path:
+   the affected package, crate, module, service, or integration path must be in scope. Check path
+   filters, matrices, package selection, test patterns, and workspace exclusions for accidental or
+   intentional gaps.
+
+4. **It was NOT weakened to pass (the key audit).** REQUEST_CHANGES if you find any of:
+   - build, lint, or test steps removed, commented out, narrowed, or scoped away from the changed code;
+   - failures masked with `|| true`, `continue-on-error`, swallowed exit codes, `set +e`, or wrappers that
+     always return success;
+   - assertions deleted or weakened; tests skipped with `skip`, `only`, `#[ignore]`, `t.Skip`, `xfail`, or
+     equivalent mechanisms to dodge failures;
    - the toolchain/PATH setup stripped so steps silently no-op.
 
-4. **It is actually green on this head.** The `ci/build` commit status for the current head is `success`,
-   and that green came from a real build+test run (cross-check against point 3).
+5. **Important CI health dimensions are intact.**
+   - Reproducibility: dependencies, lockfiles, tool versions, and generated artifacts are consistent
+     enough that CI can run from a clean checkout.
+   - Security: workflows do not expose secrets, print tokens, install untrusted code with elevated
+     permissions, or grant broader permissions than the job needs.
+   - Diagnostics: failures should be visible and actionable; timeouts, flaky-test quarantines, and
+     retries need clear justification rather than hiding red builds.
+
+6. **It is locally green on this head.** Run the repo's local CI equivalent when possible, or the closest
+   build-and-test commands for the affected area. A green result only counts if it came from a real
+   build+test run and the anti-weakening audit above still holds. If local execution is impossible,
+   report the concrete blocker and review the CI definition more strictly.
 
 Report concrete findings (cite the file + line). A weakened or unmaintained CI is itself grounds for
 `REQUEST_CHANGES`, independent of the code change's correctness.

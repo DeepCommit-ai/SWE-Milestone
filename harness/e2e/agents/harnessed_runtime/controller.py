@@ -315,6 +315,11 @@ class Controller:
     def srs_of(self, mid):
         return read_file(os.path.join(self.args.workspace, "srs", f"{mid}_SRS.md"))[:SRS_CAP]
 
+    def srs_path(self, mid):
+        """Container path where the SRS lives — accessible to every role agent. We reference it instead
+        of pasting the SRS into prompts (especially on resume, the session has already read it)."""
+        return f"{self.args.workspace}/srs/{mid}_SRS.md"
+
     def sync_issues(self):
         mids, _ = self.available_milestones()
         for mid in mids:
@@ -354,13 +359,15 @@ class Controller:
         git(self.work, "fetch", "origin")
         git(self.work, "checkout", "-B", ref, f"origin/{ref}")
 
-    def _call(self, role, mid, task, label_suffix):
-        """Build the role prompt (full on a fresh session, incremental on resume) and run claude."""
+    def _call(self, role, mid, fresh_task, label_suffix, resume_task=None):
+        """Run the role's claude. Fresh session → full role.md system prompt + fresh_task. Resume → a
+        short "(continuing as <role>)" header + resume_task (a lean delta: which PR/milestone, what
+        happened — request rejected / new code pushed — WITHOUT re-pasting the SRS the session already read)."""
         sid, resume = self.sessions.acquire(role, mid)
         if resume:
-            prompt = f"(Continuing your work as {role}.)\n\n{task}"
+            prompt = f"(Continuing your work as {role}.)\n\n{resume_task or fresh_task}"
         else:
-            prompt = f"{role_prompt(self.args.roles_dir, role)}\n\n{task}"
+            prompt = f"{role_prompt(self.args.roles_dir, role)}\n\n{fresh_task}"
         return run_claude(prompt, self.args, f"{role}-{label_suffix}", self.work, sid, resume)
 
     # --- role actions -----------------------------------------------
@@ -374,11 +381,10 @@ class Controller:
             return
         self._wc_checkout("main")
         git(self.work, "checkout", "-B", branch, "main")
-        task = (f"## Milestone to implement: {mid}\n## Requirement (SRS)\n{self.srs_of(mid)}\n\n"
-                f"Implement this in the current repo ({self.work}). As CI owner, ensure the project CI "
-                f"(`ci.sh`) still builds + passes after your change, extending it if the change needs new "
-                f"coverage. Build/run the relevant tests locally. Leave changes ready to commit. Do NOT "
-                f"git tag, branch, or open a PR — the harness handles that.")
+        task = (f"## Milestone to implement: {mid}\nRead the full requirement (SRS) at `{self.srs_path(mid)}`.\n\n"
+                f"Implement it in the current repo ({self.work}). As CI owner, keep the project CI building + "
+                f"passing after your change, extending it if new coverage is needed. Build/run the relevant "
+                f"tests locally. Leave changes ready to commit. Do NOT git tag, branch, or open a PR.")
         self._call("dev", mid, task, f"open-{mid}")
         git_commit_all(self.work, f"{mid}: implement")
         git(self.work, "push", "-f", "origin", branch)
@@ -401,10 +407,14 @@ class Controller:
         self._wc_checkout(branch)
         comments = self.gc.comments(self.repo, pr["number"]) or []
         feedback = comments[-1]["body"][:OUT_CAP] if comments else "(see review)"
-        task = (f"## Milestone: {mid}\nThe team requested changes on your PR:\n\n{feedback}\n\n"
-                f"Address them in the current repo ({self.work}); keep the project CI (`ci.sh`) green. "
-                f"Leave changes ready to commit. Do NOT git tag or open a PR.")
-        self._call("dev", mid, task, f"fix-{mid}-{self.rev_bounces.get(mid,0)+self.qa_bounces.get(mid,0)}")
+        fresh = (f"## Your PR for milestone {mid} was sent back. Requirement (SRS): `{self.srs_path(mid)}`.\n"
+                 f"The team requested these changes:\n\n{feedback}\n\nAddress them in the current repo "
+                 f"({self.work}); keep the project CI green. Leave changes ready to commit. No git tag / PR.")
+        resume = (f"## Your PR for milestone {mid} was sent back with requested changes:\n\n{feedback}\n\n"
+                  f"Address them in the current repo ({self.work}); keep CI green. No git tag / PR. "
+                  f"(SRS unchanged at `{self.srs_path(mid)}` if you need it.)")
+        self._call("dev", mid, fresh, f"fix-{mid}-{self.rev_bounces.get(mid,0)+self.qa_bounces.get(mid,0)}",
+                   resume_task=resume)
         git_commit_all(self.work, f"{mid}: address feedback")
         git(self.work, "push", "-f", "origin", branch)
         self._relabel(pr, state, next_state(state, actor="dev", verdict="fixed"))
@@ -417,10 +427,12 @@ class Controller:
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
         build_log = self.ci_out.get(self._head_sha(pr), "(ci failed)")
-        task = (f"## Milestone: {mid}\nThe project CI (`ci.sh`) is RED. As CI owner, fix it in the current "
-                f"repo ({self.work}) so build + tests pass. Do NOT weaken the CI to hide failures — fix the "
-                f"real cause. CI output:\n\n{build_log}\n\nLeave changes ready to commit. No git tag / PR.")
-        self._call("dev", mid, task, f"ci-{mid}-{self.ci_bounces.get(mid,0)}")
+        fresh = (f"## The project CI on your PR for milestone {mid} is RED. As CI owner, fix the REAL cause "
+                 f"in the current repo ({self.work}) so build + tests pass — do NOT weaken CI to hide it. "
+                 f"CI output:\n\n{build_log}\n\nLeave changes ready to commit. No git tag / PR.")
+        resume = (f"## Your PR's CI for milestone {mid} is now RED. Fix the real cause (do not weaken CI). "
+                  f"CI output:\n\n{build_log}\n\nLeave changes ready to commit. No git tag / PR.")
+        self._call("dev", mid, fresh, f"ci-{mid}-{self.ci_bounces.get(mid,0)}", resume_task=resume)
         git_commit_all(self.work, f"{mid}: fix CI")
         git(self.work, "push", "-f", "origin", branch)
         self.ci_bounces[mid] = self.ci_bounces.get(mid, 0) + 1
@@ -449,13 +461,16 @@ class Controller:
             verdict = "approve"
             log(f"[reviewer] PR #{pr['number']} budget exhausted -> force approve")
         else:
-            task = (f"## PR under review: milestone {mid}\nThe PR branch is checked out in your working "
-                    f"directory ({self.work}); base is `origin/main`. Use git + read the code to review the "
-                    f"actual change (`git diff origin/main...HEAD`).\n## Requirement (SRS)\n{self.srs_of(mid)}\n\n"
-                    f"ALSO audit the Dev's CI maintenance: load and follow the skill at `{CI_SKILL}` "
-                    f"(read it) — verify `ci.sh` is real, covers this change, and was not weakened. "
-                    f"Then give your verdict.")
-            out = self._call("reviewer", mid, task, f"{mid}-{self.rev_bounces.get(mid,0)}")
+            fresh = (f"## PR under review: milestone {mid}\nThe PR branch is checked out in your working "
+                     f"directory ({self.work}); base is `origin/main`. Read the requirement (SRS) at "
+                     f"`{self.srs_path(mid)}`, then review the actual change (`git diff origin/main...HEAD`).\n"
+                     f"ALSO audit the Dev's CI maintenance using the ci-maintenance-check skill (read it at "
+                     f"`{CI_SKILL}`). Then give your verdict.")
+            resume = (f"## Re-review: milestone {mid}\nThe Dev pushed a new commit addressing the changes you "
+                      f"requested on this PR. Re-examine the current diff (`git diff origin/main...HEAD`) — focus "
+                      f"on whether your concerns are resolved, and re-check CI maintenance. (SRS unchanged at "
+                      f"`{self.srs_path(mid)}`.) Give your verdict.")
+            out = self._call("reviewer", mid, fresh, f"{mid}-{self.rev_bounces.get(mid,0)}", resume_task=resume)
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
             verdict = "approve" if parse_verdict(out, "APPROVE", "REQUEST_CHANGES") != "REQUEST_CHANGES" else "request-changes"
         if verdict == "request-changes":
@@ -472,13 +487,16 @@ class Controller:
             verdict, out = "pass", ""
             log(f"[qa] PR #{pr['number']} budget exhausted -> force pass")
         else:
-            task = (f"## PR under test: milestone {mid}\nThe PR branch is checked out in your working "
-                    f"directory ({self.work}); base is `origin/main`.\n## Requirement (SRS)\n{self.srs_of(mid)}\n\n"
-                    f"As Test-Suite owner: build the project and run its tests, AND write/strengthen tests "
-                    f"in the suite that deeply exercise this milestone's required behavior (mirror the "
-                    f"codebase's conventions / verify cross-type interface symmetry). Any tests you add will "
-                    f"be committed. Give your verdict from real execution.")
-            out = self._call("qa", mid, task, f"{mid}-{self.qa_bounces.get(mid,0)}")
+            fresh = (f"## PR under test: milestone {mid}\nThe PR branch is checked out in your working "
+                     f"directory ({self.work}); base is `origin/main`. Requirement (SRS): `{self.srs_path(mid)}`.\n"
+                     f"As Test-Suite owner: build the project and run its tests, AND write/strengthen tests in "
+                     f"the suite that deeply exercise this milestone's required behavior (mirror the codebase's "
+                     f"conventions / verify cross-type interface symmetry). Tests you add are committed. Give "
+                     f"your verdict from real execution.")
+            resume = (f"## Re-test: milestone {mid}\nThe Dev pushed a fix for the bug you found on this PR. "
+                      f"Re-verify by building + running the tests (including the ones you added). (SRS unchanged "
+                      f"at `{self.srs_path(mid)}`.) Give your verdict from real execution.")
+            out = self._call("qa", mid, fresh, f"{mid}-{self.qa_bounces.get(mid,0)}", resume_task=resume)
             verdict = "pass" if parse_verdict(out, "PASS", "FAIL") != "FAIL" else "bug"
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
         # QA maintains the Test Suite: commit + push any tests it wrote/updated (head sha will change;
