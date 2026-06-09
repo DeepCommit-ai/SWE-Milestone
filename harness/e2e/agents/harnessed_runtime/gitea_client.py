@@ -33,16 +33,25 @@ class GiteaClient:
         if params:
             url += "?" + urlencode(params)
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", f"token {self.token}")
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req) as r:
-                raw = r.read()
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as e:
-            raise GiteaError(f"{method} {path} -> {e.code}: {e.read().decode()[:300]}") from None
+        # Retry transient connection errors (Gitea restart/blip on a busy host). HTTPError (a real
+        # API response like 404/409/405) is NOT retried — those are surfaced immediately.
+        import time as _t
+        last = None
+        for attempt in range(6):
+            req = urllib.request.Request(url, data=data, method=method)
+            req.add_header("Authorization", f"token {self.token}")
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    raw = r.read()
+                    return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                raise GiteaError(f"{method} {path} -> {e.code}: {e.read().decode()[:300]}") from None
+            except (urllib.error.URLError, OSError) as e:
+                last = e
+                _t.sleep(min(2 ** attempt, 20))
+        raise GiteaError(f"{method} {path} -> connection failed after retries: {last}")
 
     def _paginate(self, path: str, params=None) -> list:
         """GET every page. Gitea caps page size at ~50 and silently ignores limit>50, so a single

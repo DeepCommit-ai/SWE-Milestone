@@ -57,13 +57,19 @@ class HarnessedFramework(ClaudeCodeFramework):
 
     def get_container_env_vars(self) -> List[str]:
         env = super().get_container_env_vars()
-        # Point GITEA_URL at Gitea's bridge container IP (not localhost / not the gateway).
-        port = "3000"
-        m = re.search(r":(\d+)", os.environ.get("GITEA_URL", ""))
-        if m:
-            port = m.group(1)
-        ip = self._gitea_container_ip()
-        url = f"http://{ip}:{port}" if ip else os.environ.get("GITEA_URL", "http://172.17.0.3:3000")
+        # In-container Gitea URL, in preference order:
+        # 1) GITEA_INCONTAINER_URL — Gitea's FIXED IP on the coordination network (gitea_up.sh); stable
+        #    across Gitea restarts and reachable because container_setup joins the agent to that net.
+        # 2) docker inspect the Gitea container's current bridge IP (fallback for older setups).
+        # localhost is NOT usable in-container, so we never fall back to it silently.
+        url = os.environ.get("GITEA_INCONTAINER_URL", "").strip()
+        if not url:
+            ip = self._gitea_container_ip()
+            port = (re.search(r":(\d+)", os.environ.get("GITEA_URL", "")) or [None, "3000"])[1]
+            url = f"http://{ip}:{port}" if ip else ""
+        if not url:
+            raise RuntimeError("harnessed: cannot resolve in-container Gitea URL — set GITEA_INCONTAINER_URL "
+                               "(run scripts/gitea_up.sh) or ensure the Gitea container is up.")
         env.extend([
             "-e", f"GITEA_URL={url}",
             "-e", f"GITEA_TOKEN={os.environ.get('GITEA_TOKEN', '')}",
