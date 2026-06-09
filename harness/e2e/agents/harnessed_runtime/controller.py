@@ -137,26 +137,36 @@ def run_claude(prompt_text, args, label, cwd, session_id, resume):
 
 
 class Sessions:
-    """Per-role Claude session strategy.
-      A = fresh session every call (no continuity).
-      B = one persistent session per role for the whole trial (max continuity; matches spec /loop).
-      C = one session per (role, milestone) — continuity within a milestone, fresh across milestones.
-    Configured per role, e.g. {"dev":"B","reviewer":"C","qa":"C"}."""
+    """Per-role Claude session strategy (how much memory a role carries between its calls):
+      fresh      = a fresh session EVERY call — no memory carried (the agent re-reads/re-explores each time).
+      milestone  = one session per (role, milestone) — memory WITHIN a milestone (open→fix→re-review etc.),
+                   reset between milestones.
+      persistent = one session per role for the WHOLE trial — memory across ALL milestones (the spec /loop
+                   ideal: a role that builds up knowledge of the repo; context grows over a long run).
+    Configured per role, e.g. {"dev":"persistent","reviewer":"milestone","qa":"milestone"}. The legacy
+    single letters A/B/C are accepted as aliases (fresh/persistent/milestone)."""
+
+    _ALIAS = {"a": "fresh", "b": "persistent", "c": "milestone",
+              "fresh": "fresh", "persistent": "persistent", "milestone": "milestone"}
 
     def __init__(self, strategy_map):
-        self.strat = {k: (v or "C").upper() for k, v in strategy_map.items()}
+        self.strat = {k: self._norm(v) for k, v in strategy_map.items()}
         self.ids = {}        # key -> session_id
         self.started = set()  # session_ids already started (so next call --resumes)
 
+    @staticmethod
+    def _norm(v):
+        return Sessions._ALIAS.get((v or "milestone").strip().lower(), "milestone")
+
     def strategy(self, role):
-        return self.strat.get(role, "C")
+        return self.strat.get(role, "milestone")
 
     def acquire(self, role, mid):
         """Return (session_id, is_resume) for this role+milestone under its configured strategy."""
         s = self.strategy(role)
-        if s == "A":
+        if s == "fresh":
             return str(uuid.uuid4()), False
-        key = role if s == "B" else f"{role}:{mid}"
+        key = role if s == "persistent" else f"{role}:{mid}"
         sid = self.ids.get(key)
         if sid is None:
             sid = str(uuid.uuid4())
@@ -167,13 +177,14 @@ class Sessions:
 
 
 def parse_session_config(spec):
-    """'dev:B,reviewer:C,qa:C' -> {'dev':'B','reviewer':'C','qa':'C'}."""
+    """'dev:persistent,reviewer:milestone,qa:milestone' -> {'dev':'persistent',...}. Values are
+    normalized (incl. legacy A/B/C aliases) by Sessions._norm at use."""
     out = {}
     for part in (spec or "").split(","):
         part = part.strip()
         if ":" in part:
             role, strat = part.split(":", 1)
-            out[role.strip()] = strat.strip().upper()
+            out[role.strip()] = strat.strip()
     return out
 
 
@@ -648,7 +659,7 @@ def main():
     ap.add_argument("--roles-dir", required=True)
     ap.add_argument("--work", default="/tmp/ctl_work")
     ap.add_argument("--event-log", default="/e2e_workspace/harnessed_events.jsonl")
-    ap.add_argument("--session-config", default="dev:B,reviewer:C,qa:C")
+    ap.add_argument("--session-config", default="dev:persistent,reviewer:milestone,qa:milestone")
     ap.add_argument("--call-timeout", type=int, default=2400)
     ap.add_argument("--max-bounces", type=int, default=10)
     ap.add_argument("--max-passes", type=int, default=200)

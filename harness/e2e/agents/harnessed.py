@@ -86,9 +86,9 @@ class HarnessedFramework(ClaudeCodeFramework):
             "--testbed", "/testbed",
             "--event-log", "/e2e_workspace/harnessed_events.jsonl",
             "--max-bounces", os.environ.get("HARNESSED_MAX_BOUNCES", str(self._max_bounces)),
-            # Per-role session strategy (A=fresh / B=persistent-per-role / C=per-milestone resume),
-            # configurable per agent via the HARNESSED_SESSION env var, e.g. "dev:B,reviewer:C,qa:C".
-            "--session-config", os.environ.get("HARNESSED_SESSION", "dev:B,reviewer:C,qa:C"),
+            # Per-role session strategy (fresh / milestone / persistent), configurable per agent via the
+            # HARNESSED_SESSION env or the trial yaml's harnessed_session field.
+            "--session-config", os.environ.get("HARNESSED_SESSION", "dev:persistent,reviewer:milestone,qa:milestone"),
         ]
         effort = self.get_effective_reasoning_effort()
         if effort:
