@@ -35,6 +35,10 @@ from labels import next_state  # noqa: E402
 
 SRS_CAP = 20000
 OUT_CAP = 16000
+# Give up merging a PR (mark it failed, never tag) after this many merge_gate attempts across passes.
+# An EMPTY PR (Dev produced no diff) makes Gitea return "405 Please try again later" forever; without a
+# cap the pacer force-tagged it at the wrong commit and re-processed it every pass (the merge storm).
+MERGE_GIVEUP = 3
 RUNTIME = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.expanduser("~/.claude/skills")
 CI_SKILL = os.path.join(SKILL_DIR, "ci-maintenance-check", "SKILL.md")
@@ -92,14 +96,17 @@ def role_prompt(roles_dir, role):
 
 
 def parse_verdict(text, positive, negative):
+    """Scan for an explicit 'VERDICT:' line. Returns positive / negative / None. The NEGATIVE token is
+    checked FIRST so 'VERDICT: not approved' / 'do not pass' read as negative — a quality gate must fail
+    closed, and callers treat None (no / garbled verdict, e.g. a timed-out role) as the negative outcome."""
     found = None
     for line in text.splitlines():
         s = line.strip().upper()
         if s.startswith("VERDICT:"):
-            if positive in s:
-                found = positive
-            elif negative in s:
+            if negative in s:
                 found = negative
+            elif positive in s:
+                found = positive
     return found
 
 
@@ -199,6 +206,8 @@ class Controller:
         self.events = os.path.join(args.event_log)
         self.issued = {}                    # mid -> issue number
         self.tagged = set()
+        self.abandoned = set()              # mids given up on (unmergeable empty PR OR CI gate never green) — never tagged
+        self.merge_attempts = {}            # mid -> merge_gate attempt count (give up after MERGE_GIVEUP)
         # SEPARATE per-role retry budgets (each capped at args.max_bounces) so the review loop doesn't
         # consume QA's budget (which was force-skipping QA).
         self.rev_bounces = {}
@@ -230,10 +239,18 @@ class Controller:
         rem = self.remote()
         git(self.testbed, "remote", "remove", "gitea")
         git(self.testbed, "remote", "add", "gitea", rem)
-        rc, _, err = git(self.testbed, "push", "-f", "gitea", "HEAD:refs/heads/main")
-        if rc != 0:
-            log(f"[setup] push /testbed→gitea WARN: {err[:200]}")
+        # Seed Gitea main from /testbed ONLY on a fresh repo (no PRs ever opened). On a restart the Gitea
+        # repo already holds merged milestone work that /testbed may not — force-pushing /testbed over it
+        # would DESTROY merged milestones. In that case adopt gitea/main as the source of truth instead.
+        existing_prs = bool(self.gc.list_prs(self.repo, state="all"))
         git(self.testbed, "fetch", "gitea")
+        if not existing_prs:
+            rc, _, err = git(self.testbed, "push", "-f", "gitea", "HEAD:refs/heads/main")
+            if rc != 0:
+                log(f"[setup] seed /testbed->gitea main WARN: {err[:200]}")
+        else:
+            log("[setup] existing PRs on Gitea — adopting gitea/main (NOT force-pushing; preserves merged work)")
+            git(self.testbed, "reset", "--hard", "gitea/main")
         subprocess.run(["rm", "-rf", self.work])
         r = subprocess.run(["git", "clone", rem, self.work], capture_output=True, text=True)
         if not os.path.isdir(os.path.join(self.work, ".git")):
@@ -242,6 +259,13 @@ class Controller:
         _, out, _ = git(self.testbed, "tag", "-l", "agent-impl-*")
         for t in out.split():
             self.tagged.add(t.replace("agent-impl-", ""))
+        # Resume-safe: rebuild abandoned from the persisted 'harness-abandoned' label so a milestone we gave
+        # up merging isn't re-opened / re-processed (and idle-spun) after a restart.
+        for pr in self.gc.list_prs(self.repo, state="all"):
+            if "harness-abandoned" in self._labels(pr):
+                fm = self._mid_of_pr(pr)
+                if fm:
+                    self.abandoned.add(fm)
         for iss in self.gc.list_issues(self.repo, labels=["evoclaw-task"], state="all"):
             m = re.match(r"\[([^\]]+)\]", iss.get("title", ""))
             if m:
@@ -308,14 +332,15 @@ class Controller:
         return r.returncode == 0, (r.stdout + r.stderr)[-OUT_CAP:]
 
     def _probe_main_ci(self):
-        """Does untouched main pass the project CI in THIS env? If not (e.g. missing system lib), CI is
-        advisory so we don't red-flag every PR for a pre-existing env gap — but we log it loudly."""
+        """DIAGNOSTIC: does untouched main pass the project CI in THIS env? Recorded so Dev knows whether
+        it must also fix a broken base build (e.g. a missing system lib) to make CI a valid passable gate.
+        This NO LONGER weakens the gate — CI is always enforced on the real ci.sh result."""
         if self.main_ci_ok is not None:
             return
         self._wc_checkout("main")
         ok, _out = self._run_project_ci()
         self.main_ci_ok = ok
-        log(f"[ci] baseline probe: main CI {'PASS -> gating' if ok else 'FAIL -> ADVISORY (env)'}")
+        log(f"[ci] baseline probe: untouched main CI {'PASS' if ok else 'FAIL (Dev must make the gate valid)'}")
         self.event(type="ci_baseline", main_ci_ok=ok)
 
     # --- milestone inputs -------------------------------------------
@@ -365,12 +390,32 @@ class Controller:
         return ((pr.get("head") or {}).get("sha")) or ""
 
     def _relabel(self, pr, old, new):
-        self.gc.remove_labels(self.repo, pr["number"], [old])
+        # Add the NEW state before removing the old: if the process dies / Gitea errors between the two
+        # calls, the PR keeps a state label (still actionable) instead of being orphaned with none (which
+        # _pr_state reads as None -> only the no-op observer touches it -> it never advances or merges).
         self.gc.add_labels(self.repo, pr["number"], [new])
+        self.gc.remove_labels(self.repo, pr["number"], [old])
 
     def _wc_checkout(self, ref):
         git(self.work, "fetch", "origin")
-        git(self.work, "checkout", "-B", ref, f"origin/{ref}")
+        # Hard-clean the SHARED working clone before switching branches. A prior role in the same pass
+        # (especially Reviewer, which never commits) can leave tracked edits / untracked files that make
+        # `checkout -B` ABORT — silently stranding the tree on the wrong branch so the next role acts on
+        # the wrong milestone's code. Reset + clean guarantees a pristine checkout; a hard failure raises
+        # (caught by _safe) so the action retries instead of running on the wrong tree.
+        git(self.work, "reset", "--hard")
+        git(self.work, "clean", "-fd")
+        rc, _, err = git(self.work, "checkout", "-B", ref, f"origin/{ref}")
+        if rc != 0:
+            raise RuntimeError(f"checkout {ref} failed in shared clone: {err[:200]}")
+
+    def _push(self, branch):
+        """Force-push the shared clone's branch to Gitea, CHECKED. A silently-failed push would leave the
+        remote head stale, so Reviewer/QA/merge act on the OLD code while the label says 'fixed'. Raising
+        (caught by _safe) retries the action instead."""
+        rc, _, err = git(self.work, "push", "-f", "origin", branch)
+        if rc != 0:
+            raise RuntimeError(f"push {branch} -> origin failed: {err[:160]}")
 
     def _call(self, role, mid, fresh_task, label_suffix, resume_task=None):
         """Run the role's claude with the right prompt for one of THREE situations:
@@ -411,7 +456,14 @@ class Controller:
                 f"tests locally. Leave changes ready to commit. Do NOT git tag, branch, or open a PR.")
         self._call("dev", mid, task, f"open-{mid}")
         git_commit_all(self.work, f"{mid}: implement")
-        git(self.work, "push", "-f", "origin", branch)
+        _, ahead, _ = git(self.work, "rev-list", "--count", "origin/main..HEAD")
+        if ahead.strip() in ("", "0"):
+            # Dev produced NO diff vs main (empty implementation — seen with persistent Dev sessions on the
+            # DAG tail). The PR will be unmergeable; flag it loudly. The merge gate later marks it
+            # harness-abandoned rather than force-tagging it at a commit that lacks its code.
+            log(f"[dev] WARNING: {mid} branch has NO changes vs origin/main — Dev produced an EMPTY implementation")
+            self.event(type="empty_impl", milestone=mid)
+        self._push(branch)
         try:
             pr = self.gc.create_pr(self.repo, head=branch, base="main", title=f"Implement {mid}",
                                    body=f"milestone_id: {mid}", labels=["needs-review"])
@@ -440,7 +492,7 @@ class Controller:
         self._call("dev", mid, fresh, f"fix-{mid}-{self.rev_bounces.get(mid,0)+self.qa_bounces.get(mid,0)}",
                    resume_task=resume)
         git_commit_all(self.work, f"{mid}: address feedback")
-        git(self.work, "push", "-f", "origin", branch)
+        self._push(branch)
         self._relabel(pr, state, next_state(state, actor="dev", verdict="fixed"))
         log(f"[dev] fixed PR #{pr['number']} ({state} -> next)")
         self.event(type="dev_fix", milestone=mid, pr=pr["number"], frm=state)
@@ -451,14 +503,20 @@ class Controller:
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
         build_log = self.ci_out.get(self._head_sha(pr), "(ci failed)")
+        base_note = ("" if self.main_ci_ok else
+                     "\n\nIMPORTANT: even the UNTOUCHED base does not build / pass CI in this environment "
+                     "(e.g. a missing system or build dependency). As CI owner you must still make CI a REAL, "
+                     "PASSABLE hard gate: install the missing build dependency if you can, or evolve ci.sh to "
+                     "build/test what it can and gate on regressions RELATIVE to that baseline — your call, but "
+                     "the gate must genuinely validate this change and never be faked green.")
         fresh = (f"## The project CI on your PR for milestone {mid} is RED. As CI owner, fix the REAL cause "
                  f"in the current repo ({self.work}) so build + tests pass — do NOT weaken CI to hide it. "
-                 f"CI output:\n\n{build_log}\n\nLeave changes ready to commit. No git tag / PR.")
+                 f"CI output:\n\n{build_log}{base_note}\n\nLeave changes ready to commit. No git tag / PR.")
         resume = (f"## Your PR's CI for milestone {mid} is now RED. Fix the real cause (do not weaken CI). "
-                  f"CI output:\n\n{build_log}\n\nLeave changes ready to commit. No git tag / PR.")
+                  f"CI output:\n\n{build_log}{base_note}\n\nLeave changes ready to commit. No git tag / PR.")
         self._call("dev", mid, fresh, f"ci-{mid}-{self.ci_bounces.get(mid,0)}", resume_task=resume)
         git_commit_all(self.work, f"{mid}: fix CI")
-        git(self.work, "push", "-f", "origin", branch)
+        self._push(branch)
         self.ci_bounces[mid] = self.ci_bounces.get(mid, 0) + 1
         log(f"[dev] fixed red CI on PR #{pr['number']} (ci_bounce {self.ci_bounces[mid]}/{self.args.max_bounces})")
         self.event(type="dev_fix_ci", milestone=mid, pr=pr["number"])
@@ -467,16 +525,20 @@ class Controller:
         sha = self._head_sha(pr)
         if not sha or self.ci_done.get(sha):
             return
-        self._probe_main_ci()
+        self._probe_main_ci()  # DIAGNOSTIC only (does the untouched base build in this env?) — never a gate weaken
         self._wc_checkout((pr.get("head") or {}).get("ref"))
         ok, out = self._run_project_ci()
-        state = "success" if (ok or not self.main_ci_ok) else "failure"
-        desc = "ci.sh (build+test)" + ("" if self.main_ci_ok else " [advisory: base CI fails in env]")
-        self.gc.set_commit_status(self.repo, sha, state=state, context="ci/build", description=desc[:90])
+        # CI is a REAL hard gate: the status is the ACTUAL ci.sh result. The framework NEVER force-greens a
+        # failing PR (not even when the untouched base fails to build) — making CI a valid, passable gate is
+        # the Dev's job (spec §3.1: Dev owns + maintains the pipeline; install the build deps, or write a
+        # baseline-adaptive ci.sh, whatever the scenario needs). The framework only ENFORCES green-before-merge.
+        state = "success" if ok else "failure"
+        self.gc.set_commit_status(self.repo, sha, state=state, context="ci/build", description="ci.sh (build+test)")
         self.ci_done[sha] = state
         self.ci_out[sha] = out
-        log(f"[ci] PR #{pr['number']} head={sha[:8]} ci_ok={ok} -> {state}{'' if self.main_ci_ok else ' (advisory)'}")
-        self.event(type="ci_run", pr=pr["number"], result=state, ci_ok=ok, sha=sha[:12])
+        log(f"[ci] PR #{pr['number']} head={sha[:8]} ci_ok={ok} -> {state}"
+            f"{'' if self.main_ci_ok else ' (NB: untouched base ALSO fails to build here — Dev must make the gate valid)'}")
+        self.event(type="ci_run", pr=pr["number"], result=state, ci_ok=ok, sha=sha[:12], base_builds=self.main_ci_ok)
 
     def reviewer(self, pr):
         mid = self._mid_of_pr(pr)
@@ -496,7 +558,7 @@ class Controller:
                       f"`{self.srs_path(mid)}`.) Give your verdict.")
             out = self._call("reviewer", mid, fresh, f"{mid}-{self.rev_bounces.get(mid,0)}", resume_task=resume)
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
-            verdict = "approve" if parse_verdict(out, "APPROVE", "REQUEST_CHANGES") != "REQUEST_CHANGES" else "request-changes"
+            verdict = "approve" if parse_verdict(out, "APPROVE", "REQUEST_CHANGES") == "APPROVE" else "request-changes"
         if verdict == "request-changes":
             self.rev_bounces[mid] = self.rev_bounces.get(mid, 0) + 1
         self._relabel(pr, "needs-review", next_state("needs-review", actor="reviewer", verdict=verdict))
@@ -521,13 +583,13 @@ class Controller:
                       f"Re-verify by building + running the tests (including the ones you added). (SRS unchanged "
                       f"at `{self.srs_path(mid)}`.) Give your verdict from real execution.")
             out = self._call("qa", mid, fresh, f"{mid}-{self.qa_bounces.get(mid,0)}", resume_task=resume)
-            verdict = "pass" if parse_verdict(out, "PASS", "FAIL") != "FAIL" else "bug"
+            verdict = "pass" if parse_verdict(out, "PASS", "FAIL") == "PASS" else "bug"
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
         # QA maintains the Test Suite: commit + push any tests it wrote/updated (head sha will change;
         # CI re-runs on the new head next pass before merge).
         if git_commit_all(self.work, f"{mid}: QA tests") and verdict != "pass":
             pass
-        git(self.work, "push", "-f", "origin", branch)
+        self._push(branch)
         pr = self.gc.get_pr(self.repo, pr["number"])  # refresh head sha after QA's commit
         sha = self._head_sha(pr)
         if verdict == "pass":
@@ -545,26 +607,66 @@ class Controller:
         qa_forced = self.qa_bounces.get(mid, 0) >= self.args.max_bounces
         qa_ok = qa_forced or any(c.get("body", "").strip().startswith(f"qa_passed@{sha[:12]}")
                                  for c in (self.gc.comments(self.repo, pr["number"]) or []))
-        ci_ok = (self.ci_bounces.get(mid, 0) >= self.args.max_bounces) or self.ci_done.get(sha) == "success"
+        # CI must be green on the ACTUAL current head sha — never a milestone-level budget bypass, which
+        # would let a NEW (e.g. QA-committed) head merge without CI ever running on it. The budget-
+        # exhaustion escape hatch lives in the pacer's CI-failure handler, which force-marks the SPECIFIC
+        # head sha green, so this check still passes once that fires.
+        ci_ok = self.ci_done.get(sha) == "success"
         return qa_ok and ci_ok
 
     def merge_gate(self, pr):
         mid = self._mid_of_pr(pr)
+        if mid in self.tagged or mid in self.abandoned:
+            return  # idempotent: never re-merge / re-tag a milestone already resolved
         if not self._ready(pr):
             return
+        merged = False
         for _ in range(40):
             try:
                 self.gc.merge_pr(self.repo, pr["number"], method="merge")
+                merged = True
                 break
             except GiteaError as e:
-                if "405" in str(e) or "Please try again" in str(e):
+                es = str(e)
+                # "405 / Please try again later" is Gitea's reply BOTH to a transient mergeability re-check
+                # AND to a permanently un-mergeable PR (notably an EMPTY PR — Dev produced no diff). Retry a
+                # few times for the transient case; the give-up logic below handles the permanent case.
+                if "405" in es or "Please try again" in es:
                     time.sleep(0.5)
                     continue
-                log(f"[merge] PR #{pr['number']} merge error: {str(e)[:160]}")
-                return
+                log(f"[merge] PR #{pr['number']} merge error: {es[:160]}")
+                break
+        if not merged:
+            # CRITICAL: do NOT tag a milestone whose PR did not actually merge. Tagging current main here
+            # would grade the milestone against code that never included its implementation (a false 0),
+            # and — because the PR stays ready-to-merge — re-process it every pass forever (the merge storm).
+            # Retry across a few passes for true transients, then give up: mark failed + drop the label so
+            # the pacer stops touching it.
+            n = self.merge_attempts.get(mid, 0) + 1
+            self.merge_attempts[mid] = n
+            if n >= MERGE_GIVEUP:
+                self.abandoned.add(mid)
+                # Persist the failure as a label so it survives a restart (setup() rebuilds abandoned
+                # from it); add-before-remove so the PR is never left with no label.
+                self.gc.add_labels(self.repo, pr["number"], ["harness-abandoned"])
+                self.gc.remove_labels(self.repo, pr["number"], ["ready-to-merge"])
+                log(f"[merge] PR #{pr['number']} ({mid}) UNMERGEABLE after {n} attempts "
+                    f"(empty/diverged PR?) — GIVE UP: no tag, stop re-processing")
+                self.event(type="merge_failed", milestone=mid, pr=pr["number"], attempts=n)
+            else:
+                log(f"[merge] PR #{pr['number']} ({mid}) not merged (attempt {n}/{MERGE_GIVEUP}) — will retry")
+            return
         git(self.testbed, "fetch", "gitea", "main")
         git(self.testbed, "reset", "--hard", "gitea/main")
-        rc, _, _ = git(self.testbed, "tag", f"agent-impl-{mid}")
+        rc, _, terr = git(self.testbed, "tag", f"agent-impl-{mid}")
+        # rc=128 normally means the tag already exists (fine). But never trust rc alone: verify the tag
+        # truly resolves; if it somehow doesn't after a real merge, force-create it (the grader consumes
+        # ONLY this tag, so a missing tag = a lost milestone). Only then mark it tagged.
+        exists, _, _ = git(self.testbed, "rev-parse", "-q", "--verify", f"refs/tags/agent-impl-{mid}")
+        if exists != 0:
+            rc2, _, terr2 = git(self.testbed, "tag", "-f", f"agent-impl-{mid}")
+            log(f"[merge-gate] tag agent-impl-{mid} missing after merge (rc={rc}:{terr[:80]}); "
+                f"forced re-tag rc={rc2} {terr2[:80]}")
         self.tagged.add(mid)
         log(f"[merge-gate] merged PR #{pr['number']} -> tag agent-impl-{mid} (rc={rc})")
         self.event(type="merged_and_tagged", milestone=mid, pr=pr["number"])
@@ -603,18 +705,28 @@ class Controller:
                 if "has-pr" in self._labels(iss):
                     continue
                 mid = next((m for m, n in self.issued.items() if n == iss["number"]), None)
-                if mid and mid not in self.tagged:
+                if mid and mid not in self.tagged and mid not in self.abandoned:
                     self._safe("dev_open", self.dev_open, mid, iss["number"])
             for pr in self.gc.list_prs(self.repo, state="open"):
                 self._safe("ci", self.run_ci, pr)
             for pr in self.gc.list_prs(self.repo, state="open"):
                 sha = self._head_sha(pr)
-                if self._pr_state(pr) in ("needs-review", "needs-qa") and self.ci_done.get(sha) == "failure":
-                    if self.ci_bounces.get(self._mid_of_pr(pr), 0) >= self.args.max_bounces:
-                        self.ci_done[sha] = "success"
-                        self.gc.set_commit_status(self.repo, sha, state="success", context="ci/build",
-                                                  description="forced (budget exhausted)")
-                        log(f"[ci] PR #{pr['number']} budget exhausted -> force CI green")
+                st = self._pr_state(pr)
+                if st in ("needs-review", "needs-qa", "ready-to-merge") and self.ci_done.get(sha) == "failure":
+                    mid = self._mid_of_pr(pr)
+                    if self.ci_bounces.get(mid, 0) >= self.args.max_bounces:
+                        # Dev could not make the CI gate pass within budget. A hard gate is NEVER force-greened
+                        # — abandon the milestone (honest fail: no merge, no tag) so a broken build can't ship.
+                        self.abandoned.add(mid)
+                        self.gc.add_labels(self.repo, pr["number"], ["harness-abandoned"])
+                        self.gc.remove_labels(self.repo, pr["number"], [st])
+                        log(f"[ci] PR #{pr['number']} ({mid}) CI gate never green within budget -> ABANDON (no merge/tag)")
+                        self.event(type="ci_gate_failed", milestone=mid, pr=pr["number"])
+                    elif st == "ready-to-merge":
+                        # CI went red on an already-QA'd head (typically QA's own new tests fail). Route it
+                        # back through Dev+QA on the fixed head instead of merging red or stalling forever.
+                        self._relabel(pr, "ready-to-merge", "needs-code-changes:Q")
+                        log(f"[ci] PR #{pr['number']} ready-to-merge but CI RED -> back to needs-code-changes:Q")
                     else:
                         self._safe("dev_fix_ci", self.dev_fix_ci, pr)
             for pr in self.gc.list_prs(self.repo, state="open"):
@@ -630,8 +742,8 @@ class Controller:
                     self._safe("observer", self.observer, pr)
 
             mids, no_more = self.available_milestones()
-            if mids and all(m in self.tagged for m in mids) and no_more:
-                log("[pacer] all milestones tagged + queue drained — done")
+            if mids and all(m in self.tagged or m in self.abandoned for m in mids) and no_more:
+                log("[pacer] all milestones resolved (tagged or harness-abandoned) + queue drained — done")
                 break
             now = self.gc.list_prs(self.repo, state="all")
             sig = (len(self.tagged), tuple(sorted(
