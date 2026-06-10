@@ -8,7 +8,11 @@ trial_name: harnessed_devqa-persist
 agent: harnessed
 model: claude-opus-4-7
 default_haiku_model: claude-opus-4-7   # pin every Claude Code model slot to opus (no separate billing)
-reasoning_effort: xhigh
+reasoning_effort: xhigh                # matches the bare control claude-code_opus-4.7_xhigh_001
+                                       # (its effort was unset = opus-4-7's built-in xhigh default;
+                                       # the old "_max" trial name was a mislabel, renamed 2026-06-10)
+vertex_ai: true                        # real billing, same backend as the bare leaderboard trials
+vertex_location: global                # regional endpoints ship with ~0 quota (see opus-4.8 yaml note)
 timeout: 36000
 repos:
   - navidrome

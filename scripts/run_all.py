@@ -424,12 +424,15 @@ def main():
     # container — no proxy/bridge:
     #   gemini-cli  → Gemini models      (harness/e2e/agents/gemini.py)
     #   claude-code → Claude models via CLAUDE_CODE_USE_VERTEX (claude_code.py)
+    #   harnessed   → inherits claude-code's Vertex env verbatim (HarnessedFramework
+    #                 extends ClaudeCodeFramework; its in-container roles are plain
+    #                 `claude` calls that pick up CLAUDE_CODE_USE_VERTEX + ADC)
     # Other agents (codex, openhands) have no Vertex path here and are rejected.
     vertex_info = None
     if vertex_ai:
-        if agent not in ("gemini-cli", "claude-code"):
-            print(f"Error: vertex_ai is only supported with agent: gemini-cli "
-                  f"or claude-code (got '{agent}').", file=sys.stderr)
+        if agent not in ("gemini-cli", "claude-code", "harnessed"):
+            print(f"Error: vertex_ai is only supported with agent: gemini-cli, "
+                  f"claude-code or harnessed (got '{agent}').", file=sys.stderr)
             sys.exit(1)
         proj = vertex_project or _adc_project()
         if not proj:

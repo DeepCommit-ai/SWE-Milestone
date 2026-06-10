@@ -644,7 +644,8 @@ class Controller:
     def reviewer(self, pr):
         mid = self._mid_of_pr(pr)
         self._wc_checkout((pr.get("head") or {}).get("ref"))
-        if self.rev_bounces.get(mid, 0) >= self.args.max_bounces:
+        forced = self.rev_bounces.get(mid, 0) >= self.args.max_bounces
+        if forced:
             verdict = "approve"
             # Terminal safety valve, made VISIBLE in the artifact: this is pacing, not a real approval.
             self.gc.comment(self.repo, pr["number"],
@@ -679,13 +680,17 @@ class Controller:
             self.rev_bounces[mid] = self.rev_bounces.get(mid, 0) + 1
         self._relabel(pr, "needs-review", next_state("needs-review", actor="reviewer", verdict=verdict))
         log(f"[reviewer] PR #{pr['number']} -> {verdict} (rev_bounce {self.rev_bounces.get(mid,0)}/{self.args.max_bounces})")
-        self.event(type="review_verdict", milestone=mid, pr=pr["number"], verdict=verdict)
+        # forced=True marks the budget-exhaustion safety valve (no real review call) — without it the
+        # event stream can't distinguish a real approval from a force (only the PR comment / sub-second
+        # timing gave it away during analysis).
+        self.event(type="review_verdict", milestone=mid, pr=pr["number"], verdict=verdict, forced=forced)
 
     def qa(self, pr):
         mid = self._mid_of_pr(pr)
         branch = (pr.get("head") or {}).get("ref")
         self._wc_checkout(branch)
-        if self.qa_bounces.get(mid, 0) >= self.args.max_bounces:
+        forced = self.qa_bounces.get(mid, 0) >= self.args.max_bounces
+        if forced:
             verdict, out = "pass", ""
             self.gc.comment(self.repo, pr["number"],
                             "harness: QA budget exhausted — FORCE-PASSED without a verification call "
@@ -726,7 +731,7 @@ class Controller:
             self.qa_bounces[mid] = self.qa_bounces.get(mid, 0) + 1
             self._relabel(pr, "needs-qa", "needs-code-changes:Q")
         log(f"[qa] PR #{pr['number']} -> {verdict} (qa_bounce {self.qa_bounces.get(mid,0)}/{self.args.max_bounces})")
-        self.event(type="qa_verdict", milestone=mid, pr=pr["number"], verdict=verdict)
+        self.event(type="qa_verdict", milestone=mid, pr=pr["number"], verdict=verdict, forced=forced)
 
     def _qa_certified(self, pr, sha):
         """True iff a qa_passed comment certifies exactly this head sha."""
