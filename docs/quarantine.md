@@ -221,6 +221,55 @@ This is enforced a second time at trial startup: the `wheelhouse_forbid` list in
 (`_assert_wheelhouse_excludes`) if the wheelhouse contains a forbidden artifact —
 so a tampered/un-audited wheelhouse is caught even if the builder was bypassed.
 
+## The base-offline image (B-aware closure for cargo/go/maven/npm)
+
+> **The gap this closes.** The eval base images pre-bake only the **A-version**
+> dependency cache. Quarantine cuts the network *and* forces the package manager
+> offline — so for a non-pip repo, an agent implementing A→B can't fetch the
+> **legitimate** new deps B needs (a 2026-06-10 audit found this breaks the build
+> for all 6 non-pip repos: ripgrep needs 81 new crates, dubbo 499 new Maven
+> artifacts, go-zero 744 modules incl. the go-redis v8→v9 migration, etc.). These
+> are normal public-registry deps, **not** cheat artifacts — but offline they're
+> unreachable. pip avoided this because scikit's wheelhouse was already built
+> from a B-capable env.
+
+**The fix: a per-repo `base-offline:latest` image.** For cargo/go/maven/npm
+quarantine repos, `image_for_repo()` (harness/e2e/quarantine.py) launches from
+`<repo>/base-offline:latest` instead of `base:latest` — the same image **re-baked
+with the A→B dependency closure** plus any bumped toolchain. `base:latest` is
+never overwritten (fully reversible: just delete the offline tag). pip stays on
+`base:latest` (its closure is the mounted host wheelhouse, not baked in).
+
+**Self-exclusion still holds.** The repo's own package is a path / workspace /
+reactor dep — built locally, never pulled from the registry — so it is absent
+from the third-party closure by construction. Every offline image was audited to
+contain **none** of the repo's own post-baseline artifacts (the same property
+`cache_forbid_globs` asserts at runtime). So baking B's deps does **not** leak the
+answer: the agent gets `regex`/`netty`/`grpc`/`html-react-parser`, never the
+repo's own B source.
+
+### Building a base-offline image (per ecosystem)
+
+Run in a **networked** container started from `base:latest`; collect every
+milestone image's lockfile (the union covers any A→B path the agent may take);
+pull the closure online; **verify offline**; audit self-exclusion; then
+`docker commit` to `base-offline:latest`. Never `mvn install` (it would bake the
+repo's own artifact into `.m2`). Per-ecosystem pull + offline-verify commands:
+
+| ecosystem | pull closure (online) | offline verify (gate) | toolchain bump |
+|---|---|---|---|
+| cargo | `cargo fetch --locked` per milestone lock | `cargo build --offline` exit 0 (agent re-resolves, so `--offline build` is the faithful gate, not `--locked`) | nushell 1.86→**1.88** (`rustup toolchain install`, driven by `rust-toolchain.toml`); ripgrep none |
+| go | `GOFLAGS=-mod=mod GOPROXY=… go mod download all` per milestone | `GOPROXY=off go mod download all` + `go build ./...` zero cache misses | go-zero 1.19→**1.21.13**, navidrome 1.24.4→**1.24.5** (replace `/usr/local/go`, SHA256-checked) |
+| maven | `mvn dependency:go-offline` (+ `spotless:check`, `dependency:get` for dynamic/classified/test-scope artifacts go-offline misses) | `mvn -o test-compile` after `git clean -xfd` → BUILD SUCCESS, zero "Cannot access … offline" | dubbo none |
+| npm | `yarn install` per distinct milestone lock | `rm -rf node_modules && yarn install --offline` clean; full `yarn build` offline | element-web none |
+
+Toolchains aren't in the dependency closure, so a version bump (e.g. nushell's
+`rust-toolchain.toml` 1.88, go-zero's `go 1.21` directive) must be **pre-installed**
+in the offline image — it can't be fetched offline. The bumped tool lives at the
+same path the base PATH already points to, so it's transparent to the harness
+(which invokes `go test`/`cargo test`/`mvn test` via `sh -c`, inheriting the image
+PATH — not a login shell).
+
 ## Verification protocol (run before trusting a secure re-run)
 
 Most of this is now **automated**. `verify_network_lockdown` (run at every
@@ -267,20 +316,31 @@ aiplatform.googleapis.com        → reachable  (LLM endpoint preserved)
 `quarantine_configs/<repo>.yaml` and live-smoke-tested via
 `scripts/verify_quarantine.py` (ALL PASS):
 
-| repo | ecosystem | network deny | offline closure |
-|---|---|---|---|
-| scikit-learn | pip | PyPI + Fastly `/16`s | host wheelhouse |
-| ripgrep, nushell | cargo | crates.io + Fastly `/16`s | `CARGO_NET_OFFLINE` + image cache |
-| dubbo | maven | Maven Central + Cloudflare `/12` | `mvn -o` + image `.m2` |
-| go-zero | go | goproxy.cn/io + proxy domain-deny | `GOPROXY=off` + modcache |
-| navidrome | go + npm | (go set) + npm registry + Cloudflare `/12` | `GOPROXY=off` + `npm_config_offline` |
-| element-web | npm | npm registry + Cloudflare `/12` | `npm_config_offline` |
+| repo | ecosystem | network deny | offline closure | offline image |
+|---|---|---|---|---|
+| scikit-learn | pip | PyPI + Fastly `/16`s | host wheelhouse | base:latest (wheelhouse mounted) |
+| ripgrep | cargo | crates.io + Fastly `/16`s | `CARGO_NET_OFFLINE` + baked closure | base-offline (+81 crates) |
+| nushell | cargo | crates.io + Fastly `/16`s | `CARGO_NET_OFFLINE` + baked closure | base-offline (+820 crates, rust 1.88) |
+| dubbo | maven | Maven Central + Cloudflare `/12` | `mvn -o` + baked `.m2` | base-offline (+499 artifacts) |
+| go-zero | go | goproxy.cn/io + proxy domain-deny | `GOPROXY=off` + baked modcache | base-offline (744 modules, go 1.21.13) |
+| navidrome | go + npm | (go set) + npm registry + Cloudflare `/12` | `GOPROXY=off` + `npm_config_offline` | base-offline (+19 modules, go 1.24.5) |
+| element-web | npm | npm registry + Cloudflare `/12` | `npm_config_offline` | base-offline (+168 cache entries) |
 
 Implemented since the original pip design: per-manager offline switches
 (`harness/e2e/agents/base.py`), subnet-overlap CIDR deny, the Google-shared
 auto-exemption, the fail-closed coverage gate + `--unprotected`
-(`scripts/run_all.py`), curl-independent verification probes, and
-`cache_forbid_globs` / `verify_fetch_urls` audits.
+(`scripts/run_all.py`), curl-independent verification probes,
+`cache_forbid_globs` / `verify_fetch_urls` audits, and — **the part that makes
+offline trials actually buildable** — a per-repo **`base-offline:latest`** image
+baked with the A→B dependency closure + bumped toolchains (image_for_repo;
+`base:latest` untouched). All 6 non-pip images built + offline-verified +
+self-exclusion-audited 2026-06-10; scikit uses its host wheelhouse.
+
+**One pip edge note:** rebuilding scikit-learn from scratch with the default
+`pip install -e .` (build isolation **on**) wants `patchelf`, absent from the
+wheelhouse. Not a blocker — the image ships scikit-learn already editable-built,
+and `--no-build-isolation` rebuilds offline fine; only matters if an agent does a
+clean isolated rebuild.
 
 **Remaining residual:** `proxy.golang.org` (Google range shared with Vertex) is
 defended only at the manager layer (`GOPROXY=off`), not the firewall. The

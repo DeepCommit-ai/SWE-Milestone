@@ -7,9 +7,14 @@ implemented mechanism. This doc is kept as the **risk study + the long-term SNI
 proxy plan**; the per-ecosystem analysis below is what informed the configs.
 
 **What shipped vs. this study:** the network lever (deny domains + CIDR) works
-per the analysis; the offline closures use the **eval image's pre-baked package
-cache** (cargo registry / `/go/pkg/mod` / `.m2` / `node_modules`) rather than
-freshly built vendor dirs. The go ecosystem was implemented with **`GOPROXY=off`
+per the analysis. The offline closures do NOT rely on the eval image's pre-baked
+cache as first assumed — an audit found that cache holds only the **A-version**
+closure, so cutting the network broke legitimate B builds for all 6 non-pip
+repos. The fix shipped as a per-repo **`base-offline:latest`** image re-baked with
+the full A→B dependency closure (+ bumped toolchains), selected at launch by
+`image_for_repo()`; `base:latest` is left untouched. See
+[`docs/quarantine.md`](quarantine.md) → "The base-offline image" for the
+per-ecosystem build recipe and the self-exclusion guarantee. The go ecosystem was implemented with **`GOPROXY=off`
 as the primary defense** (NOT the `/32`-exemption CIDR-deny proposed below):
 `proxy.golang.org` shares Vertex's Google range, and rather than risk an anycast
 `/32` carve-out that could rotate into Vertex's IP and break the model path,
