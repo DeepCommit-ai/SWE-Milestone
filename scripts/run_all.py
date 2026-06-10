@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
+from harness.e2e.quarantine import load_quarantine_env, quarantine_coverage_errors
+
 
 def _adc_project() -> str | None:
     """Read quota_project_id from the host ADC file (Vertex project default)."""
@@ -71,94 +73,6 @@ def _load_dotenv_files() -> None:
             print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
     for key, val in merged.items():
         os.environ.setdefault(key, val)  # a real shell-exported var wins
-
-
-def _assert_wheelhouse_excludes(wheelhouse: str, forbid: list[str]) -> None:
-    """Fail closed if the offline quarantine wheelhouse contains an artifact
-    whose distribution name matches a forbidden prefix (the repo-under-test's own
-    package). Without this, an un-audited wheelhouse could silently serve the
-    answer offline via PIP_FIND_LINKS, defeating the network deny. See
-    docs/quarantine.md.
-    """
-    norm_forbid = [f.strip().lower().replace("_", "-") for f in forbid if f.strip()]
-    if not norm_forbid:
-        return
-    offending = []
-    for name in os.listdir(wheelhouse):
-        low = name.lower().replace("_", "-")
-        if not low.endswith((".whl", ".tar.gz", ".zip")):
-            continue
-        if any(low.startswith(pref + "-") for pref in norm_forbid):
-            offending.append(name)
-    if offending:
-        print(
-            f"Error: quarantine wheelhouse {wheelhouse} contains forbidden "
-            f"artifact(s) {sorted(offending)} matching wheelhouse_forbid={forbid}. "
-            f"Refusing to run — this would serve the repo's own target source "
-            f"offline. Rebuild the wheelhouse with scripts/build_quarantine_wheelhouse.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
-    """Per-repo anti-cheat ("quarantine") policy → container env vars.
-
-    Quarantine prevents an agent from fetching the repo-under-test's own
-    target-version source (the answer) over the network: it denies the registry
-    serving that source and forces the package manager offline against a vetted
-    wheelhouse. The policy is **repo-intrinsic** (scikit denies PyPI, go-zero the
-    Go proxy, …), so it lives once per repo in `quarantine_configs/<repo>.yaml`.
-
-    Auto-on: presence of the file IS the switch (no trial-config flag). Returns
-    {} (quarantine off) if the file is absent. Applied only to THIS repo's
-    container — not globally to the whole trial. Fails closed (sys.exit) on a
-    malformed policy or a wheelhouse that ships the repo's own package.
-    See docs/quarantine.md.
-    """
-    conf_path = project_root / "quarantine_configs" / f"{repo_name}.yaml"
-    if not conf_path.exists():
-        return {}
-    try:
-        with open(conf_path) as f:
-            q = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"Error: failed to read quarantine config {conf_path}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    env: dict[str, str] = {}
-    dd = q.get("deny_domains")
-    dc = q.get("deny_cidrs")
-    wh = q.get("pip_wheelhouse")
-    if dd:
-        env["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
-    if dc:
-        env["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
-    if wh:
-        # Expand ${EVOCLAW_WHEELHOUSE_DIR} etc. so the policy file carries no
-        # host-specific absolute path (set the base once in .env_private).
-        wh = str(Path(os.path.expandvars(str(wh))).expanduser().resolve())
-        if not Path(wh).is_dir():
-            print(f"Error: {conf_path}: pip_wheelhouse not found: {wh} "
-                  f"(is EVOCLAW_WHEELHOUSE_DIR set in .env_private?)", file=sys.stderr)
-            sys.exit(1)
-        # Fail closed if the wheelhouse ships the repo's own package — an
-        # un-audited wheelhouse must not be able to serve the answer offline.
-        forbid = q.get("wheelhouse_forbid") or []
-        if isinstance(forbid, str):
-            forbid = [forbid]
-        _assert_wheelhouse_excludes(wh, forbid)
-        if not forbid:
-            print(
-                f"Warning: {conf_path}: pip_wheelhouse set without wheelhouse_forbid "
-                f"— cannot assert the wheelhouse excludes the repo's own package "
-                f"(see docs/quarantine.md).",
-                file=sys.stderr,
-            )
-        else:
-            env["EVOCLAW_WHEELHOUSE_FORBID"] = ",".join(forbid)
-        env["EVOCLAW_PIP_WHEELHOUSE"] = wh
-    return env
 
 
 def discover_repos(data_root: Path, repo_filters: list[str] | None = None) -> list[Path]:
@@ -328,6 +242,12 @@ def main():
              "Selection is the first N in topological order (prerequisites always included), "
              "written per-trial to milestone_selection.txt; the dataset is never modified.",
     )
+    parser.add_argument(
+        "--unprotected", action="store_true",
+        help="Bypass the quarantine coverage gate and launch even if a repo's "
+             "anti-cheat policy is missing/incomplete. Scores from unprotected "
+             "repos can be tainted by registry answer-fetch (see issue #12).",
+    )
     args = parser.parse_args()
 
     if args.new and args.force:
@@ -408,6 +328,25 @@ def main():
         print(f"Error: no repos found in {data_root}", file=sys.stderr)
         sys.exit(1)
 
+    # Fail-closed quarantine coverage gate (issue #12): refuse to launch any
+    # repo whose anti-cheat policy is absent or doesn't deny its ecosystem's
+    # registries. 3 of 7 repos were confirmed cheating via exactly this gap
+    # (crates.io / Maven Central fetches of their own target-version source)
+    # because quarantine used to be silently opt-in.
+    project_root = Path(__file__).resolve().parent.parent
+    gate_errors = quarantine_coverage_errors([r.name for r in repos], project_root)
+    if gate_errors:
+        print("Quarantine coverage gate:", file=sys.stderr)
+        for e in gate_errors:
+            print(f"  - {e}", file=sys.stderr)
+        if args.unprotected:
+            print("  --unprotected set: launching anyway (scores may be tainted).",
+                  file=sys.stderr)
+        else:
+            print("Refusing to launch. Add/fix quarantine_configs/<repo>.yaml "
+                  "(see docs/quarantine.md) or pass --unprotected.", file=sys.stderr)
+            sys.exit(1)
+
     # Resolve trial name based on yaml + flags + existing trial dirs
     trial_name = resolve_trial_name(yaml_trial_name, repos, args.force, args.new)
 
@@ -455,7 +394,6 @@ def main():
     print("=" * 60)
 
     # Generate collect config for monitor.sh
-    project_root = Path(__file__).resolve().parent.parent
     log_dir = project_root / ".evoclaw"
     log_dir.mkdir(parents=True, exist_ok=True)
     collect_config = generate_collect_config(
