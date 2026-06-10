@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from harness.e2e.agents import AgentFramework, get_agent_framework
+from harness.e2e.quarantine import cidr_overlaps_any
 
 logger = logging.getLogger("e2e.container_setup")
 
@@ -375,6 +376,7 @@ try:
         '/usr/local/lib/node_modules',  # Global npm modules
         '/root/.npm',            # npm cache
         '/root/.cache',          # General cache (pip, etc.)
+        '/root/.m2',             # Maven local repo (fakeroot needs rw under the quarantine maven.repo.local redirect)
     ]
 
     for toolchain_dir in toolchain_dirs:
@@ -1030,13 +1032,17 @@ echo "Git history truncated successfully"
         # registry fronted by that CDN becomes unreachable even via raw curl.
         # Needed because EVOCLAW_DENY_DOMAINS only drops DNS-resolved IPs, while
         # registries like PyPI ride a shared CDN range (Fastly 151.101.0.0/16)
-        # that CDN_CIDR_RANGES would otherwise accept wholesale. Keep Google
-        # (Vertex) and Cloudflare (claude.ai) ranges so the LLM path survives.
-        _deny_cidrs = {c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()}
+        # that CDN_CIDR_RANGES would otherwise accept wholesale. Overlap
+        # matching (not string equality): the builtin Cloudflare accept is
+        # 104.16.0.0/13 while a policy may deny 104.16.0.0/12 — equality would
+        # leave the /13 accepted and the registry reachable. LLM paths survive
+        # on other ranges (Vertex = Google, api.anthropic.com = Anthropic ASN).
+        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
         if _deny_cidrs:
-            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges: {sorted(_deny_cidrs)}")
+            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges overlapping: {sorted(_deny_cidrs)}")
         for cidr in CDN_CIDR_RANGES:
-            if cidr in _deny_cidrs:
+            if _deny_cidrs and cidr_overlaps_any(cidr, _deny_cidrs):
+                logger.warning(f"  CDN range {cidr} overlaps a denied CIDR — not accepted")
                 continue
             accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
 
@@ -1109,10 +1115,16 @@ echo "/etc/hosts poisoned with {len(CODE_HOSTING_DOMAINS)} domains"
         logger.info(f"  /etc/hosts poisoned ({len(CODE_HOSTING_DOMAINS)} domains)")
 
         # --- Step 5: Set Go env vars ---
-        go_env_script = """
-# Configure Go to use module proxy instead of direct VCS
+        # Under go quarantine (EVOCLAW_GO_OFFLINE), the proxy itself is the
+        # answer-fetch channel (`go get <self>@<target>`), so write GOPROXY=off
+        # (go then refuses both proxy and direct/VCS fetches and works from
+        # /go/pkg/mod). Shell profiles override docker -e, so this MUST be
+        # written here, not only injected via get_quarantine_env_vars.
+        _goproxy = "off" if os.environ.get("EVOCLAW_GO_OFFLINE") else "https://proxy.golang.org,direct"
+        go_env_script = f"""
+# Configure Go module fetching (quarantine-aware)
 cat >> /etc/environment << 'EOF'
-GOPROXY=https://proxy.golang.org,direct
+GOPROXY={_goproxy}
 GONOSUMCHECK=*
 GONOSUMDB=*
 EOF
@@ -1120,11 +1132,11 @@ EOF
 # Also set for fakeroot's shell profile
 mkdir -p /home/fakeroot
 cat >> /home/fakeroot/.bashrc << 'EOF'
-export GOPROXY=https://proxy.golang.org,direct
+export GOPROXY={_goproxy}
 export GONOSUMCHECK=*
 export GONOSUMDB=*
 EOF
-echo "Go env vars configured"
+echo "Go env vars configured (GOPROXY={_goproxy})"
 """
         subprocess.run(
             ["docker", "exec", self.container_name, "/bin/sh", "-c", go_env_script],
@@ -1239,6 +1251,56 @@ echo "Go env vars configured"
                 )
         if _deny_domains:
             logger.info(f"  Quarantine verified: {len(_deny_domains)} denied host(s) unreachable")
+
+        # Quarantine: probe the exact registry URLs of the observed cheats
+        # (e.g. the self-crate on static.crates.io, the -sources.jar on Maven
+        # Central). ANY successful connect — even a redirect — means the
+        # answer-fetch channel is open; the deny must make connects fail.
+        _verify_urls = [u.strip() for u in os.environ.get("EVOCLAW_VERIFY_FETCH_URLS", "").split(",") if u.strip()]
+        for url in _verify_urls:
+            probe = subprocess.run(
+                [
+                    "docker", "exec", "--user", "fakeroot",
+                    "-e", "HOME=/home/fakeroot", self.container_name,
+                    "curl", "-s", "-o", "/dev/null",
+                    "--connect-timeout", "3", "--max-time", "10", url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if probe.returncode == 0:
+                raise RuntimeError(
+                    f"Quarantine verification failed: answer-fetch URL still "
+                    f"reachable: {url}"
+                )
+        if _verify_urls:
+            logger.info(f"  Quarantine verified: {len(_verify_urls)} answer-fetch URL(s) blocked")
+
+        # Quarantine: fail closed if the image's pre-baked package cache
+        # contains the repo's own artifacts at a post-baseline version (the
+        # offline closure must not be able to serve the answer — the cache
+        # analogue of the pip wheelhouse_forbid audit).
+        _forbid_globs = [g.strip() for g in os.environ.get("EVOCLAW_CACHE_FORBID_GLOBS", "").split(",") if g.strip()]
+        for glob_pat in _forbid_globs:
+            audit = subprocess.run(
+                [
+                    "docker", "exec", self.container_name,
+                    "/bin/sh", "-c", f"ls -d {glob_pat} 2>/dev/null | head -5",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if audit.stdout.strip():
+                raise RuntimeError(
+                    f"Quarantine cache audit failed: forbidden artifact(s) in the "
+                    f"image cache match '{glob_pat}':\n{audit.stdout.strip()}\n"
+                    f"The offline cache could serve the repo's own target-version "
+                    f"source. Rebuild/clean the image before running."
+                )
+        if _forbid_globs:
+            logger.info(f"  Quarantine cache audit passed: {len(_forbid_globs)} forbid glob(s) matched nothing")
 
         # Verify sudo is revoked
         sudo_result = subprocess.run(
