@@ -33,6 +33,9 @@ cache_forbid_globs:
   - /go/pkg/mod/cache/download/github.com/zeromicro/*
   - /go/pkg/mod/github.com/zeromicro/*
 
+# Only the IP-blockable proxies are asserted here (proxy.golang.org shares
+# Google's Vertex range and can't be IP-blocked — GOPROXY=off is its defense;
+# verify_network_lockdown auto-exempts it from the unreachable assertion).
 verify_fetch_urls:
-  - https://proxy.golang.org/github.com/zeromicro/go-zero/@v/v1.9.3.zip
   - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip
+  - https://goproxy.io/github.com/zeromicro/go-zero/@v/v1.9.3.zip

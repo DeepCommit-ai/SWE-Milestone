@@ -29,6 +29,8 @@ cache_forbid_globs:
   - /go/pkg/mod/cache/download/github.com/navidrome/*
   - /go/pkg/mod/github.com/navidrome/*
 
+# proxy.golang.org shares Google's Vertex range (GOPROXY=off is its defense,
+# auto-exempted from the unreachable assertion); assert the IP-blockable ones.
 verify_fetch_urls:
-  - https://proxy.golang.org/github.com/navidrome/navidrome/@v/v0.58.0.zip
+  - https://goproxy.cn/github.com/navidrome/navidrome/@v/v0.58.0.zip
   - https://registry.npmjs.org/navidrome

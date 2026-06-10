@@ -1165,6 +1165,45 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
 
         logger.info("Network lockdown applied successfully")
 
+    def _url_reachable_in_container(self, url: str, user: str = "fakeroot") -> bool:
+        """True if `url`'s host:port is reachable (TCP) from inside the container.
+
+        Uses python3 (guaranteed present by init) rather than curl, so the
+        probe is real even on images without curl (e.g. the scikit base). A
+        successful TCP connect proves the channel is open — that is exactly
+        what the iptables IP/CIDR deny is meant to prevent, so a full HTTP
+        round-trip is unnecessary. Only the first IPv4 address is tried, with
+        a short timeout, so a blocked (DROP'd) host fails fast instead of
+        walking every CDN anycast IP. Mirrors docs/quarantine.md.
+        """
+        probe_script = (
+            "import sys, socket\n"
+            "from urllib.parse import urlparse\n"
+            "u = urlparse(sys.argv[1])\n"
+            "port = u.port or (443 if u.scheme == 'https' else 80)\n"
+            "try:\n"
+            "    infos = socket.getaddrinfo(u.hostname, port, socket.AF_INET, socket.SOCK_STREAM)\n"
+            "    fam, typ, proto, _, sa = infos[0]\n"
+            "    s = socket.socket(fam, typ, proto)\n"
+            "    s.settimeout(4)\n"
+            "    s.connect(sa)\n"
+            "    s.close()\n"
+            "    print('REACH')\n"
+            "except Exception:\n"
+            "    print('BLOCK')\n"
+        )
+        result = subprocess.run(
+            [
+                "docker", "exec", "--user", user,
+                "-e", f"HOME=/home/{user}" if user != "root" else "HOME=/root",
+                self.container_name, "python3", "-c", probe_script, url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return "REACH" in result.stdout
+
     def verify_network_lockdown(self) -> bool:
         """Verify that network lockdown is active in the container.
 
@@ -1231,45 +1270,64 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # covers code hosting; a typo'd deny CIDR/domain would otherwise pass
         # verification while leaving the exact cheat channel (e.g. PyPI) open.
         _deny_domains = [d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()]
-        for host in _deny_domains:
-            probe = subprocess.run(
-                [
-                    "docker", "exec", "--user", "fakeroot",
-                    "-e", "HOME=/home/fakeroot", self.container_name,
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "--connect-timeout", "3", "--max-time", "5",
-                    f"https://{host}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
+        # Some denied registries share a CDN/IP range with an ALLOWED service
+        # and cannot be blocked at the IP layer without also cutting that
+        # service — notably the Go proxies (proxy.golang.org, sum.golang.org,
+        # golang.org, go.dev) ride Google ranges shared with Vertex
+        # aiplatform. For those the defense is the package-manager offline
+        # switch (GOPROXY=off), not the firewall; don't hard-fail verification
+        # on them (a known residual until the SNI egress proxy lands, issue
+        # #12). Detected automatically: a denied domain whose resolved IPs all
+        # fall inside a still-ACCEPTed CDN range. goproxy.cn (Qiniu 155.102),
+        # goproxy.io (Cloudflare) and the Fastly/Cloudflare registries are NOT
+        # exempt — their ranges are denied, so they must verify unreachable.
+        import ipaddress as _ipaddr
+        _deny_cidr_list = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
+        _accepted_cdn = []
+        for _c in CDN_CIDR_RANGES:
+            if _deny_cidr_list and cidr_overlaps_any(_c, _deny_cidr_list):
+                continue
+            try:
+                _accepted_cdn.append(_ipaddr.ip_network(_c))
+            except ValueError:
+                pass
+
+        def _shares_allowed_cdn(host: str) -> bool:
+            try:
+                ips = {sa[0] for *_, sa in socket.getaddrinfo(host, None, socket.AF_INET)}
+            except socket.gaierror:
+                return False
+            return bool(ips) and all(
+                any(_ipaddr.ip_address(ip) in net for net in _accepted_cdn) for ip in ips
             )
-            if probe.returncode == 0 and probe.stdout.strip().startswith("2"):
+
+        _verified = 0
+        for host in _deny_domains:
+            if _shares_allowed_cdn(host):
+                logger.warning(
+                    f"  Quarantine: '{host}' shares an allowed CDN/IP range "
+                    f"(e.g. Vertex/Google) — not IP-blockable; relying on the "
+                    f"package-manager offline switch (residual until SNI proxy)."
+                )
+                continue
+            if self._url_reachable_in_container(f"https://{host}"):
                 raise RuntimeError(
                     f"Quarantine verification failed: denied host '{host}' is still "
                     f"reachable — EVOCLAW_DENY_DOMAINS/EVOCLAW_DENY_CIDRS not effective"
                 )
-        if _deny_domains:
-            logger.info(f"  Quarantine verified: {len(_deny_domains)} denied host(s) unreachable")
+            _verified += 1
+        if _verified:
+            logger.info(f"  Quarantine verified: {_verified} denied host(s) unreachable")
 
         # Quarantine: probe the exact registry URLs of the observed cheats
         # (e.g. the self-crate on static.crates.io, the -sources.jar on Maven
-        # Central). ANY successful connect — even a redirect — means the
-        # answer-fetch channel is open; the deny must make connects fail.
+        # Central). ANY successful connect — even an HTTP error response —
+        # means the answer-fetch channel is open; the deny must make connects
+        # fail. Uses python3 (guaranteed by init), not curl, so the check is
+        # real even on images that ship no curl (e.g. the scikit base).
         _verify_urls = [u.strip() for u in os.environ.get("EVOCLAW_VERIFY_FETCH_URLS", "").split(",") if u.strip()]
         for url in _verify_urls:
-            probe = subprocess.run(
-                [
-                    "docker", "exec", "--user", "fakeroot",
-                    "-e", "HOME=/home/fakeroot", self.container_name,
-                    "curl", "-s", "-o", "/dev/null",
-                    "--connect-timeout", "3", "--max-time", "10", url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            if probe.returncode == 0:
+            if self._url_reachable_in_container(url):
                 raise RuntimeError(
                     f"Quarantine verification failed: answer-fetch URL still "
                     f"reachable: {url}"

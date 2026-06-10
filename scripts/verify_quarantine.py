@@ -40,16 +40,12 @@ def _match_repo(substr: str) -> str:
     return hits[0]
 
 
-def _probe(container: str, url: str, expect_blocked: bool) -> bool:
-    r = subprocess.run(
-        ["docker", "exec", "--user", "fakeroot", "-e", "HOME=/home/fakeroot",
-         container, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-         "--connect-timeout", "3", "--max-time", "10", url],
-        capture_output=True, text=True, timeout=20,
-    )
-    blocked = r.returncode != 0
+def _probe(cs: "ContainerSetup", url: str, expect_blocked: bool) -> bool:
+    # python3-based probe (curl-independent — the scikit base ships no curl).
+    reachable = cs._url_reachable_in_container(url)
+    blocked = not reachable
     ok = blocked == expect_blocked
-    label = "BLOCKED" if blocked else f"reachable (HTTP {r.stdout.strip()})"
+    label = "BLOCKED" if blocked else "reachable"
     print(f"  {'PASS' if ok else 'FAIL'}  {url} -> {label}")
     return ok
 
@@ -104,7 +100,7 @@ def main() -> int:
 
         print("Positive probes (must stay reachable):")
         for url in ("https://api.anthropic.com", "https://aiplatform.googleapis.com"):
-            if not _probe(container, url, expect_blocked=False):
+            if not _probe(cs, url, expect_blocked=False):
                 failures += 1
 
         print("Offline switches visible in container env:")
