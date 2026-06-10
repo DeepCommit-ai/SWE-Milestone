@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
-from harness.e2e.quarantine import load_quarantine_env, quarantine_coverage_errors
+from harness.e2e.quarantine import image_for_repo, load_quarantine_env, quarantine_coverage_errors
 
 
 def _adc_project() -> str | None:
@@ -183,11 +183,16 @@ def build_cmd(
     api_router: bool,
     force: bool,
     milestones: str | None = None,
+    project_root: Path | None = None,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
     trial_dir = repo / "e2e_trial" / trial_name
     metadata_path = trial_dir / "trial_metadata.json"
+    # Quarantine repos run offline, so use the offline-closure image
+    # (base-offline:latest) baked with the B-version dependency closure.
+    _root = project_root or Path(__file__).resolve().parent.parent
+    image = image_for_repo(repo_name, _root)
 
     if not force and trial_dir.exists() and metadata_path.exists():
         # Resume reuses the existing trial dir, where --milestones already wrote
@@ -201,7 +206,7 @@ def build_cmd(
     cmd = [
         sys.executable, "-m", "harness.e2e.run_e2e",
         "--repo-name", repo_name,
-        "--image", get_image_name(repo_name),
+        "--image", image,
         "--srs-root", str(repo / "srs"),
         "--workspace-root", str(repo),
         "--agent", agent,
@@ -416,7 +421,7 @@ def main():
         cmd, mode = build_cmd(
             repo, agent, model, timeout, trial_name,
             reasoning_effort, api_router, args.force,
-            milestones,
+            milestones, project_root,
         )
         # Per-repo quarantine: apply this repo's anti-cheat policy (if any) only
         # to its own container, via the worker subprocess env (not global).

@@ -4,6 +4,7 @@ import pytest
 
 from harness.e2e.quarantine import (
     cidr_overlaps_any,
+    image_for_repo,
     load_quarantine_env,
     quarantine_coverage_errors,
 )
@@ -163,6 +164,24 @@ class TestAgentQuarantineEnvVars:
     def test_pip_wheelhouse_unchanged(self):
         env = self._env_dict({"EVOCLAW_PIP_WHEELHOUSE": "/wh"})
         assert env == {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": "/wheelhouse"}
+
+
+class TestImageForRepo:
+    def test_no_config_uses_base(self, tmp_path):
+        assert image_for_repo("Foo_Bar", tmp_path) == "foo_bar/base:latest"
+
+    def test_cargo_quarantine_uses_offline(self, tmp_path):
+        _write_config(tmp_path, "rg", "ecosystem: [cargo]\ncargo_offline: true\n")
+        assert image_for_repo("rg", tmp_path) == "rg/base-offline:latest"
+
+    def test_go_quarantine_uses_offline(self, tmp_path):
+        _write_config(tmp_path, "gz", "ecosystem: [go]\ngo_offline: true\n")
+        assert image_for_repo("gz", tmp_path) == "gz/base-offline:latest"
+
+    def test_pip_only_keeps_base(self, tmp_path):
+        # scikit ships its closure as a host wheelhouse, not a baked image.
+        _write_config(tmp_path, "sk", "ecosystem: [pip]\npip_wheelhouse: /wh\n")
+        assert image_for_repo("sk", tmp_path) == "sk/base:latest"
 
 
 class TestCidrOverlap:

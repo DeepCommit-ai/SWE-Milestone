@@ -105,6 +105,31 @@ def load_quarantine_config(repo_name: str, project_root: Path) -> dict | None:
         sys.exit(1)
 
 
+def image_for_repo(repo_name: str, project_root: Path) -> str:
+    """Docker image tag for a repo's container.
+
+    A quarantine repo (one with quarantine_configs/<repo>.yaml) runs under
+    network lockdown + forced-offline package managers, so it must use the
+    **offline-closure image** `<repo>/base-offline:latest` — base:latest baked
+    with the B-version dependency closure (scripts/build_offline_closure.py) so
+    the locked-down container can still build A→B offline. Without the closure
+    image, the agent would hit `No matching distribution` / `cargo offline` /
+    `GOPROXY=off` errors on legitimate new deps (the base:latest cache only has
+    the A-version closure). Non-quarantine repos use base:latest as before.
+
+    pip is the exception: scikit ships its closure as a mounted host wheelhouse
+    (pip_wheelhouse), not baked into the image, so a pip-only policy keeps
+    base:latest. Detected by absence of a baked-image offline switch.
+    """
+    lower = repo_name.lower()
+    q = load_quarantine_config(repo_name, project_root)
+    if q is not None and any(
+        q.get(k) for k in ("cargo_offline", "go_offline", "maven_offline", "npm_offline")
+    ):
+        return f"{lower}/base-offline:latest"
+    return f"{lower}/base:latest"
+
+
 def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
     """Per-repo anti-cheat ("quarantine") policy → container env vars.
 
