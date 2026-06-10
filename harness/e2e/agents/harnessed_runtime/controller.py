@@ -514,6 +514,20 @@ class Controller:
             prompt = f"(Continuing your work as {role}.)\n\n{resume_task or fresh_task}"
         return run_claude(prompt, self.args, f"{role}-{label_suffix}", self.work, sid, resume)
 
+    def _wip_note(self, mid):
+        """WIP-policy text injected into the Dev task when --wip-limit is set, so the model KNOWS the
+        team's WIP cap and where to stop. Injected via the task (not roles/dev.md) on purpose: it rides
+        into ALL THREE _call prompt variants — fresh, resumed-new-milestone (the persistent-Dev resume
+        path), and resumed-iteration (fallback) — and stays out of WIP-unlimited trials entirely."""
+        if not self.args.wip_limit:
+            return ""
+        return (f"\n\nWIP POLICY: this team works on at most {self.args.wip_limit} milestone(s) at a time — "
+                f"right now that is THIS one. Implement ONLY milestone {mid}: do NOT implement or "
+                f"pre-implement any other milestone's requirement, even if you remember one from earlier "
+                f"work — every future milestone gets its own PR later, cut from the then-current merged "
+                f"main. When this milestone's implementation is complete and ready to commit, STOP and "
+                f"end your turn.")
+
     # --- role actions -----------------------------------------------
     def dev_open(self, mid, issue_num):
         branch = f"task-{re.sub(r'[^A-Za-z0-9_.-]', '-', mid)}"
@@ -528,7 +542,8 @@ class Controller:
         task = (f"## Milestone to implement: {mid}\nRead the full requirement (SRS) at `{self.srs_path(mid)}`.\n\n"
                 f"Implement it in the current repo ({self.work}). As CI owner, keep the project CI building + "
                 f"passing after your change, extending it if new coverage is needed. Build/run the relevant "
-                f"tests locally. Leave changes ready to commit. Do NOT git tag, branch, or open a PR.")
+                f"tests locally. Leave changes ready to commit. Do NOT git tag, branch, or open a PR."
+                f"{self._wip_note(mid)}")
         self._call("dev", mid, task, f"open-{mid}")
         git_commit_all(self.work, f"{mid}: implement")
         _, ahead, _ = git(self.work, "rev-list", "--count", "origin/main..HEAD")
@@ -1009,6 +1024,28 @@ class Controller:
         log(f"[merge-gate] merged PR #{pr['number']} -> tag agent-impl-{mid} @ {(mcs or 'gitea/main')[:12]}")
         self.event(type="merged_and_tagged", milestone=mid, pr=pr["number"])
 
+    def _open_work(self):
+        """Open new milestone work (issue without a PR -> dev_open). Under --wip-limit N this caps the
+        WORK IN PROGRESS: at most N PRs in flight at once, and run() calls this at the END of the pass
+        (stop starting, start finishing). WIP=1 is the strict one-PR-at-a-time flow: each PR is cut from
+        the freshest main, so the merge queue's stale/integrate path never fires, and persistent-Dev
+        pre-implementation (the Trial-1 empty-PR root cause) is structurally prevented. wip_limit=0
+        (default) keeps the original open-everything behavior and the original pass position."""
+        limit = self.args.wip_limit
+        active = 0
+        if limit:
+            active = sum(1 for p in self.gc.list_prs(self.repo, state="open")
+                         if self._pr_state(p) and not self._resolved_mid(p))
+        for iss in self.gc.list_issues(self.repo, labels=["evoclaw-task"], state="open"):
+            if limit and active >= limit:
+                break  # pipeline at WIP capacity — finish in-flight PRs before starting new work
+            if "has-pr" in self._labels(iss):
+                continue
+            mid = next((m for m, n in self.issued.items() if n == iss["number"]), None)
+            if mid and mid not in self.tagged and mid not in self.abandoned:
+                self._safe("dev_open", self.dev_open, mid, iss["number"])
+                active += 1
+
     def _ci_red_route(self, pr, st):
         """Route a PR whose CURRENT head has red CI. Extracted from run() so every Gitea call here runs
         under _safe (the inline version could crash the whole controller on one HTTP error)."""
@@ -1066,12 +1103,8 @@ class Controller:
                 st = self._pr_state(pr)
                 if st in ("needs-code-changes:R", "needs-code-changes:Q") and not self._resolved_mid(pr):
                     self._safe("dev_fix", self.dev_fix, pr, st)
-            for iss in self.gc.list_issues(self.repo, labels=["evoclaw-task"], state="open"):
-                if "has-pr" in self._labels(iss):
-                    continue
-                mid = next((m for m, n in self.issued.items() if n == iss["number"]), None)
-                if mid and mid not in self.tagged and mid not in self.abandoned:
-                    self._safe("dev_open", self.dev_open, mid, iss["number"])
+            if not self.args.wip_limit:
+                self._open_work()  # original behavior: open everything up front
             for pr in self.gc.list_prs(self.repo, state="open"):
                 if not self._resolved_mid(pr):  # a resolved PR's CI result is never consumed — skip the build
                     self._safe("ci", self.run_ci, pr)
@@ -1093,6 +1126,10 @@ class Controller:
                     self._safe("merge", self.merge_gate, pr)
                 else:
                     self._safe("observer", self.observer, pr)
+            if self.args.wip_limit:
+                # WIP mode: open new work only AFTER this pass tried to finish in-flight work (merges
+                # above just freed WIP slots) — stop starting, start finishing.
+                self._open_work()
 
             # CLEAN EXIT: queue drained AND every milestone we ever issued is resolved AND no PR is still
             # in flight. (The old predicate required the queue to list tasks AND say 'No tasks currently
@@ -1142,6 +1179,9 @@ def main():
     ap.add_argument("--session-config", default="dev:persistent,reviewer:milestone,qa:milestone")
     ap.add_argument("--call-timeout", type=int, default=2400)
     ap.add_argument("--max-bounces", type=int, default=10)
+    ap.add_argument("--wip-limit", type=int, default=0,
+                    help="max PRs in flight at once (0 = unlimited/original behavior); under a limit, "
+                         "new work opens at the END of the pass and the Dev prompt states the WIP policy")
     ap.add_argument("--max-passes", type=int, default=200)
     ap.add_argument("--max-idle", type=int, default=16)
     ap.add_argument("--poll-secs", type=int, default=10)

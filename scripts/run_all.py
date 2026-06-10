@@ -368,6 +368,8 @@ def main():
         os.environ.setdefault("HARNESSED_SESSION", str(cfg["harnessed_session"]))
     if cfg.get("harnessed_max_bounces") is not None:
         os.environ.setdefault("HARNESSED_MAX_BOUNCES", str(cfg["harnessed_max_bounces"]))
+    if cfg.get("harnessed_wip_limit") is not None:
+        os.environ.setdefault("HARNESSED_WIP_LIMIT", str(cfg["harnessed_wip_limit"]))
 
     # Anti-cheat ("quarantine") is now PER-REPO and auto-on: each repo's policy
     # lives in quarantine_configs/<repo>.yaml and is applied only to that repo's

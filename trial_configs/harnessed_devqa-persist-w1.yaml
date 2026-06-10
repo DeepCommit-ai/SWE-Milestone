@@ -1,0 +1,24 @@
+# EvoHarness harnessed arm — SESSION SETUP 1 + WIP=1 ("1R-w1").
+# Same roles/sessions as harnessed_devqa-persist, but a STRICT one-PR-at-a-time flow:
+#   - at most 1 PR in flight; new work opens only after the in-flight PR merges (or abandons)
+#   - every PR is cut from the freshest merged main -> the merge queue's stale/integrate
+#     path never fires; persistent-Dev pre-implementation (Trial-1 empty-PR cause) is
+#     structurally prevented; the Dev prompt states the WIP policy explicitly
+# This is the cleanest "review/QA process value vs bare" comparison (bare is also one
+# milestone at a time); the WIP-unlimited run (harnessed_devqa-persist) keeps measuring
+# the parallel-team + merge-queue form.
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: harnessed_devqa-persist-w1
+agent: harnessed
+model: claude-opus-4-7
+default_haiku_model: claude-opus-4-7   # pin every Claude Code model slot to opus (no separate billing)
+reasoning_effort: xhigh                # matches the bare control claude-code_opus-4.7_xhigh_001
+vertex_ai: true                        # real billing, same backend as the bare leaderboard trials
+vertex_location: global
+timeout: 36000
+repos:
+  - navidrome
+  - ripgrep
+harnessed_session: "dev:persistent,reviewer:milestone,qa:persistent"
+harnessed_max_bounces: 10
+harnessed_wip_limit: 1

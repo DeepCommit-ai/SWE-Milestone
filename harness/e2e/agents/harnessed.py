@@ -86,6 +86,9 @@ class HarnessedFramework(ClaudeCodeFramework):
             "--testbed", "/testbed",
             "--event-log", "/e2e_workspace/harnessed_events.jsonl",
             "--max-bounces", os.environ.get("HARNESSED_MAX_BOUNCES", str(self._max_bounces)),
+            # WIP cap (0 = unlimited). yaml harnessed_wip_limit -> HARNESSED_WIP_LIMIT (run_all.py).
+            # WIP=1 = strict one-PR-at-a-time flow (1R-w1 setup).
+            "--wip-limit", os.environ.get("HARNESSED_WIP_LIMIT", "0"),
             # Per-role session strategy (fresh / milestone / persistent), configurable per agent via the
             # HARNESSED_SESSION env or the trial yaml's harnessed_session field.
             "--session-config", os.environ.get("HARNESSED_SESSION", "dev:persistent,reviewer:milestone,qa:milestone"),
