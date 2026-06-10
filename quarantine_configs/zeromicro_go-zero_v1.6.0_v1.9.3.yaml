@@ -1,0 +1,38 @@
+# Quarantine (anti-cheat) policy — go-zero v1.6.0 → v1.9.3
+#
+# Channel (attempted via WebFetch, blocked; the registry path was open):
+# `go get github.com/zeromicro/go-zero@v1.9.3` or a raw curl of the proxy
+# zip serves the full target source. Primary defense is GOPROXY=off (go
+# refuses proxy AND direct/VCS fetches, works from the image's /go/pkg/mod);
+# domain-deny is belt-and-suspenders. goproxy.cn (the image's configured
+# proxy, Qiniu CDN) and goproxy.io (Cloudflare) are CIDR-deniable;
+# proxy.golang.org rides Google ranges shared with Vertex aiplatform, so it
+# is domain-deny only — narrow residual (curl --resolve with a known Google
+# IP) accepted until the SNI egress proxy lands (issue #12 long-term plan).
+
+ecosystem: [go]
+
+deny_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - goproxy.cn
+  - goproxy.io
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (goproxy.io)
+  - 155.102.0.0/16     # Qiniu/Kunlun CDN (goproxy.cn)
+
+go_offline: true
+
+# The main module is never in its own module cache; any copy of it there is
+# answer material.
+cache_forbid_globs:
+  - /go/pkg/mod/cache/download/github.com/zeromicro/*
+  - /go/pkg/mod/github.com/zeromicro/*
+
+verify_fetch_urls:
+  - https://proxy.golang.org/github.com/zeromicro/go-zero/@v/v1.9.3.zip
+  - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip

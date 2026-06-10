@@ -1,0 +1,34 @@
+# Quarantine (anti-cheat) policy — navidrome v0.57.0 → v0.58.0
+#
+# Dual ecosystem: Go backend (same channel & defense as go-zero —
+# GOPROXY=off + proxy domain-deny) and npm UI (registry.npmjs.org rides
+# Cloudflare; ui/node_modules 748M is pre-baked, npm forced offline).
+# The agent attempted exactly 1 WebFetch of upstream master (blocked).
+
+ecosystem: [go, npm]
+
+deny_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - goproxy.cn
+  - goproxy.io
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+  - registry.npmjs.org
+  - registry.yarnpkg.com
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (npm registry + goproxy.io)
+  - 155.102.0.0/16     # Qiniu/Kunlun CDN (goproxy.cn)
+
+go_offline: true
+npm_offline: true
+
+cache_forbid_globs:
+  - /go/pkg/mod/cache/download/github.com/navidrome/*
+  - /go/pkg/mod/github.com/navidrome/*
+
+verify_fetch_urls:
+  - https://proxy.golang.org/github.com/navidrome/navidrome/@v/v0.58.0.zip
+  - https://registry.npmjs.org/navidrome

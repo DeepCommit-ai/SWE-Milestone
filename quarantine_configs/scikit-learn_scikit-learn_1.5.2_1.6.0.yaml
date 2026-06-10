@@ -11,6 +11,8 @@
 # reached the wheel) and force pip offline against a vetted dependency closure
 # that excludes scikit-learn by construction.
 
+ecosystem: [pip]
+
 # Registry domains denied at the iptables layer (excluded from the whitelist).
 deny_domains:
   - pypi.org
@@ -33,3 +35,8 @@ wheelhouse_forbid:
   - scikit-learn
   - scikit_learn
   - sklearn
+
+# The exact channel of the original confirmed cheat — must fail to connect.
+verify_fetch_urls:
+  - https://pypi.org/simple/scikit-learn/
+  - https://files.pythonhosted.org/
