@@ -86,12 +86,44 @@ that repo's container whenever the file exists — no trial-config flag. To run 
 unprotected baseline for a repo, move its file aside. Policy fields:
 
 ```yaml
-# quarantine_configs/scikit-learn_scikit-learn_1.5.2_1.6.0.yaml
+# quarantine_configs/scikit-learn_scikit-learn_1.5.2_1.6.0.yaml  (pip)
+ecosystem:      [pip]                                # used by the coverage gate
 deny_domains:   [pypi.org, files.pythonhosted.org]
 deny_cidrs:     [151.101.0.0/16, 146.75.0.0/16]    # Fastly fronts PyPI
-pip_wheelhouse: /host/path/to/wheelhouse            # host-specific
+pip_wheelhouse: ${EVOCLAW_WHEELHOUSE_DIR}/sk_wheelhouse   # expanded from .env_private
 wheelhouse_forbid: [scikit-learn, scikit_learn, sklearn]
+verify_fetch_urls: [https://pypi.org/simple/scikit-learn/]   # must fail to connect
 ```
+
+```yaml
+# quarantine_configs/apache_dubbo_dubbo-3.3.3_dubbo-3.3.6.yaml  (maven)
+ecosystem:        [maven]
+deny_domains:     [repo1.maven.org, repo.maven.apache.org, central.sonatype.com]
+deny_cidrs:       [104.16.0.0/12]                   # Cloudflare fronts Maven Central
+maven_offline:    true                              # → MAVEN_ARGS=-o
+maven_repo_local: /root/.m2/repository              # image's pre-baked .m2
+cache_forbid_globs: ["/root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*"]
+verify_fetch_urls: [".../dubbo-common-3.3.6-sources.jar"]
+```
+
+**Policy fields.** `ecosystem` (required — see the gate below). Network deny:
+`deny_domains`, `deny_cidrs`. Offline closure, one per package manager:
+`pip_wheelhouse` (+`wheelhouse_forbid`), `cargo_offline`, `go_offline`,
+`maven_offline` (+`maven_repo_local`), `npm_offline`. Fail-closed audits run at
+container lockdown: `cache_forbid_globs` (the image's pre-baked cache must not
+ship the repo's own post-baseline artifacts) and `verify_fetch_urls` (the exact
+observed cheat URLs — any successful TCP connect aborts the trial).
+
+### Fail-closed coverage gate (issue #12)
+
+Quarantine is **opt-in by file presence**, which is how 6 repos once ran open. To
+make "silently unprotected" impossible, `run_all.py` runs a **coverage gate**
+before launching: every repo must have a config that declares its `ecosystem`
+and whose `deny_domains` covers **all** of that ecosystem's registries
+(`harness/e2e/quarantine.py:ECOSYSTEM_REGISTRIES`). A missing/incomplete policy
+**hard-fails the launch** (`Refusing to launch …`); `--unprotected` is the
+explicit, logged escape hatch for an intentional open baseline. Use `none` as
+the ecosystem for a repo with no answer-serving registry.
 
 `load_quarantine_env()` in `run_all.py` reads that file and passes the policy to
 **only that repo's** worker via the env vars below, consumed by
@@ -131,9 +163,39 @@ insufficient — see "Why … not enough"):
    > **`apt-get` breaks** under quarantine. Fine when the eval image is
    > pre-provisioned (toolchain baked in); provision any needed system package
    > into the image rather than reopening the range.
-2. **Package manager.** Force the manager offline against the local closure:
-   `EVOCLAW_PIP_WHEELHOUSE=/path/to/wheelhouse` → mounts it read-only at
-   `/wheelhouse` and sets `PIP_NO_INDEX=1` + `PIP_FIND_LINKS=/wheelhouse`.
+   - **CIDR-deny matching is by subnet overlap, not string equality.** The
+     builtin `CDN_CIDR_RANGES` accepts Cloudflare as `104.16.0.0/13`; a Maven/npm
+     policy denies `104.16.0.0/12`. String-equality skipping would leave the
+     `/13` ACCEPT in place and the registry reachable — `cidr_overlaps_any()`
+     drops any builtin range that overlaps a denied one.
+   - **Go's residual.** `proxy.golang.org` / `sum.golang.org` / `golang.org` /
+     `go.dev` ride Google ranges **shared with Vertex `aiplatform`**, so they
+     cannot be IP-blocked without cutting the model path. Their defense is the
+     manager-offline layer (`GOPROXY=off`); `verify_network_lockdown`
+     auto-detects this (a denied domain whose resolved IPs all fall in a
+     still-ACCEPTed CDN range) and downgrades it to a warning instead of a
+     hard-fail. `goproxy.cn` (Qiniu) / `goproxy.io` (Cloudflare) / `pkg.go.dev`
+     (GCLB) are IP-blockable and stay hard-asserted. The SNI egress proxy (long
+     term, see `docs/quarantine-rollout.md`) eliminates this residual.
+2. **Package manager (offline closure).** Force the manager at a local closure
+   instead of the live registry. Wired in `harness/e2e/agents/base.py`
+   (`get_quarantine_env_vars` / `get_quarantine_mounts`, shared by **all**
+   agents). Per manager, set from the policy's offline switch:
+   - **pip** — `pip_wheelhouse` mounts the host wheelhouse read-only at
+     `/wheelhouse`, sets `PIP_NO_INDEX=1` + `PIP_FIND_LINKS=/wheelhouse`.
+   - **cargo** — `cargo_offline: true` → `CARGO_NET_OFFLINE=true`.
+   - **go** — `go_offline: true` → `GOPROXY=off` (also written into
+     `/etc/environment` + `.bashrc` by `lock_network`, since shell profiles
+     override a bare `docker -e`).
+   - **maven** — `maven_offline: true` → `MAVEN_ARGS=-o`
+     (`+ -Dmaven.repo.local=<maven_repo_local>`, redirecting Maven at the
+     image's pre-baked `.m2` since the agent runs as `fakeroot`).
+   - **npm** — `npm_offline: true` → `npm_config_offline=true`.
+
+   For cargo/go/maven/npm the closure is the **cache pre-baked into the eval
+   image** (verified present: cargo registry, `/go/pkg/mod`, `/root/.m2`,
+   `node_modules`); the repo's own package is a path/vendor/workspace dep, never
+   in that cache. `cache_forbid_globs` asserts this at lockdown.
 3. **(existing) /etc/hosts poisoning + github block** — unchanged.
 
 ### Building the closure (pip example)
@@ -161,20 +223,28 @@ so a tampered/un-audited wheelhouse is caught even if the builder was bypassed.
 
 ## Verification protocol (run before trusting a secure re-run)
 
-Inside the locked container, all must hold:
+Most of this is now **automated**. `verify_network_lockdown` (run at every
+container lockdown) asserts the denied hosts and every `verify_fetch_urls` entry
+are unreachable and audits `cache_forbid_globs`. Probes use **python3, not curl**
+(`_url_reachable_in_container` — a single IPv4 TCP connect), so they are accurate
+even on images that ship no curl (e.g. the scikit base, where the old curl probes
+silently passed). `scripts/verify_quarantine.py --repo <name>` spins up a repo's
+real base image, applies the policy + lockdown, and additionally checks the LLM
+endpoints stay reachable and the offline switches are present:
 
 ```
-curl github.com                  → CONNFAIL   (baseline: code-hosting blocked)
-curl files.pythonhosted.org      → CONNFAIL   (registry CDN blocked)
-curl pypi.org/simple/            → CONNFAIL
-pip download <self>==<target>    → No matching distribution  (manager offline)
-pip download <a-real-dependency> → Successfully downloaded    (wheelhouse works)
-curl aiplatform.googleapis.com   → reachable  (LLM endpoint preserved)
+python scripts/verify_quarantine.py --repo dubbo      # → ALL PASS
 ```
 
-Plus an **end-to-end attack**: resolve the target sdist URL via the PyPI JSON API
-and `curl` it — it must fail to connect (this is the exact hole that the
-pip-only block missed).
+Conceptually, inside the locked container all must hold:
+
+```
+github.com / <registry CDN>      → CONNFAIL   (code hosting + registry blocked)
+<verify_fetch_urls entries>      → CONNFAIL   (exact observed cheat URLs)
+<pm> install <self>@<target>     → fails      (manager offline, e.g. "No matching distribution")
+<pm> install <a-real-dependency> → succeeds   (offline closure works)
+aiplatform.googleapis.com        → reachable  (LLM endpoint preserved)
+```
 
 ## Residual caveats (be honest about scope)
 
@@ -193,7 +263,26 @@ pip-only block missed).
 
 ## Status
 
-- pip / scikit-learn: implemented + verified (first instance of this design).
-- Other ecosystems (cargo/Go/Maven/npm): design specified above; not yet wired.
-  When you quarantine those repos, add the per-ecosystem offline switch from the
-  table and extend the verification protocol with that manager's download command.
+**All 7 benchmark repos covered** (issue #12), each with a
+`quarantine_configs/<repo>.yaml` and live-smoke-tested via
+`scripts/verify_quarantine.py` (ALL PASS):
+
+| repo | ecosystem | network deny | offline closure |
+|---|---|---|---|
+| scikit-learn | pip | PyPI + Fastly `/16`s | host wheelhouse |
+| ripgrep, nushell | cargo | crates.io + Fastly `/16`s | `CARGO_NET_OFFLINE` + image cache |
+| dubbo | maven | Maven Central + Cloudflare `/12` | `mvn -o` + image `.m2` |
+| go-zero | go | goproxy.cn/io + proxy domain-deny | `GOPROXY=off` + modcache |
+| navidrome | go + npm | (go set) + npm registry + Cloudflare `/12` | `GOPROXY=off` + `npm_config_offline` |
+| element-web | npm | npm registry + Cloudflare `/12` | `npm_config_offline` |
+
+Implemented since the original pip design: per-manager offline switches
+(`harness/e2e/agents/base.py`), subnet-overlap CIDR deny, the Google-shared
+auto-exemption, the fail-closed coverage gate + `--unprotected`
+(`scripts/run_all.py`), curl-independent verification probes, and
+`cache_forbid_globs` / `verify_fetch_urls` audits.
+
+**Remaining residual:** `proxy.golang.org` (Google range shared with Vertex) is
+defended only at the manager layer (`GOPROXY=off`), not the firewall. The
+**SNI-filtering egress proxy** in `docs/quarantine-rollout.md` is the definitive
+fix that closes it (and the whole shared-CDN class).

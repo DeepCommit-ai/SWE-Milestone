@@ -1,7 +1,23 @@
 # Quarantine rollout to all ecosystems — risk study & plan
 
-**Status:** research / proposal (pip implemented & verified; cargo/go/maven/npm NOT yet wired)
-**Related:** [`docs/quarantine.md`](quarantine.md) (the design + the pip implementation)
+**Status:** ✅ **ROLLED OUT (issue #12, 2026-06-10)** — all 5 ecosystems (pip,
+cargo, go, maven, npm) are wired and live-smoke-tested for all 7 repos. See
+[`docs/quarantine.md`](quarantine.md) → "Status" for the per-repo matrix and the
+implemented mechanism. This doc is kept as the **risk study + the long-term SNI
+proxy plan**; the per-ecosystem analysis below is what informed the configs.
+
+**What shipped vs. this study:** the network lever (deny domains + CIDR) works
+per the analysis; the offline closures use the **eval image's pre-baked package
+cache** (cargo registry / `/go/pkg/mod` / `.m2` / `node_modules`) rather than
+freshly built vendor dirs. The go ecosystem was implemented with **`GOPROXY=off`
+as the primary defense** (NOT the `/32`-exemption CIDR-deny proposed below):
+`proxy.golang.org` shares Vertex's Google range, and rather than risk an anycast
+`/32` carve-out that could rotate into Vertex's IP and break the model path,
+`verify_network_lockdown` auto-exempts the Google-shared Go domains from the
+unreachable assertion and leans on `GOPROXY=off`. That `proxy.golang.org`
+residual is the one thing the SNI proxy (below) still needs to close.
+
+**Related:** [`docs/quarantine.md`](quarantine.md) (the design + full implementation)
 
 ## Why this doc exists
 
