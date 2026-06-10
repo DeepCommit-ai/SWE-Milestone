@@ -111,14 +111,34 @@ class AgentFramework(ABC):
         return []
 
     def get_quarantine_env_vars(self) -> List[str]:
-        """Quarantine: force pip offline to the wheelhouse (no PyPI index).
+        """Quarantine: force the repo's package manager(s) offline.
 
         Belt to the EVOCLAW_DENY_* firewall suspenders, shared across agents.
-        See docs/quarantine.md.
+        pip gets the mounted wheelhouse; cargo/go/maven/npm run offline
+        against the cache pre-baked into the eval image (verified present:
+        cargo registry, /go/pkg/mod, /root/.m2, node_modules). GOPROXY=off is
+        additionally written into /etc/environment + .bashrc by
+        container_setup.lock_network (shell profiles would override a bare
+        docker -e). See docs/quarantine.md.
         """
+        env: List[str] = []
         if os.environ.get("EVOCLAW_PIP_WHEELHOUSE"):
-            return ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
-        return []
+            env += ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
+        if os.environ.get("EVOCLAW_CARGO_OFFLINE"):
+            env += ["-e", "CARGO_NET_OFFLINE=true"]
+        if os.environ.get("EVOCLAW_GO_OFFLINE"):
+            env += ["-e", "GOPROXY=off"]
+        if os.environ.get("EVOCLAW_MAVEN_OFFLINE"):
+            margs = "-o"
+            repo_local = os.environ.get("EVOCLAW_MAVEN_REPO_LOCAL")
+            if repo_local:
+                # The image's populated cache lives under root's home; the
+                # agent runs as fakeroot, whose own ~/.m2 starts empty.
+                margs += f" -Dmaven.repo.local={repo_local}"
+            env += ["-e", f"MAVEN_ARGS={margs}"]
+        if os.environ.get("EVOCLAW_NPM_OFFLINE"):
+            env += ["-e", "npm_config_offline=true"]
+        return env
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return the reasoning effort level actually used by the agent.

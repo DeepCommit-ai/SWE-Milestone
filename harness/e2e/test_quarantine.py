@@ -103,6 +103,68 @@ deny_domains: [proxy.golang.org, sum.golang.org, goproxy.cn, goproxy.io,
         assert quarantine_coverage_errors(["repoF"], tmp_path) == []
 
 
+class TestAgentQuarantineEnvVars:
+    def _env_dict(self, flags):
+        """Run get_quarantine_env_vars under a controlled env, return {k: v}."""
+        import os
+
+        from harness.e2e.agents.base import AgentFramework
+
+        class _F(AgentFramework):
+            FRAMEWORK_NAME = "test"
+
+            def get_container_mounts(self):
+                return []
+
+            def get_container_init_script(self, agent_name):
+                return ""
+
+            def build_run_command(self, model, session_id, prompt_path):
+                return ""
+
+            def build_resume_command(self, model, session_id, message_path):
+                return ""
+
+        saved = {k: os.environ.pop(k) for k in list(os.environ)
+                 if k.startswith("EVOCLAW_")}
+        try:
+            os.environ.update(flags)
+            args = _F().get_quarantine_env_vars()
+        finally:
+            for k in flags:
+                os.environ.pop(k, None)
+            os.environ.update(saved)
+        assert all(args[i] == "-e" for i in range(0, len(args), 2))
+        pairs = [args[i + 1] for i in range(0, len(args), 2)]
+        return dict(p.split("=", 1) for p in pairs)
+
+    def test_no_flags_no_vars(self):
+        assert self._env_dict({}) == {}
+
+    def test_cargo_offline(self):
+        assert self._env_dict({"EVOCLAW_CARGO_OFFLINE": "1"}) == {
+            "CARGO_NET_OFFLINE": "true"}
+
+    def test_go_offline(self):
+        assert self._env_dict({"EVOCLAW_GO_OFFLINE": "1"}) == {"GOPROXY": "off"}
+
+    def test_maven_offline_with_repo_local(self):
+        env = self._env_dict({"EVOCLAW_MAVEN_OFFLINE": "1",
+                              "EVOCLAW_MAVEN_REPO_LOCAL": "/root/.m2/repository"})
+        assert env == {"MAVEN_ARGS": "-o -Dmaven.repo.local=/root/.m2/repository"}
+
+    def test_maven_offline_without_repo_local(self):
+        assert self._env_dict({"EVOCLAW_MAVEN_OFFLINE": "1"}) == {"MAVEN_ARGS": "-o"}
+
+    def test_npm_offline(self):
+        assert self._env_dict({"EVOCLAW_NPM_OFFLINE": "1"}) == {
+            "npm_config_offline": "true"}
+
+    def test_pip_wheelhouse_unchanged(self):
+        env = self._env_dict({"EVOCLAW_PIP_WHEELHOUSE": "/wh"})
+        assert env == {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": "/wheelhouse"}
+
+
 class TestCidrOverlap:
     def test_denied_slash12_covers_accept_slash13(self):
         assert cidr_overlaps_any("104.16.0.0/13", ["104.16.0.0/12"])
