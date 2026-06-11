@@ -80,6 +80,57 @@ def test_hermetic_gate_catches_mtime_masked_break(tmp_path=None):
     assert not leftovers, f"ci-gate dirs leaked: {leftovers}"
 
 
+def _seed_repo(base):
+    """origin + work clone with the FILES baseline committed; returns (origin, work, baseline_sha)."""
+    origin, work = os.path.join(base, "origin.git"), os.path.join(base, "work")
+    _sh(f"git init -q --bare {origin}")
+    _sh(f"git clone -q {origin} {work}")
+    _sh("git config user.email t@t && git config user.name t", cwd=work)
+    for name, body in FILES.items():
+        with open(os.path.join(work, name), "w") as f:
+            f.write(body)
+    _sh("chmod +x ci.sh && git add -A && git commit -qm baseline && git push -q origin HEAD:main", cwd=work)
+    return origin, work, _sh("git rev-parse HEAD", cwd=work)[1]
+
+
+def test_qa_worktree_is_fresh_each_call_and_pushes_tests():
+    base = tempfile.mkdtemp(prefix="hermetic-qa-test-")
+    _, work, sha = _seed_repo(base)
+    fake = types.SimpleNamespace(work=work, args=types.SimpleNamespace(call_timeout=60))
+    try:
+        # shared clone polluted with the gitignored artifact (the trap)
+        rc, _ = _sh("sh ci.sh", cwd=work)
+        assert rc == 0 and os.path.exists(os.path.join(work, "out.bin"))
+
+        # 1) QA's worktree is created at the exact sha and does NOT inherit the artifact
+        controller.Controller._qa_checkout(fake, sha)
+        assert _sh("git rev-parse HEAD", cwd=controller.QA_WORK)[1] == sha
+        assert not os.path.exists(os.path.join(controller.QA_WORK, "out.bin")), \
+            "QA worktree must not inherit gitignored artifacts from the shared clone"
+
+        # 2) leftovers from a QA round are wiped by the next recreation
+        with open(os.path.join(controller.QA_WORK, "out.bin"), "w") as f:
+            f.write("stale artifact from a previous QA round")
+        controller.Controller._qa_checkout(fake, sha)
+        assert not os.path.exists(os.path.join(controller.QA_WORK, "out.bin")), \
+            "recreation must wipe artifacts left by the previous QA round"
+
+        # 3) tests QA commits in the worktree fast-forward onto the branch
+        with open(os.path.join(controller.QA_WORK, "qa_added_test.sh"), "w") as f:
+            f.write("echo qa test\n")
+        _sh("git add -A && git -c user.name=qa -c user.email=qa@t commit -qm 'qa tests'",
+            cwd=controller.QA_WORK)
+        controller.Controller._qa_push(fake, "main")
+        _sh("git fetch -q origin", cwd=work)
+        rc, _ = _sh("git cat-file -e origin/main:qa_added_test.sh", cwd=work)
+        assert rc == 0, "QA's committed test must reach the branch on origin"
+    finally:
+        _sh(f"git worktree remove --force {controller.QA_WORK}", cwd=work)
+        _sh(f"rm -rf {controller.QA_WORK}")
+
+
 if __name__ == "__main__":
     test_hermetic_gate_catches_mtime_masked_break()
-    print("PASS: old gate = false green (mask reproduced); new hermetic gate = red; clean teardown.")
+    test_qa_worktree_is_fresh_each_call_and_pushes_tests()
+    print("PASS: old gate = false green (mask reproduced); new hermetic gate = red; "
+          "QA worktree fresh per call + tests reach the branch; clean teardown.")

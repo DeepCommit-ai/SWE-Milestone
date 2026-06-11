@@ -43,6 +43,13 @@ OUT_CAP = 16000
 MERGE_GIVEUP = 3
 # At most one controller may drive the repo (see takeover_singleton).
 PIDFILE = "/tmp/harnessed_controller.pid"
+# QA's own working tree — a HERMETIC worktree recreated FRESH at the PR head for every QA call, at a
+# STABLE path (claude sessions are keyed by cwd: a changing path would break --resume for the
+# milestone/persistent session strategies). Same rationale as the CI gate's ephemeral worktree: QA's
+# "verdict from real execution" must not be vouched for by build artifacts predating the change under
+# test (navidrome plugin.wasm mtime mask). Dev keeps the long-lived shared clone — dirty fast
+# iteration is fine for AUTHORING; it's the VERIFICATION roles that must run clean.
+QA_WORK = "/tmp/qa_work"
 RUNTIME = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.expanduser("~/.claude/skills")
 CI_SKILL = os.path.join(SKILL_DIR, "ci-maintenance-check", "SKILL.md")
@@ -518,7 +525,28 @@ class Controller:
         if rc != 0:
             raise RuntimeError(f"push {branch} -> origin failed: {err[:160]}")
 
-    def _call(self, role, mid, fresh_task, label_suffix, resume_task=None):
+    def _qa_checkout(self, commit_ish):
+        """Recreate QA's hermetic worktree (QA_WORK) FRESH at `commit_ish`, detached. Torn down and
+        rebuilt on every QA call: the path stays stable (session resume), the contents never carry
+        anything over — no gitignored build artifact from a previous round (or from Dev's tree) can
+        mask a break in the code under test. Failures raise (caught by _safe -> the pass retries)."""
+        git(self.work, "fetch", "origin")
+        git(self.work, "worktree", "remove", "--force", QA_WORK)  # best-effort: may not exist yet
+        shutil.rmtree(QA_WORK, ignore_errors=True)                # catches what remove refuses
+        git(self.work, "worktree", "prune")
+        rc, _, err = git(self.work, "worktree", "add", "--detach", QA_WORK, commit_ish)
+        if rc != 0:
+            raise RuntimeError(f"qa worktree add {commit_ish} failed: {err[:200]}")
+
+    def _qa_push(self, branch):
+        """Push QA's committed tests from its detached-HEAD worktree onto the PR branch, CHECKED.
+        Plain (non-force) push: QA's commit fast-forwards the head it was given; anything else means
+        the branch moved underneath (should not happen — the controller is serial) and must surface."""
+        rc, _, err = git(QA_WORK, "push", "origin", f"HEAD:{branch}")
+        if rc != 0:
+            raise RuntimeError(f"qa push HEAD->{branch} failed: {err[:160]}")
+
+    def _call(self, role, mid, fresh_task, label_suffix, resume_task=None, workdir=None):
         """Run the role's claude with the right prompt for one of THREE situations:
           1. fresh session              → full role.md system prompt + fresh_task;
           2. resumed session, but the FIRST task for THIS milestone (strategy B carried the session over
@@ -538,7 +566,7 @@ class Controller:
                       f"\n\n{fresh_task}")
         else:
             prompt = f"(Continuing your work as {role}.)\n\n{resume_task or fresh_task}"
-        return run_claude(prompt, self.args, f"{role}-{label_suffix}", self.work, sid, resume)
+        return run_claude(prompt, self.args, f"{role}-{label_suffix}", workdir or self.work, sid, resume)
 
     def _wip_note(self, mid):
         """WIP-policy text injected into the Dev task when --wip-limit is set, so the model KNOWS the
@@ -731,7 +759,6 @@ class Controller:
     def qa(self, pr):
         mid = self._mid_of_pr(pr)
         branch = (pr.get("head") or {}).get("ref")
-        self._wc_checkout(branch)
         forced = self.qa_bounces.get(mid, 0) >= self.args.max_bounces
         if forced:
             verdict, out = "pass", ""
@@ -740,8 +767,15 @@ class Controller:
                             "(terminal safety valve, not a real pass)")
             log(f"[qa] PR #{pr['number']} budget exhausted -> force pass")
         else:
+            # QA verifies in its OWN fresh worktree at the exact PR head — never the shared clone,
+            # whose leftover gitignored build artifacts can vouch for broken code (the plugin.wasm
+            # mtime mask). "Verdict from real execution" requires a clean build state.
+            self._qa_checkout(self._head_sha(pr))
+            clean_note = ("Your working directory is a FRESH checkout of the PR head — build artifacts "
+                          "from previous rounds are deliberately absent; build from source as needed.")
             fresh = (f"## PR under test: milestone {mid}\nThe PR branch is checked out in your working "
-                     f"directory ({self.work}); base is `origin/main`. Requirement (SRS): `{self.srs_path(mid)}`.\n"
+                     f"directory ({QA_WORK}); base is `origin/main`. {clean_note} Requirement (SRS): "
+                     f"`{self.srs_path(mid)}`.\n"
                      f"As Test-Suite owner: build the project and run its tests, AND write/strengthen tests in "
                      f"the suite that deeply exercise this milestone's required behavior (mirror the codebase's "
                      f"conventions / verify cross-type interface symmetry). Tests you add are committed. Give "
@@ -753,18 +787,23 @@ class Controller:
                 resume = (f"## Re-test: milestone {mid}\nSince your PASS, {qnote}. Re-verify the milestone ON "
                           f"THE MERGED RESULT: build and run the full test suite (including tests you added), "
                           f"and confirm the milestone's required behavior still holds with main's incoming "
-                          f"changes merged in. (SRS at `{self.srs_path(mid)}`.) Give your verdict from real execution.")
+                          f"changes merged in. {clean_note} (SRS at `{self.srs_path(mid)}`.) Give your verdict "
+                          f"from real execution.")
             else:
                 resume = (f"## Re-test: milestone {mid}\nThe PR has NEW commits since your last QA round. "
-                          f"Re-verify by building + running the tests (including the ones you added). (SRS "
-                          f"unchanged at `{self.srs_path(mid)}`.) Give your verdict from real execution.")
-            out = self._call("qa", mid, fresh, f"{mid}-{self.qa_bounces.get(mid,0)}", resume_task=resume)
+                          f"Re-verify by building + running the tests (including the ones you added). "
+                          f"{clean_note} (SRS unchanged at `{self.srs_path(mid)}`.) Give your verdict from "
+                          f"real execution.")
+            out = self._call("qa", mid, fresh, f"{mid}-{self.qa_bounces.get(mid,0)}", resume_task=resume,
+                             workdir=QA_WORK)
             verdict = "pass" if parse_verdict(out, "PASS", "FAIL") == "PASS" else "bug"
             self.gc.comment(self.repo, pr["number"], out[:OUT_CAP] or "(no output)")
-        # QA maintains the Test Suite: commit + push any tests it wrote/updated (head sha will change;
-        # CI re-runs on the new head next pass before merge).
-        git_commit_all(self.work, f"{mid}: QA tests")
-        self._push(branch)
+            # QA maintains the Test Suite: commit + push any tests it wrote/updated (head sha will
+            # change; CI re-runs on the new head next pass before merge). Committed in QA's worktree
+            # (detached HEAD on top of the PR head), pushed as a fast-forward onto the branch. The
+            # forced path deliberately touches NO git state — there was no QA run to record.
+            git_commit_all(QA_WORK, f"{mid}: QA tests")
+            self._qa_push(branch)
         pr = self.gc.get_pr(self.repo, pr["number"])  # refresh head sha after QA's commit
         sha = self._head_sha(pr)
         if verdict == "pass":
