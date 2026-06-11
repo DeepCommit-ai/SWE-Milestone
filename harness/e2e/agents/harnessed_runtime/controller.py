@@ -27,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -352,8 +353,8 @@ class Controller:
         log(f"[setup] installed skills: {os.listdir(src)}")
 
     # --- CI (Dev-owned project pipeline) ----------------------------
-    def _default_ci_body(self):
-        has = lambda f: os.path.exists(os.path.join(self.work, f))  # noqa: E731
+    def _default_ci_body(self, tree):
+        has = lambda f: os.path.exists(os.path.join(tree, f))  # noqa: E731
         if has("Cargo.toml"):
             return 'echo "[ci] build"; cargo build --workspace\necho "[ci] test"; cargo test --workspace'
         if has("go.mod"):
@@ -375,7 +376,7 @@ class Controller:
             return
         with open(ci_sh, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env bash\n# Project CI — owned & MAINTAINED by Dev (lint + build + tests).\n"
-                    "set -e\n" + _CI_ENV_LINES + "\n" + self._default_ci_body() + "\n")
+                    "set -e\n" + _CI_ENV_LINES + "\n" + self._default_ci_body(self.work) + "\n")
         os.chmod(ci_sh, 0o755)
         wf = os.path.join(self.work, ".gitea", "workflows")
         os.makedirs(wf, exist_ok=True)
@@ -385,20 +386,46 @@ class Controller:
         git(self.work, "push", "origin", "main")
         log("[setup] seeded ci.sh + .gitea/workflows/ci.yaml into main")
 
-    def _run_project_ci(self):
-        """Run the Dev-maintained project CI (ci.sh) in the current working tree. Returns (ok, log).
+    def _run_project_ci(self, commit_ish):
+        """Run the Dev-maintained project CI (ci.sh) on `commit_ish` in an EPHEMERAL git worktree —
+        created fresh per run, removed after. Returns (ok, log).
+
+        WHY ISOLATED (navidrome three-arm post-mortem): the shared clone accumulates GITIGNORED build
+        artifacts that mtime-based Makefile rules never rebuild — navidrome's plugins/testdata
+        plugin.wasm, born green at baseline, masked a wasip1-only interface break through EVERY later
+        in-tree CI run (trial green, eval-container red), in both harness arms. Devs may test in their
+        own (dirty) tree for speed, but the GATE must build from a state where no artifact predates the
+        change under test — standard real-world CI semantics. A fresh worktree guarantees that
+        structurally, for any repo, with no per-repo knowledge of what to clean. The shared GOCACHE
+        (content-addressed: a hit requires identical inputs, so it can only speed up a true green,
+        never fake one) keeps the cold-build cost low.
+
         A TIMEOUT is a FAILING result, not an exception: letting TimeoutExpired escape to _safe would
         leave ci_done[sha] unset, so the same full-length hang re-runs every pass (and after every
         restart) with no red signal ever reaching dev_fix_ci / the CI budget."""
-        ci = os.path.join(self.work, "ci.sh")
-        body = "bash ci.sh" if os.path.exists(ci) else self._default_ci_body().replace("\n", " && ")
+        git(self.work, "fetch", "origin")
+        holder = tempfile.mkdtemp(prefix="ci-gate-")
+        wt = os.path.join(holder, "tree")
         try:
-            r = run_proc(["/bin/sh", "-c", _CI_PATH + body], cwd=self.work, timeout=self.args.call_timeout)
-        except subprocess.TimeoutExpired:
-            return False, (f"(CI TIMED OUT after {self.args.call_timeout}s — a hanging step is a FAILING "
-                           f"gate; find and fix the blocking command, e.g. a foregrounded server or a "
-                           f"test waiting on stdin/network)")
-        return r.returncode == 0, (r.stdout + r.stderr)[-OUT_CAP:]
+            rc, _, err = git(self.work, "worktree", "add", "--detach", wt, commit_ish)
+            if rc != 0:
+                raise RuntimeError(f"ci worktree add {commit_ish} failed: {err[:200]}")
+            ci = os.path.join(wt, "ci.sh")
+            body = "bash ci.sh" if os.path.exists(ci) else self._default_ci_body(wt).replace("\n", " && ")
+            try:
+                r = run_proc(["/bin/sh", "-c", _CI_PATH + body], cwd=wt, timeout=self.args.call_timeout)
+            except subprocess.TimeoutExpired:
+                return False, (f"(CI TIMED OUT after {self.args.call_timeout}s — a hanging step is a FAILING "
+                               f"gate; find and fix the blocking command, e.g. a foregrounded server or a "
+                               f"test waiting on stdin/network)")
+            return r.returncode == 0, (r.stdout + r.stderr)[-OUT_CAP:]
+        finally:
+            # Best-effort teardown, robust to dirty/broken worktrees: `remove --force` handles the
+            # normal case; rmtree catches what it refuses (e.g. submodule leftovers); prune clears the
+            # admin record if the directory was nuked out from under git.
+            git(self.work, "worktree", "remove", "--force", wt)
+            shutil.rmtree(holder, ignore_errors=True)
+            git(self.work, "worktree", "prune")
 
     def _probe_main_ci(self):
         """DIAGNOSTIC: does untouched main pass the project CI in THIS env? Recorded so Dev knows whether
@@ -406,8 +433,7 @@ class Controller:
         This NO LONGER weakens the gate — CI is always enforced on the real ci.sh result."""
         if self.main_ci_ok is not None:
             return
-        self._wc_checkout("main")
-        ok, _out = self._run_project_ci()
+        ok, _out = self._run_project_ci("origin/main")
         self.main_ci_ok = ok
         log(f"[ci] baseline probe: untouched main CI {'PASS' if ok else 'FAIL (Dev must make the gate valid)'}")
         self.event(type="ci_baseline", main_ci_ok=ok)
@@ -642,8 +668,10 @@ class Controller:
         if not sha or self.ci_done.get(sha):
             return
         self._probe_main_ci()  # DIAGNOSTIC only (does the untouched base build in this env?) — never a gate weaken
-        self._wc_checkout((pr.get("head") or {}).get("ref"))
-        ok, out = self._run_project_ci()
+        # CI runs on the EXACT head sha in its own ephemeral worktree (never the shared clone): the
+        # status we set certifies this sha, so checking out `origin/<branch>` (which may have advanced)
+        # would certify the wrong code; and the shared tree's leftover build artifacts must not vouch.
+        ok, out = self._run_project_ci(sha)
         # CI is a REAL hard gate: the status is the ACTUAL ci.sh result. The framework NEVER force-greens a
         # failing PR (not even when the untouched base fails to build) — making CI a valid, passable gate is
         # the Dev's job (spec §3.1: Dev owns + maintains the pipeline; install the build deps, or write a
