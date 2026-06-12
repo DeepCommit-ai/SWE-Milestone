@@ -52,14 +52,33 @@ class TaskRecord:
     def from_row(cls, ei: dict) -> "TaskRecord":
         """Build from a parquet extra_info dict (numpy-array fields tolerated)."""
         def _list(v):
+            # numpy-safe: parquet round-trips list fields as ndarray, whose
+            # truthiness raises — never use `if v` on these.
             if v is None:
                 return []
             if hasattr(v, "tolist"):
                 v = v.tolist()
             return list(v)
 
+        def _plain(v):
+            # recursively coerce numpy arrays/scalars to plain python so
+            # downstream `x or []` truthiness is safe everywhere (parquet
+            # round-trips nested lists as ndarray).
+            if v is None or isinstance(v, (str, int, float, bool)):
+                return v
+            if hasattr(v, "item") and not hasattr(v, "__len__"):
+                return v.item()
+            if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
+                return _plain(v.tolist())
+            if isinstance(v, dict):
+                return {str(k): _plain(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_plain(x) for x in v]
+            return v
+
         def _dict(v):
-            return dict(v) if v else {}
+            v = _plain(v)
+            return v if isinstance(v, dict) else {}
 
         return cls(
             instance_id=str(ei.get("instance_id", "")),
@@ -180,12 +199,14 @@ def agent_session_spec(task: TaskRecord, *, agent: str = "claude-code") -> Agent
 
 # ───────────────────────────── leak masking ────────────────────────────────
 def _src_filter_for(task: TaskRecord):
-    """Build a SrcFileFilter from repo_config in source_spec (src/test dirs)."""
+    """Build a SrcFileFilter from repo_config in source_spec (src/test/exclude
+    dirs, carried from the EvoClaw-data config/<repo>.yaml)."""
     from harness.utils.src_filter import SrcFileFilter  # noqa: PLC0415
     rc = task.source_spec.get("repo_config") or {}
     return SrcFileFilter(
-        src_dirs=rc.get("src_dirs"),
-        test_dirs=rc.get("test_dirs"),
+        src_dirs=rc.get("src_dirs") or [],
+        test_dirs=rc.get("test_dirs") or [],
+        exclude_patterns=rc.get("exclude_patterns"),
     )
 
 
