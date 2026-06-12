@@ -3,10 +3,13 @@
 # Pull Docker images from DockerHub and retag them for the E2E harness.
 #
 # The evaluator expects images named:
-#   {repo_full_name}/{milestone_id}:latest
+#   {repo_full_name}/{milestone_id}:${VERSION}     (VERSION default: v0.9)
 #
 # DockerHub images are stored as:
-#   DOCKERHUB_ORG/<short_name>:<milestone_id>
+#   DOCKERHUB_ORG/<short_name>:<milestone_id>-${VERSION}
+#
+# Version is controlled by --version or EVOCLAW_IMAGE_TAG (default v0.9),
+# matching the harness default in evaluator.py / run_milestone.py / run_all.py.
 #
 # This script pulls and retags automatically.
 #
@@ -19,6 +22,7 @@
 set -euo pipefail
 
 DOCKERHUB_ORG="${DOCKERHUB_ORG:-hyd2apse}"
+VERSION="${EVOCLAW_IMAGE_TAG:-v0.9}"
 DRY_RUN=false
 SELECTED_REPOS=()
 
@@ -27,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)  DRY_RUN=true; shift ;;
         --repo)     SELECTED_REPOS+=("$2"); shift 2 ;;
         --org)      DOCKERHUB_ORG="$2"; shift 2 ;;
+        --version)  VERSION="$2"; shift 2 ;;
         --help|-h)
             echo "Usage: $0 [--dry-run] [--repo <name>]... [--org <dockerhub_org>]"
             echo ""
@@ -34,6 +39,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --repo <name>   Only pull this repo (can repeat). Options:"
             echo "                  navidrome, dubbo, ripgrep, go-zero, nushell, element-web, scikit-learn"
             echo "  --org <org>     DockerHub org (default: hyd2apse)"
+            echo "  --version <v>   Benchmark data version tag (default: v0.9; env EVOCLAW_IMAGE_TAG)"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -122,15 +128,15 @@ for repo in "${REPOS_TO_PROCESS[@]}"; do
 
     # Base image
     pull_and_retag \
-        "${DOCKERHUB_ORG}/${repo}:base" \
-        "${repo_full}/base:latest"
+        "${DOCKERHUB_ORG}/${repo}:base-${VERSION}" \
+        "${repo_full}/base:${VERSION}"
     total_images=$((total_images + 1))
 
     # Milestone images
     for mid in ${REPO_MIDS[$repo]}; do
         pull_and_retag \
-            "${DOCKERHUB_ORG}/${repo}:${mid}" \
-            "${repo_full}/${mid}:latest"
+            "${DOCKERHUB_ORG}/${repo}:${mid}-${VERSION}" \
+            "${repo_full}/${mid}:${VERSION}"
         total_images=$((total_images + 1))
     done
 done
