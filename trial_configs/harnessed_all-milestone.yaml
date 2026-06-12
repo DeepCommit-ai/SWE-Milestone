@@ -1,0 +1,16 @@
+# EvoHarness harnessed arm — SESSION SETUP 2.
+#   All roles = milestone: each role keeps memory WITHIN a milestone (open→fix→re-review/re-test) and
+#   resets between milestones. Bounded context; the per-milestone-continuity baseline.
+# Full navidrome + ripgrep, Opus-4.7 @ xhigh.
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: harnessed_all-milestone
+agent: harnessed
+model: claude-opus-4-7
+default_haiku_model: claude-opus-4-7
+reasoning_effort: xhigh
+timeout: 36000
+repos:
+  - navidrome
+  - ripgrep
+harnessed_session: "dev:milestone,reviewer:milestone,qa:milestone"
+harnessed_max_bounces: 10

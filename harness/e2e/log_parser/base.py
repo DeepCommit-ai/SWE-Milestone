@@ -1149,6 +1149,7 @@ def get_parser(framework: str) -> AgentLogParser:
     from harness.e2e.log_parser import claude_code  # noqa: F401
     from harness.e2e.log_parser import codex  # noqa: F401
     from harness.e2e.log_parser import gemini  # noqa: F401  # registers as "gemini-cli"
+    from harness.e2e.log_parser import harnessed  # noqa: F401
     from harness.e2e.log_parser import openhands  # noqa: F401
 
     if framework not in _PARSER_REGISTRY:

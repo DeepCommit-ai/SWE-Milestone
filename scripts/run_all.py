@@ -390,6 +390,16 @@ def main():
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
+    # Harnessed-agent knobs (read from the trial config so each config-group is a self-contained yaml).
+    # Exported to the env the detached workers inherit; HarnessedFramework reads them. A shell-exported
+    # var still wins (setdefault). harnessed_session e.g. "dev:B,reviewer:C,qa:C"; harnessed_max_bounces e.g. 10.
+    if cfg.get("harnessed_session"):
+        os.environ.setdefault("HARNESSED_SESSION", str(cfg["harnessed_session"]))
+    if cfg.get("harnessed_max_bounces") is not None:
+        os.environ.setdefault("HARNESSED_MAX_BOUNCES", str(cfg["harnessed_max_bounces"]))
+    if cfg.get("harnessed_wip_limit") is not None:
+        os.environ.setdefault("HARNESSED_WIP_LIMIT", str(cfg["harnessed_wip_limit"]))
+
     # Anti-cheat ("quarantine") is now PER-REPO and auto-on: each repo's policy
     # lives in quarantine_configs/<repo>.yaml and is applied only to that repo's
     # container at spawn time (load_quarantine_env). No trial-config block. Warn
@@ -445,12 +455,15 @@ def main():
     # container — no proxy/bridge:
     #   gemini-cli  → Gemini models      (harness/e2e/agents/gemini.py)
     #   claude-code → Claude models via CLAUDE_CODE_USE_VERTEX (claude_code.py)
+    #   harnessed   → inherits claude-code's Vertex env verbatim (HarnessedFramework
+    #                 extends ClaudeCodeFramework; its in-container roles are plain
+    #                 `claude` calls that pick up CLAUDE_CODE_USE_VERTEX + ADC)
     # Other agents (codex, openhands) have no Vertex path here and are rejected.
     vertex_info = None
     if vertex_ai:
-        if agent not in ("gemini-cli", "claude-code"):
-            print(f"Error: vertex_ai is only supported with agent: gemini-cli "
-                  f"or claude-code (got '{agent}').", file=sys.stderr)
+        if agent not in ("gemini-cli", "claude-code", "harnessed"):
+            print(f"Error: vertex_ai is only supported with agent: gemini-cli, "
+                  f"claude-code or harnessed (got '{agent}').", file=sys.stderr)
             sys.exit(1)
         proj = vertex_project or _adc_project()
         if not proj:

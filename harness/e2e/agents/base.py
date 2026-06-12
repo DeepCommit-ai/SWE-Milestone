@@ -178,6 +178,7 @@ def get_agent_framework(name: str, **kwargs) -> AgentFramework:
     from harness.e2e.agents import claude_code  # noqa: F401
     from harness.e2e.agents import codex  # noqa: F401
     from harness.e2e.agents import gemini  # noqa: F401
+    from harness.e2e.agents import harnessed  # noqa: F401
     from harness.e2e.agents import openhands  # noqa: F401
 
     if name not in _FRAMEWORK_REGISTRY:

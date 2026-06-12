@@ -1,0 +1,9 @@
+# EvoHarness Phase-3 — BARE arm, cheap haiku smoke (validates the EvoClaw e2e
+# pipeline on this host: container → agent → tag → grade → score). Reference for
+# the harnessed A/B. Run: python scripts/run_all.py --config trial_configs/evoharness_bare_debug.yaml --repos ripgrep --milestones 1
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: evoharness_bare_debug
+agent: claude-code
+model: claude-haiku-4-5
+default_haiku_model: claude-haiku-4-5   # pin every Claude Code slot to haiku (cheapest debug)
+timeout: 3600

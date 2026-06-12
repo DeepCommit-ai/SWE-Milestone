@@ -37,6 +37,13 @@ WHITELISTED_DOMAINS = [
     "api.kimi.com",
     "api.moonshot.ai",
     "api.fireworks.ai",
+    # === Host services: EvoHarness Gitea coordination substrate (multi-role harness) ===
+    # The host's Gitea. In-container the agents reach it at host.docker.internal:3000, which Docker
+    # maps to the bridge gateway 172.17.0.1. WHITELISTED_DOMAINS are resolved HOST-SIDE, where
+    # host.docker.internal does NOT exist — so we whitelist the gateway IP directly (getaddrinfo
+    # passes IP literals through). Opens the host gateway generally — fine for the benchmark:
+    # github/code-hosting + the repo's own source registry stay blocked.
+    "172.17.0.1",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",
@@ -126,6 +133,12 @@ CDN_CIDR_RANGES = [
     "104.16.0.0/13",  # Cloudflare
     "142.250.0.0/15",  # Google
     "216.239.32.0/19",  # Google
+    # Docker bridge subnet — lets the multi-role harness reach the host's Gitea CONTAINER directly
+    # (container-to-container on the default bridge; the gateway/host-published-port path is blocked
+    # on this host). EvoHarness Gitea coordination only — no external code hosting is on the bridge.
+    "172.17.0.0/16",
+    # EvoHarness coordination network (user-defined, gitea_up.sh) — Gitea at a fixed IP here.
+    "172.30.0.0/16",
 ]
 
 
@@ -655,6 +668,18 @@ print("Container initialization complete!")
 
         logger.debug(f"Docker run command: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
+
+        # EvoHarness: attach the agent container to the coordination network so the in-container
+        # multi-role harness can reach the Gitea container at its FIXED IP (stable across Gitea
+        # restarts; the default-bridge IP is not). Opt-in via EVOHARNESS_NET (set by gitea_up.sh).
+        _net = os.environ.get("EVOHARNESS_NET")
+        if _net:
+            r = subprocess.run(["docker", "network", "connect", _net, self.container_name],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                logger.info(f"Connected {self.container_name} to coordination network {_net}")
+            else:
+                logger.warning(f"Could not connect to network {_net}: {r.stderr.strip()[:200]}")
 
         # Ensure Python3 is available for init script
         self._ensure_python3()

@@ -1,0 +1,8 @@
+# EvoHarness Phase-3 — HARNESSED arm (in-container Dev→Reviewer→QA→tag), cheap haiku smoke.
+# Run: python scripts/run_all.py --config trial_configs/evoharness_harnessed_debug.yaml --repos ripgrep --milestones 1
+data_root: ${EVOCLAW_DATA_ROOT}
+trial_name: evoharness_harnessed_debug
+agent: harnessed
+model: claude-haiku-4-5
+default_haiku_model: claude-haiku-4-5   # pin every Claude Code slot to haiku (cheapest debug)
+timeout: 7200
