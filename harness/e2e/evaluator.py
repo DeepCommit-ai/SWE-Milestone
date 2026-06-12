@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import yaml
 
+from harness.e2e.image_version import resolve_image
 from harness.utils.rust_test_filter import (
     get_rust_files_from_tar,
     process_rust_files_in_container,
@@ -634,14 +635,18 @@ class PatchEvaluator:
         print(f"📋 Test timeout: {self.test_timeout}s" if self.test_timeout else "📋 Test timeout: disabled")
         print(f"📋 Docker CPUs: {self.docker_cpus}")
 
-        # Docker image name: {repo_name_lower}/{milestone_id_lower}
-        # EvoClaw example: navidrome_navidrome_v0.57.0_v0.58.0/milestone_006
-        # AgentBench example: urllib3_urllib3_2.0.6_2.3.0/test_multi_stage_v2/m001
+        # Docker image name: {repo_name_lower}/{milestone_id_lower}:{image_tag}
+        # EvoClaw example: navidrome_navidrome_v0.57.0_v0.58.0/milestone_006:v0.9
+        # AgentBench example: urllib3_urllib3_2.0.6_2.3.0/test_multi_stage_v2/m001:v0.9
         # Note: Docker image names must be lowercase (OCI spec requirement)
+        # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default: v0.9);
+        # resolve_image falls back to :latest WITH a warning when the default
+        # pin is absent locally (never when the tag was set explicitly).
         if self.test_name:
-            self.docker_image = f"{self.repo_name.lower()}/{self.test_name.lower()}/{milestone_id.lower()}"
+            image_base = f"{self.repo_name.lower()}/{self.test_name.lower()}/{milestone_id.lower()}"
         else:
-            self.docker_image = f"{self.repo_name.lower()}/{milestone_id.lower()}"
+            image_base = f"{self.repo_name.lower()}/{milestone_id.lower()}"
+        self.docker_image = resolve_image(image_base)
 
         # Docker container name: {repo_base}-{milestone_id}-{pid}-eval[-retry{N}]
         # Extract repo base name (e.g., "urllib3_urllib3_2.0.6_2.3.0" -> "urllib3")
