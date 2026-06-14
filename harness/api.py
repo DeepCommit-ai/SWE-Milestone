@@ -17,6 +17,7 @@ functions that need them, so importing this module is cheap and side-effect free
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -236,45 +237,100 @@ def mask_tests(container_name: str, task: TaskRecord, *, workdir: str = "/testbe
 
 
 # ───────────────────────────── grading ─────────────────────────────────────
+# The EvoClaw-data tree (classification / test_config / metadata / config /
+# filter_list) lives on the box; grading reads it directly so ALL judging logic
+# stays official — no reimplementation, no materialization. Point at it with
+# EVOCLAW_DATA_ROOT (default ~/worksapce/EvoClaw-data). The consumer is
+# responsible for a version self-check (tree commit ↔ parquet source_commit).
+EVOCLAW_DATA_ROOT = os.environ.get("EVOCLAW_DATA_ROOT") or str(Path.home() / "worksapce" / "EvoClaw-data")
+
+
+def _repo_dir(task: TaskRecord, root: Optional[Path] = None) -> str:
+    """Resolve the EvoClaw-data subdir for this task, CASE-INSENSITIVELY against
+    `root`. Docker image names are lowercased per OCI (e.g. burntsushi_ripgrep)
+    but the data dir may be CamelCase (BurntSushi_ripgrep) — a plain
+    docker-image-derived name then misses the tree and every milestone of that
+    repo infra-fails. Candidates, correct-case first: source_spec.repo, the
+    instance_id prefix (`<repo>__<milestone>` — carries the canonical case), then
+    the repo half of docker_image; resolve by exact dir match, then case-insensitive."""
+    cands: list[str] = []
+    if task.source_spec.get("repo"):
+        cands.append(str(task.source_spec["repo"]))
+    if "__" in task.instance_id:
+        cands.append(task.instance_id.split("__")[0])
+    img = (task.docker_image or "").split(":")[0]
+    if "/" in img:
+        cands.append(img.split("/")[0])
+    if not cands:
+        cands.append(task.instance_id)
+    if root is not None and root.is_dir():
+        for c in cands:                       # exact match wins
+            if (root / c).is_dir():
+                return c
+        actual = {d.name.lower(): d.name for d in root.iterdir() if d.is_dir()}
+        for c in cands:                       # case-insensitive fallback
+            if c.lower() in actual:
+                return actual[c.lower()]
+    return cands[0]
+
+
+def _milestone_id(task: TaskRecord) -> str:
+    """Tree milestone id (e.g. 'M023'): source_spec.milestone_id, else the suffix
+    of instance_id (`<repo>__<milestone>`), else instance_id itself."""
+    return str(task.source_spec.get("milestone_id")
+               or (task.instance_id.split("__")[-1] if "__" in task.instance_id else task.instance_id))
+
+
+def _normalize_eval(d: dict) -> dict:
+    """Official EvaluationResult.to_dict() -> cross-source EvalResult primitives
+    (§4). reward formula stays a training-side config; we only pass counts."""
+    ts = d.get("tests_status", {}) or {}
+    f2p = ts.get("FAIL_TO_PASS", {}) or {}
+    p2p = ts.get("PASS_TO_PASS", {}) or {}
+    summ = d.get("test_summary", {}) or {}
+    n_fixed = len(f2p.get("success", []) or [])
+    return {
+        "resolved": bool(d.get("resolved", False)),
+        "n_f2p_fixed": n_fixed,
+        "n_f2p_inscope": n_fixed + len(f2p.get("failure", []) or []),
+        "n_p2p_broken": len(p2p.get("failure", []) or []),
+        "n_p2p_inscope": int(summ.get("pass_to_pass_required", 0) or 0),
+        "failed_apply_patch": not bool(d.get("patch_successfully_applied", True)),
+        "total_tests": int(summ.get("total", 0) or 0),
+        "passed_tests": int(summ.get("passed", 0) or 0),
+    }
+
+
 def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
-             timeout_s: float = 1500.0) -> dict:
-    """Official grading via PatchEvaluator. De-workspaced signature: the
-    classification is materialized from the TaskRecord into `scratch` (training
-    machines have no EvoClaw-data tree). Returns an EvalResult-shaped dict.
-    Concurrency-safe: all outputs land under the per-call `scratch`."""
+             timeout_s: float = 1500.0, data_root: Optional[str] = None) -> dict:
+    """Official grading. Points the official PatchEvaluator + the official
+    flaky-filter pass at the on-box EvoClaw-data tree — we reimplement NOTHING:
+    the per-test timeout, test command, baseline classification and filter_list
+    are all read by official code from the tree. `timeout_s` is advisory (the
+    real per-test timeout is the tree's metadata `pytest_timeout`). Judging runs
+    in a FRESH milestone container (clean isolation). Concurrency-safe: every
+    output lands under the per-call `scratch`."""
     import json  # noqa: PLC0415
-    from harness.e2e.evaluator import PatchEvaluator  # noqa: PLC0415
+    from harness.e2e.evaluator import PatchEvaluator, generate_filtered_evaluation  # noqa: PLC0415
+
+    root = Path(data_root or EVOCLAW_DATA_ROOT)
+    repo = _repo_dir(task, root)
+    milestone = _milestone_id(task)
+    ws = root / repo
+    classification = ws / "test_results" / milestone / f"{milestone}_classification.json"
+    if not classification.exists():
+        raise FileNotFoundError(
+            f"classification not found (EvoClaw-data tree missing or version-mismatched?): {classification}")
 
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    classification = {"stable_classification": {
-        "fail_to_pass": [str(x) for x in task.fail_to_pass],
-        "pass_to_pass": [str(x) for x in task.pass_to_pass],
-        "none_to_pass": [nt.get("test_id") if isinstance(nt, dict) else str(nt)
-                         for nt in (task.source_spec.get("new_tests") or [])],
-    }}
-    if task.source_spec.get("filter_list"):
-        classification["filter_list"] = task.source_spec["filter_list"]
-    baseline_json = scratch / "baseline_classification.json"
-    baseline_json.write_text(json.dumps(classification))
+    ev = PatchEvaluator(workspace_root=ws, milestone_id=milestone,
+                        patch_file=Path(artifact), baseline_classification=classification,
+                        output_dir=scratch)
+    result = ev.evaluate()                      # official: container -> apply -> tests -> compare
 
-    # PatchEvaluator derives the milestone image from workspace_root.parent.name;
-    # name the scratch workspace so it resolves (<repo>_<ver>/<milestone>).
-    ws = scratch / "workspace"
-    ws.mkdir(parents=True, exist_ok=True)
-    ev = PatchEvaluator(workspace_root=ws, milestone_id=task.instance_id,
-                        patch_file=Path(artifact), baseline_classification=baseline_json,
-                        output_dir=scratch / "evaluation")
-    res = ev.evaluate()
-    # Normalize to the cross-source EvalResult schema (counting primitives +
-    # failure flags; reward formula stays a training-side config).
-    return {
-        "resolved": bool(getattr(res, "resolved", False)),
-        "n_f2p_inscope": len(getattr(res, "fail_to_pass_success", []) or []) + len(getattr(res, "fail_to_pass_failure", []) or []),
-        "n_f2p_fixed": len(getattr(res, "fail_to_pass_success", []) or []),
-        "n_p2p_inscope": getattr(res, "pass_to_pass_required", 0),
-        "n_p2p_broken": len(getattr(res, "pass_to_pass_failure", []) or []),
-        "failed_apply_patch": not bool(getattr(res, "patch_successfully_applied", True)),
-        "total_tests": getattr(res, "total_tests", 0),
-        "passed_tests": getattr(res, "passed_tests", 0),
-    }
+    raw_path = scratch / "evaluation_result.json"
+    raw_path.write_text(json.dumps(result.to_dict()))
+    filtered = generate_filtered_evaluation(raw_path, ws, milestone)   # official flaky filter_list pass
+    final = json.loads((filtered or raw_path).read_text())
+    return _normalize_eval(final)
