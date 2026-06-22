@@ -32,6 +32,7 @@ from typing import Optional
 import yaml
 
 from harness.e2e.container_setup import ContainerSetup
+from harness.e2e.image_version import resolve_image
 from harness.e2e.agent_runner import AgentRunner
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
 from harness.e2e.test_masking import mask_tests_by_names
@@ -214,9 +215,12 @@ class MilestoneRunner:
             self.image_name = image_name
         else:
             # Path structure: .../harness_workspace/repo_name/test_version
+            # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default:
+            # v0.9); falls back to :latest with a warning when the default pin
+            # is absent locally (never when the tag was set explicitly).
             repo_name = self.workspace_root.parent.name.lower()
             test_version = self.workspace_root.name.lower()
-            self.image_name = f"{repo_name}/{test_version}/{milestone_id.lower()}:latest"
+            self.image_name = resolve_image(f"{repo_name}/{test_version}/{milestone_id.lower()}")
 
         # Container name (includes trial_name for uniqueness across trials)
         if self.trial_name:
@@ -1490,7 +1494,7 @@ Output Structure:
     )
     parser.add_argument(
         "--image",
-        help="Docker image (default: {repo}/{version}/{mid}:latest)",
+        help="Docker image (default: {repo}/{version}/{mid}:$EVOCLAW_IMAGE_TAG, tag default v0.9)",
     )
     parser.add_argument(
         "--model",
