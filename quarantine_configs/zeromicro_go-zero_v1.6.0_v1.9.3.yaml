@@ -43,5 +43,28 @@ verify_fetch_urls:
 closure:
   cache_paths:
     - /go/pkg/mod/cache/download
-  offline_build: "go mod download"
+  # Build-scoped gate, NOT whole-graph `go mod download`. The milestone module
+  # caches were warmed by `go build` (dataset prep), so they hold exactly what
+  # BUILDING needs — the compiled-package closure — not the full MVS download
+  # graph. `go mod download` requires a `<v>.zip` for every selected module
+  # (including direct requires the compiled code never imports, e.g.
+  # go-redis/v9@v9.4.0.zip, absent from ALL 23 milestone caches), so it raised a
+  # FALSE closure failure. The agent's real workflow is `go build`/`go test`, so
+  # we gate on a build.
+  #
+  # `-mod=mod` (NOT the go1.21 readonly default) is REQUIRED: several milestones'
+  # go.mod still declare `go 1.19`, and go1.21's `go build` default (-mod=readonly)
+  # REFUSES to build a go-1.19 module that needs any go.mod/go.sum bookkeeping
+  # ("updates to go.mod needed; go mod tidy") even when every module is already in
+  # the cache — a FALSE closure failure. `-mod=mod` lets go reconcile go.mod
+  # in-place from the cached modules; under `--network none` it can only ever use
+  # the closure's bytes, so a pass still proves offline-sufficiency. Empirically
+  # 21/23 milestones build offline this way; the 2 failures (m027, m028) are
+  # SOURCE-STATE (their START-state source imports go-redis/v8 + golang/mock +
+  # mongo-driver, which their own go.mod doesn't require — yet the bytes ARE in the
+  # cache), NOT closure gaps. The driver's classifier probes the cache to tell a
+  # real gap (bytes absent → fail-closed) from a source-state inconsistency (bytes
+  # present → recorded, does not block publish). The driver injects each
+  # milestone's /testbed (B source) and runs this with `--network none`.
+  offline_build: "go build -mod=mod ./..."
   toolchain: {go: "1.21.13", gotoolchain_local: true}

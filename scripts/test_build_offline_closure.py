@@ -245,19 +245,95 @@ def test_run_offline_gate_create_cp_run_sequence(monkeypatch):
     assert any(isinstance(x, str) and x.endswith("/testbed:/testbed") for x in run)
 
 
-def test_run_offline_gate_build_fail_exits(monkeypatch):
-    """Offline build exit != 0 → sys.exit(1) (closure insufficient, never skip)."""
+def test_run_offline_gate_build_fail_closure_gap_exits(monkeypatch):
+    """Build fails with a missing-module token whose bytes are ABSENT from the
+    closure cache → real CLOSURE GAP → sys.exit(1) (never skip)."""
+    GAP = ("core/x.go:1:2: no required module provides package "
+           "example.com/totally/absent; to add it:\n\tgo get example.com/totally/absent\n")
     def fake_run(cmd, *a, **k):
         if cmd[:2] == ["docker", "create"]:
             return _R(0, "cid\n")
         if cmd[:2] == ["docker", "run"]:
-            return _R(101, "error: failed to load source for dependency\n")
+            # both the offline build AND the cache probe are `docker run`; neither
+            # prints HIT here, so the probe reports the module ABSENT → gap.
+            return _R(101, GAP)
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     with pytest.raises(SystemExit) as e:
         boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
-                             "cargo build --offline")
+                             "go build ./...")
     assert e.value.code == 1
+
+
+def test_run_offline_gate_source_state_returns_not_exit(monkeypatch):
+    """Build fails on a module the closure cache DOES have (go.mod/source
+    inconsistency, e.g. START-state checkpoint) → SOURCE_STATE, not a closure
+    failure → returns the sentinel instead of exiting."""
+    SS = ("core/stores/redis/hook.go:10:2: no required module provides package "
+          "github.com/go-redis/redis/v8; to add it:\n\tgo get github.com/go-redis/redis/v8\n")
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            # The offline-build run (has the -v testbed mount + the build cmd) fails;
+            # the cache-probe run (sh -c with a for-loop over cache dirs) reports HIT.
+            joined = " ".join(cmd)
+            if "cache/download" in joined:        # the cache probe
+                return _R(0, "HIT\n")
+            return _R(101, SS)                      # the offline build
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    got = boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                               "go build ./...")
+    assert got == "SOURCE_STATE"
+
+
+def test_run_offline_gate_pass_returns_pass(monkeypatch):
+    """Build exit 0 → returns "PASS"."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    assert boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                                "go build ./...") == "PASS"
+
+
+def test_classify_compile_error_is_source_state(monkeypatch):
+    """A pure compile/type error (no missing-module token) is SOURCE-STATE: it is
+    not a missing dependency, so it must not be reported as a closure gap. The
+    cache probe is never consulted (no token to probe)."""
+    called = {"probe": False}
+    def fake_run(cmd, *a, **k):
+        called["probe"] = True   # any docker run here would be the probe
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    kind, _ = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "core/foo.go:12:9: undefined: tests.MockBar\n")
+    assert kind == "source_state"
+    assert called["probe"] is False   # no token → no probe call
+
+
+def test_classify_missing_from_cache_is_gap(monkeypatch):
+    """A missing-module token whose bytes are absent from the cache → closure_gap."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, ""))   # probe: no HIT → absent
+    kind, detail = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "x.go:1:2: no required module provides package example.com/gone; to add it:\n")
+    assert kind == "closure_gap"
+    assert "example.com/gone" in detail
+
+
+def test_classify_present_in_cache_is_source_state(monkeypatch):
+    """A missing-module token whose bytes ARE in the cache → source_state."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, "HIT\n"))
+    kind, _ = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "x.go:1:2: no required module provides package github.com/go-redis/redis/v8;\n")
+    assert kind == "source_state"
 
 
 def test_run_offline_gate_create_fail_exits(monkeypatch):
@@ -285,11 +361,13 @@ def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
         if cmd[:2] == ["docker", "create"]:
             return _R(0, "cid\n")
         if cmd[:2] == ["docker", "run"]:
-            return _R(1, "boom")
+            # closure-gap error (token absent from cache → probe returns no HIT) so
+            # the gate fail-closes; the point of the test is the finally-cleanup.
+            return _R(1, "no required module provides package example.com/x")
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     with pytest.raises(SystemExit):
-        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest", "cargo build")
+        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest", "go build ./...")
     assert made["d"] in removed
 
 
@@ -304,10 +382,11 @@ def test_audit_staging_image_docker_failure_exits(monkeypatch):
 
 # ---- Task 4.4: go ecosystem assembly + toolchain ------------------------------
 
-def test_assemble_go_dockerfile_appends_toolchain_and_gotoolchain_local():
-    """The go branch unions the module cache (render_union_dockerfile) AND appends
-    `COPY .../usr/local/go` + `ENV GOTOOLCHAIN=local` (+ .info synth) to the final
-    stage."""
+def test_assemble_go_dockerfile_appends_clean_replace_toolchain():
+    """The go branch unions the module cache (render_union_dockerfile) AND appends a
+    clean-replace toolchain (`RUN rm -rf /usr/local/go` BEFORE
+    `COPY .../usr/local/go`) + `ENV GOTOOLCHAIN=local` to the final stage. No
+    `.info`-synth RUN (the build-scoped gate doesn't need it)."""
     ms = ["r/x/m01:latest", "r/x/m02:latest"]
     # fake probe: only the LAST milestone has the target go (B-end), as in go-zero
     probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
@@ -317,22 +396,24 @@ def test_assemble_go_dockerfile_appends_toolchain_and_gotoolchain_local():
     assert "FROM r/x/base:latest AS final" in df
     assert "rsync -a /milestone_" in df
     assert "/go/pkg/mod/cache/download" in df
-    # toolchain layer appended AFTER the union's final stage
+    # toolchain layer appended AFTER the union's final stage, with a clean-replace
+    # `rm -rf /usr/local/go` BEFORE the COPY (overlay would mix go1.19/go1.21 stdlib
+    # -> `go build` fails "m0 redeclared")
+    assert "RUN rm -rf /usr/local/go" in df
     assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
     assert "ENV GOTOOLCHAIN=local" in df
-    # .info synthesis appended after the toolchain (so the offline gate's
-    # `go mod download` can resolve versions from the cache with no network)
-    assert ".info" in df and 'printf' in df and '"Version"' in df
-    # ordering: union FROM final -> COPY toolchain -> ENV GOTOOLCHAIN -> RUN synth
-    assert df.index("AS final") < df.index("COPY --from=r/x/m02:latest /usr/local/go")
+    # the .info-synth RUN was removed when the gate became build-scoped
+    assert ".info" not in df and "find /go/pkg/mod/cache/download" not in df
+    # ordering: union FROM final -> RUN rm -> COPY toolchain -> ENV GOTOOLCHAIN
+    assert df.index("AS final") < df.index("RUN rm -rf /usr/local/go")
+    assert df.index("RUN rm -rf /usr/local/go") < df.index("COPY --from=r/x/m02:latest /usr/local/go")
     assert df.index("COPY --from=r/x/m02:latest /usr/local/go") < df.index("ENV GOTOOLCHAIN=local")
-    assert df.index("ENV GOTOOLCHAIN=local") < df.index('printf')
     # equals the rendered union + the appended tail (no other mutation)
     union = boc.render_union_dockerfile("r/x", ms, ["/go/pkg/mod/cache/download"])
     assert df == union + (
+        "RUN rm -rf /usr/local/go\n"
         "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go\n"
-        "ENV GOTOOLCHAIN=local\n"
-        f"RUN {boc._GO_SYNTH_INFO_RUN}\n")
+        "ENV GOTOOLCHAIN=local\n")
 
 
 def test_pick_go_toolchain_milestone_last_when_correct():
