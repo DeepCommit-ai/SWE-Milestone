@@ -60,5 +60,16 @@ def test_render_union_dockerfile_structure():
     assert "FROM r/x/base:latest AS final" in df
     assert df.count("COPY --from=r/x/m01:latest") >= 1
     assert df.count("COPY --from=r/x/m02:latest") >= 1
-    assert "rsync" in df
+    assert "rsync -a /milestone_" in df
     assert "COPY --from=builder /staging" in df
+
+def test_render_union_dockerfile_empty_cache_paths():
+    df = boc.render_union_dockerfile("r/x", ["r/x/m01:latest"], [])
+    assert "AS builder" in df
+    assert "AS final" in df
+    assert "COPY --from=r/x/m01" not in df
+    assert "RUN mkdir -p /staging" in df
+
+def test_render_union_dockerfile_rsync_mkpath_and_trailing_slash():
+    df = boc.render_union_dockerfile("r/x", ["r/x/m01:latest"], ["/usr/local/cargo/registry/cache"])
+    assert "mkdir -p /staging/usr/local/cargo/registry/cache && rsync -a /milestone_0_0/usr/local/cargo/registry/cache/ /staging/usr/local/cargo/registry/cache/" in df
