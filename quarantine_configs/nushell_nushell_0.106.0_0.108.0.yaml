@@ -28,3 +28,9 @@ cache_forbid_globs:
 verify_fetch_urls:
   - https://static.crates.io/crates/nu-protocol/nu-protocol-0.108.0.crate
   - https://static.crates.io/crates/nu-parser/nu-parser-0.107.0.crate
+
+closure:
+  cache_paths:
+    - /usr/local/cargo/registry/cache
+  offline_build: "cargo build --offline"
+  toolchain: {rust: "1.88.0", install_online: true}

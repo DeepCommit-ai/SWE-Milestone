@@ -40,3 +40,7 @@ wheelhouse_forbid:
 verify_fetch_urls:
   - https://pypi.org/simple/scikit-learn/
   - https://files.pythonhosted.org/
+
+closure:
+  cache_paths: []
+  offline_build: "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt"

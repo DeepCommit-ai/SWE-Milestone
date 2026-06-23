@@ -11,6 +11,22 @@ def test_load_closure_config_missing_exits(tmp_path):
     with pytest.raises(SystemExit):
         boc.load_closure_config("foo", tmp_path)
 
+def test_load_closure_config_missing_offline_build_exits(tmp_path):
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "foo.yaml").write_text(
+        "ecosystem: [pip]\nclosure:\n  cache_paths: []\n")
+    with pytest.raises(SystemExit):
+        boc.load_closure_config("foo", tmp_path)
+
+def test_load_closure_config_empty_cache_paths_ok(tmp_path):
+    """scikit-style empty cache_paths [] must load successfully."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "foo.yaml").write_text(
+        "ecosystem: [pip]\nclosure:\n  cache_paths: []\n  offline_build: 'pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt'\n")
+    cfg = boc.load_closure_config("foo", tmp_path)
+    assert cfg["cache_paths"] == []
+    assert "offline_build" in cfg
+
 def test_load_closure_config_returns_block(tmp_path):
     (tmp_path / "quarantine_configs").mkdir()
     (tmp_path / "quarantine_configs" / "foo.yaml").write_text(

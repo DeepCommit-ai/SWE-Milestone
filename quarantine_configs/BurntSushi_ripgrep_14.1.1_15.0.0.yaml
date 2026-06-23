@@ -36,3 +36,8 @@ cache_forbid_globs:
 verify_fetch_urls:
   - https://static.crates.io/crates/grep-printer/grep-printer-0.3.1.crate
   - https://crates.io/api/v1/crates/ignore
+
+closure:
+  cache_paths:
+    - /usr/local/cargo/registry/cache
+  offline_build: "cargo build --offline"

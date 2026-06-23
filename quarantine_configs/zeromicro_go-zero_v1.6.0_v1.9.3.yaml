@@ -39,3 +39,9 @@ cache_forbid_globs:
 verify_fetch_urls:
   - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip
   - https://goproxy.io/github.com/zeromicro/go-zero/@v/v1.9.3.zip
+
+closure:
+  cache_paths:
+    - /go/pkg/mod/cache/download
+  offline_build: "go mod download"
+  toolchain: {go: "1.21.13", gotoolchain_local: true}

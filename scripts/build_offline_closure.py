@@ -30,6 +30,6 @@ def load_closure_config(repo_lower: str, project_root: Path) -> dict:
         print(f"Error: no quarantine config {conf}", file=sys.stderr); sys.exit(1)
     data = yaml.safe_load(conf.read_text()) or {}
     closure = data.get("closure")
-    if not closure or not closure.get("cache_paths"):
-        print(f"Error: {conf}: missing 'closure.cache_paths'", file=sys.stderr); sys.exit(1)
+    if not closure or "cache_paths" not in closure or "offline_build" not in closure:
+        print(f"Error: {conf}: closure block must have cache_paths and offline_build", file=sys.stderr); sys.exit(1)
     return closure

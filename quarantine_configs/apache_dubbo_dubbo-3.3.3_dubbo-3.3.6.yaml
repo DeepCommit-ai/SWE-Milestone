@@ -35,3 +35,8 @@ cache_forbid_globs:
 verify_fetch_urls:
   - https://repo.maven.apache.org/maven2/org/apache/dubbo/dubbo-common/3.3.6/dubbo-common-3.3.6-sources.jar
   - https://repo1.maven.org/maven2/org/apache/dubbo/dubbo-common/3.3.6/dubbo-common-3.3.6-sources.jar
+
+closure:
+  cache_paths:
+    - /root/.m2/repository
+  offline_build: "git clean -xfd && mvn -o test-compile"

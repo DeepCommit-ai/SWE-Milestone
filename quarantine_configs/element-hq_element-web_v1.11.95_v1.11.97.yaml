@@ -21,3 +21,8 @@ npm_offline: true
 verify_fetch_urls:
   - https://registry.npmjs.org/matrix-js-sdk
   - https://registry.yarnpkg.com/matrix-js-sdk
+
+closure:
+  cache_paths:
+    - /usr/local/share/.cache/yarn/v6
+  offline_build: "cd /testbed && yarn install --offline --frozen-lockfile"

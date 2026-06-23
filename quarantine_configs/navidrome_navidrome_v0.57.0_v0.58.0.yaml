@@ -34,3 +34,10 @@ cache_forbid_globs:
 verify_fetch_urls:
   - https://goproxy.cn/github.com/navidrome/navidrome/@v/v0.58.0.zip
   - https://registry.npmjs.org/navidrome
+
+closure:
+  cache_paths:
+    - /go/pkg/mod/cache/download
+    - /root/.npm/_cacache
+  offline_build: "cd /testbed/ui && npm run build && cd /testbed && go mod download"
+  toolchain: {go: "1.24.5", gotoolchain_local: true}
