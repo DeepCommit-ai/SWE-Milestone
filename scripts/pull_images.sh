@@ -132,6 +132,27 @@ for repo in "${REPOS_TO_PROCESS[@]}"; do
         "${repo_full}/base:${VERSION}"
     total_images=$((total_images + 1))
 
+    # base-offline image (B-aware closure for cargo/go/maven/npm repos).
+    # Not all repos have been pushed yet — treat a missing hub image as a
+    # non-fatal warning so one missing repo doesn't abort the whole pull.
+    hub_offline="${DOCKERHUB_ORG}/${repo}:base-offline-${VERSION}"
+    local_offline="${repo_full}/base-offline:latest"
+    local_offline_versioned="${repo_full}/base-offline:${VERSION}"
+    if $DRY_RUN; then
+        echo -e "  ${CYAN}[dry-run]${NC}  pull ${GREEN}${hub_offline}${NC}  ->  ${local_offline}"
+    else
+        echo -e "  ${YELLOW}Pulling${NC}  ${hub_offline} (base-offline) ..."
+        if docker pull "$hub_offline"; then
+            echo -e "  ${YELLOW}Tagging${NC}  ${hub_offline}  ->  ${local_offline}"
+            docker tag "$hub_offline" "$local_offline"
+            docker tag "$hub_offline" "$local_offline_versioned"
+            echo -e "  ${GREEN}Done${NC}     ${local_offline}"
+        else
+            echo -e "  ${YELLOW}WARN${NC}     ${hub_offline} not found on hub — skipping (build with scripts/build_offline_closure.py --repo ${repo_full} --push)"
+        fi
+    fi
+    total_images=$((total_images + 1))
+
     # Milestone images
     for mid in ${REPO_MIDS[$repo]}; do
         pull_and_retag \

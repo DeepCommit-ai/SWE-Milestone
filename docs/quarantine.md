@@ -246,27 +246,55 @@ contain **none** of the repo's own post-baseline artifacts (the same property
 answer: the agent gets `regex`/`netty`/`grpc`/`html-react-parser`, never the
 repo's own B source.
 
-### Building a base-offline image (per ecosystem)
+### Building a base-offline image
 
-Run in a **networked** container started from `base:latest`; collect every
-milestone image's lockfile (the union covers any A→B path the agent may take);
-pull the closure online; **verify offline**; audit self-exclusion; then
-`docker commit` to `base-offline:latest`. Never `mvn install` (it would bake the
-repo's own artifact into `.m2`). Per-ecosystem pull + offline-verify commands:
+Use the unified closure builder — it handles all non-pip ecosystems
+(cargo / go / maven / npm) in one command:
 
-| ecosystem | pull closure (online) | offline verify (gate) | toolchain bump |
-|---|---|---|---|
-| cargo | `cargo fetch --locked` per milestone lock | `cargo build --offline` exit 0 (agent re-resolves, so `--offline build` is the faithful gate, not `--locked`) | nushell 1.86→**1.88** (`rustup toolchain install`, driven by `rust-toolchain.toml`); ripgrep none |
-| go | `GOFLAGS=-mod=mod GOPROXY=… go mod download all` per milestone | `GOPROXY=off go mod download all` + `go build ./...` zero cache misses | go-zero 1.19→**1.21.13**, navidrome 1.24.4→**1.24.5** (replace `/usr/local/go`, SHA256-checked) |
-| maven | `mvn dependency:go-offline` (+ `spotless:check`, `dependency:get` for dynamic/classified/test-scope artifacts go-offline misses) | `mvn -o test-compile` after `git clean -xfd` → BUILD SUCCESS, zero "Cannot access … offline" | dubbo none |
-| npm | `yarn install` per distinct milestone lock | `rm -rf node_modules && yarn install --offline` clean; full `yarn build` offline | element-web none |
+```bash
+# Build the B-aware closure and tag it as base-offline:latest
+python scripts/build_offline_closure.py --repo <repo_full_name>
 
-Toolchains aren't in the dependency closure, so a version bump (e.g. nushell's
-`rust-toolchain.toml` 1.88, go-zero's `go 1.21` directive) must be **pre-installed**
-in the offline image — it can't be fetched offline. The bumped tool lives at the
-same path the base PATH already points to, so it's transparent to the harness
-(which invokes `go test`/`cargo test`/`mvn test` via `sh -c`, inheriting the image
-PATH — not a login shell).
+# Build and push to DockerHub (for cross-machine distribution)
+python scripts/build_offline_closure.py --repo <repo_full_name> --push
+```
+
+Examples:
+
+```bash
+python scripts/build_offline_closure.py --repo ripgrep_ripgrep_14.1.1_15.0.0
+python scripts/build_offline_closure.py --repo nushell_nushell_0.106.0_0.108.0
+python scripts/build_offline_closure.py --repo apache_dubbo_dubbo-3.3.3_dubbo-3.3.6
+python scripts/build_offline_closure.py --repo zeromicro_go-zero_v1.6.0_v1.9.3
+python scripts/build_offline_closure.py --repo element-hq_element-web_v1.11.95_v1.11.97
+python scripts/build_offline_closure.py --repo navidrome_navidrome_v0.57.0_v0.58.0
+```
+
+The script:
+1. Starts a **networked** container from `base:latest`.
+2. Unions the lockfiles from all milestone images (B-aware: covers any A→B path
+   the agent may take).
+3. Pulls the closure online using the per-ecosystem command driven by the repo's
+   `quarantine_configs/<repo>.yaml` `closure:` block (cargo uses `cargo vendor`; go
+   uses `go mod download all`; maven uses `mvn dependency:go-offline`; npm uses
+   `yarn install`).
+4. Runs a **fail-closed offline gate** per milestone (`cargo build --offline` /
+   `GOPROXY=off go build ./...` / `mvn -o test-compile` / `yarn install --offline`)
+   — exits non-zero if any dep is missing.
+5. Runs `audit_self_exclusion` — aborts if the repo's own package (any
+   version/alias per `cache_forbid_globs` in the yaml) is present in the closure.
+6. `docker commit`s to `<repo_full>/base-offline:latest`.
+
+Never run `mvn install` during the build — it would bake the repo's own artifact
+into `.m2`. The builder enforces this.
+
+**Toolchain bumps** (e.g. nushell's `rust-toolchain.toml` 1.88, go-zero's
+`go 1.21` directive) are also handled by the builder: the bumped toolchain is
+pre-installed before the offline gate, since it can't be fetched once the network
+is cut.
+
+Once built, push with `--push` to make the image available for `pull_images.sh`
+to distribute to other machines (see "Pulling images" above).
 
 ## Verification protocol (run before trusting a secure re-run)
 
