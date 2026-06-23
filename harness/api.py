@@ -17,10 +17,13 @@ functions that need them, so importing this module is cheap and side-effect free
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 API_VERSION = "1.0"
 PROMPT_DIR = Path(__file__).parent / "e2e" / "prompt"
@@ -201,13 +204,21 @@ def agent_session_spec(task: TaskRecord, *, agent: str = "claude-code") -> Agent
 # ───────────────────────────── leak masking ────────────────────────────────
 def _src_filter_for(task: TaskRecord):
     """Build a SrcFileFilter from repo_config in source_spec (src/test/exclude
-    dirs, carried from the EvoClaw-data config/<repo>.yaml)."""
+    dirs, carried from the EvoClaw-data config/<repo>.yaml).
+
+    Passes ALL FIVE pattern sets. Dropping generated_patterns / modifiable_test_patterns
+    (as an earlier version did) makes should_include_in_snapshot() never include generated
+    code (e.g. *.pb.go, wire_gen.go) or agent-modifiable test files — so codegen-heavy repos
+    (Go) lose required files from the snapshot, fail to compile under grading, and get
+    misjudged. mask_tests and extract_snapshot share this filter, so both need the full set."""
     from harness.utils.src_filter import SrcFileFilter  # noqa: PLC0415
     rc = task.source_spec.get("repo_config") or {}
     return SrcFileFilter(
         src_dirs=rc.get("src_dirs") or [],
         test_dirs=rc.get("test_dirs") or [],
         exclude_patterns=rc.get("exclude_patterns"),
+        generated_patterns=rc.get("generated_patterns"),
+        modifiable_test_patterns=rc.get("modifiable_test_patterns"),
     )
 
 
@@ -334,3 +345,296 @@ def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
     filtered = generate_filtered_evaluation(raw_path, ws, milestone)   # official flaky filter_list pass
     final = json.loads((filtered or raw_path).read_text())
     return _normalize_eval(final)
+
+
+# ───────────────────────────── snapshot extraction ─────────────────────────
+# Public extraction of the OFFICIAL git-archive snapshot logic (was private in
+# e2e/run_milestone.py: _extract_snapshot + _extract_snapshot_from_workdir). Pure
+# host-side `docker exec` against the live work container — no orchestrator / managed-
+# container coupling, so the training stack can call it directly after the agent run.
+def _fakeroot_exec(container_name: str) -> list[str]:
+    """The `docker exec` prefix the official snapshot path uses (git as fakeroot in /testbed)."""
+    return ["docker", "exec", "--user", "fakeroot", "-e", "HOME=/home/fakeroot",
+            "-w", "/testbed", container_name]
+
+
+def _tag_exists(container_name: str, tag: str) -> bool:
+    import subprocess  # noqa: PLC0415
+    r = subprocess.run(_fakeroot_exec(container_name) + ["git", "tag", "-l", tag],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and tag in r.stdout.split()
+
+
+def _existing_src_dirs_git(container_name: str, src_dirs: list, tag: str) -> list:
+    """Subset of src_dirs that exist at the tag (git ls-tree -d), order preserved."""
+    import subprocess  # noqa: PLC0415
+    existing = []
+    for d in src_dirs:
+        r = subprocess.run(_fakeroot_exec(container_name) + ["git", "ls-tree", "-d", tag, d.rstrip("/")],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            existing.append(d)
+    return existing
+
+
+def _existing_root_files_git(container_name: str, files: list, tag: str) -> set:
+    import subprocess  # noqa: PLC0415
+    if not files:
+        return set()
+    r = subprocess.run(
+        _fakeroot_exec(container_name) + ["git", "ls-tree", "--name-only", tag, "--"] + list(files),
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return set()
+    return {ln for ln in r.stdout.strip().split("\n") if ln}
+
+
+def _existing_workdir_dirs(container_name: str, src_dirs: list) -> list:
+    import subprocess  # noqa: PLC0415
+    existing = []
+    for d in src_dirs:
+        r = subprocess.run(_fakeroot_exec(container_name) + ["test", "-d", d.rstrip("/")], capture_output=True)
+        if r.returncode == 0:
+            existing.append(d)
+    return existing
+
+
+def _existing_root_files_workdir(container_name: str, files: list) -> set:
+    import subprocess  # noqa: PLC0415
+    if not files:
+        return set()
+    script = "; ".join(f'[ -f "{f}" ] && echo "{f}"' for f in files)
+    r = subprocess.run(_fakeroot_exec(container_name) + ["sh", "-c", script], capture_output=True, text=True)
+    return {ln for ln in r.stdout.strip().split("\n") if ln}
+
+
+def _filter_snapshot_tar(tar_path: Path, src_filter) -> int:
+    """Drop tar members should_include_in_snapshot() rejects (test/excluded files),
+    keeping src + generated + modifiable-test files. No-op when no test/exclude patterns
+    are defined. Mirrors run_milestone._filter_tar_archive."""
+    import tarfile  # noqa: PLC0415
+    if not src_filter.test_dirs and not src_filter.exclude_patterns:
+        return 0
+    n = 0
+    tmp = tar_path.with_suffix(".filtered.tar")
+    with tarfile.open(tar_path, "r") as src, tarfile.open(tmp, "w") as dst:
+        for m in src.getmembers():
+            if not m.isfile():
+                dst.addfile(m)
+                continue
+            if src_filter.should_include_in_snapshot(m.name):
+                fo = src.extractfile(m)
+                if fo:
+                    dst.addfile(m, fo)
+            else:
+                n += 1
+    tmp.replace(tar_path)
+    return n
+
+
+def extract_snapshot(container_name: str, task: TaskRecord, *, dest: Path) -> Path:
+    """Extract the gradeable source snapshot from the live work container into ``dest`` (a .tar).
+
+    OFFICIAL logic, two paths: if the agent created the completion tag
+    ``agent-impl-<milestone>`` → ``git archive`` that tag; otherwise fall back to taring the
+    working dir (regardless of git state). In both cases only the source dirs that EXIST plus
+    ROOT_BUILD_FILES are archived, then the tar is filtered by ``should_include_in_snapshot``
+    (keeps generated code + modifiable tests, drops other tests/excludes — see _src_filter_for).
+    The TaskRecord must carry ``source_spec.repo_config`` (built by iter_task_records). Raises
+    RuntimeError on infra failure so the consumer can turn it into an abort."""
+    from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tag = f"agent-impl-{_milestone_id(task)}"
+    rc = task.source_spec.get("repo_config") or {}
+    src_dirs = list(rc.get("src_dirs") or [])
+    if not src_dirs:
+        raise RuntimeError("extract_snapshot: no src_dirs in source_spec.repo_config "
+                           "(build the TaskRecord via iter_task_records)")
+    src_filter = _src_filter_for(task)
+
+    if _tag_exists(container_name, tag):
+        existing = _existing_src_dirs_git(container_name, src_dirs, tag)
+        if not existing:
+            raise RuntimeError(f"extract_snapshot: no source directories found at {tag}")
+        root_files = _existing_root_files_git(container_name, ROOT_BUILD_FILES, tag)
+        paths = get_snapshot_paths(existing, existing_root_files=root_files)
+        cmd = _fakeroot_exec(container_name) + ["git", "archive", "--format=tar", tag] + paths
+        logger.info("extract_snapshot: git archive %s (%d/%d src dirs)", tag, len(existing), len(src_dirs))
+    else:
+        existing = _existing_workdir_dirs(container_name, src_dirs)
+        if not existing:
+            raise RuntimeError("extract_snapshot: no source directories in container workdir (no tag, fallback)")
+        root_files = _existing_root_files_workdir(container_name, ROOT_BUILD_FILES)
+        paths = get_snapshot_paths(existing, existing_root_files=root_files)
+        tar_cmd = "tar -cf - --ignore-failed-read " + " ".join(paths) + " 2>/dev/null"
+        cmd = _fakeroot_exec(container_name) + ["sh", "-c", tar_cmd]
+        logger.info("extract_snapshot: workdir tar fallback (no %s); %d/%d src dirs", tag, len(existing), len(src_dirs))
+
+    with open(dest, "wb") as f:
+        r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            raise RuntimeError(f"extract_snapshot: archive failed: {r.stderr.decode(errors='replace')}")
+
+    dropped = _filter_snapshot_tar(dest, src_filter)
+    if dropped:
+        logger.info("extract_snapshot: filtered out %d test/excluded files", dropped)
+    return dest
+
+
+# ───────────────────────────── offline data build ──────────────────────────
+# Headless enumeration of the EvoClaw-data tree into TaskRecords / milestone ids for
+# the training stack's OFFLINE dataset build (not the rollout hot path). Reproduces what
+# the harness reads from disk: the milestone DAG (milestone_selection), repo_config
+# (metadata.json + config/<repo>.yaml), per-milestone classification + SRS. No docker,
+# no orchestrator coupling. NOTE: this is glue specific to the on-disk EvoClaw-data layout;
+# convert.py/enrich_source_spec.py from the legacy stack are NOT vendored here.
+def _load_repo_config(data_root: Path, repo: str) -> tuple:
+    """(repo_config with all 5 SrcFileFilter pattern sets, framework) for a repo.
+
+    metadata.json (repo_src_dirs -> src_dirs, test_dirs, ...) merged with
+    config/<repo>.yaml (generated/modifiable patterns + test_framework). The
+    repo_src_dirs -> src_dirs rename is REQUIRED — _src_filter_for/extract_snapshot
+    read repo_config["src_dirs"]; leaving it as repo_src_dirs yields an empty snapshot."""
+    import json  # noqa: PLC0415
+    import yaml  # noqa: PLC0415
+    ws = Path(data_root) / repo
+    md = json.loads((ws / "metadata.json").read_text(encoding="utf-8"))
+    cfg_path = Path(data_root) / "config" / f"{repo}.yaml"
+    cfg = (yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}) if cfg_path.exists() else {}
+    repo_config = {
+        "src_dirs": md.get("repo_src_dirs") or [],
+        "test_dirs": md.get("test_dirs") or [],
+        "exclude_patterns": md.get("exclude_patterns") or cfg.get("exclude_patterns") or [],
+        "generated_patterns": md.get("generated_patterns") or cfg.get("generated_patterns") or [],
+        "modifiable_test_patterns": (md.get("modifiable_test_patterns")
+                                     or cfg.get("modifiable_test_patterns") or []),
+    }
+    framework = str(cfg.get("test_framework") or md.get("test_framework") or md.get("framework") or "ginkgo")
+    return repo_config, framework
+
+
+def _read_classification(ws: Path, mid: str, *, f2p_strict: bool) -> tuple:
+    """(fail_to_pass, pass_to_pass, new_tests[{test_id}]) from
+    test_results/<mid>/<mid>_classification.json. Supports the flat and nested
+    (stable_classification) formats. f2p_strict=True requires the flaky-filtered
+    stable_classification (raises if absent); False falls back to the raw baseline.
+    new_tests (the hidden set mask_tests must hide) = none_to_pass (+ any explicit new_tests)."""
+    import json  # noqa: PLC0415
+
+    def _tid(x):
+        return x.get("test_id") if isinstance(x, dict) else str(x)
+
+    path = ws / "test_results" / mid / f"{mid}_classification.json"
+    baseline = json.loads(path.read_text(encoding="utf-8"))
+    stable = baseline.get("stable_classification")
+    if isinstance(stable, dict):
+        cls = stable
+    elif f2p_strict:
+        raise ValueError(f"{path}: f2p_strict set but no stable_classification present")
+    else:
+        cls = baseline
+
+    fail_to_pass = [t for t in (_tid(x) for x in (cls.get("fail_to_pass") or [])) if t]
+    pass_to_pass = [t for t in (_tid(x) for x in (cls.get("pass_to_pass") or [])) if t]
+    none_to_pass = [t for t in (_tid(x) for x in (cls.get("none_to_pass") or [])) if t]
+    new_ids = list(none_to_pass)
+    for x in (cls.get("new_tests") or baseline.get("new_tests") or []):
+        t = _tid(x)
+        if t and t not in new_ids:
+            new_ids.append(t)
+    return fail_to_pass, pass_to_pass, [{"test_id": t} for t in new_ids]
+
+
+def list_milestones(data_root, repo_dir: str, *, milestone_ids=None, curriculum: bool = False) -> list:
+    """Milestone IDs for one repo under data_root, scoped by selected_milestone_ids.txt.
+
+    curriculum=True -> dependency-closed topological order (milestone_selection); else the
+    sorted id set. ``milestone_ids`` (if given) intersects/filters the result."""
+    from harness.e2e.milestone_selection import load_graph, topological_order, read_base_ids  # noqa: PLC0415
+    ws = Path(data_root) / repo_dir
+    deps = ws / "dependencies.csv"
+    mcsv = ws / "milestones.csv"
+    base_ids = read_base_ids(ws / "selected_milestone_ids.txt")
+    if deps.exists():
+        nodes, edges = load_graph(deps, mcsv if mcsv.exists() else None, base_ids)
+        ids = topological_order(nodes, edges) if curriculum else sorted(nodes)
+    else:
+        import csv  # noqa: PLC0415
+        nodes = set()
+        if mcsv.exists():
+            with open(mcsv, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    m = (row.get("id") or "").strip()
+                    if m:
+                        nodes.add(m)
+        if base_ids is not None:
+            nodes &= base_ids
+        ids = sorted(nodes)
+    if milestone_ids is not None:
+        want = set(milestone_ids)
+        ids = [m for m in ids if m in want]
+    return ids
+
+
+def iter_task_records(data_root, repos=None, *, framework=None, f2p_strict: bool = False,
+                      include_source_spec: bool = True, curriculum: bool = False,
+                      on_error: str = "skip") -> Iterator[TaskRecord]:
+    """Yield a TaskRecord per (repo, milestone) under data_root.
+
+    repos=None -> every subdir with a metadata.json (sorted). framework filters to repos
+    whose config test_framework matches. include_source_spec=False skips the (heavier)
+    repo_config/new_tests/filter_list population — listing only (masking/snapshot then won't
+    work). on_error='skip' logs and skips a malformed repo/milestone; anything else re-raises."""
+    import json  # noqa: PLC0415
+    root = Path(data_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"iter_task_records: data_root not found: {root}")
+    if repos:
+        repo_list = list(repos)
+    else:
+        repo_list = sorted(d.name for d in root.iterdir()
+                           if d.is_dir() and d.name != "config" and (d / "metadata.json").exists())
+
+    for repo in repo_list:
+        ws = root / repo
+        try:
+            repo_config, repo_framework = _load_repo_config(root, repo)
+        except Exception as e:
+            if on_error == "skip":
+                logger.warning("iter_task_records: skip repo %s (%s)", repo, e)
+                continue
+            raise
+        if framework and repo_framework != framework:
+            continue
+        for mid in list_milestones(root, repo, curriculum=curriculum):
+            try:
+                fail_to_pass, pass_to_pass, new_tests = _read_classification(ws, mid, f2p_strict=f2p_strict)
+                srs = ws / "srs" / mid / "SRS.md"
+                problem = srs.read_text(encoding="utf-8") if srs.exists() else ""
+                image = f"{repo.lower()}/{mid.lower()}"
+                if ":" not in image:
+                    image += ":latest"
+                ei = {
+                    "instance_id": f"{repo}__{mid}",
+                    "docker_image": image,
+                    "problem_statement": problem,
+                    "fail_to_pass": fail_to_pass,
+                    "pass_to_pass": pass_to_pass,
+                    "framework": repo_framework,
+                }
+                if include_source_spec:
+                    ss = {"repo": repo, "milestone_id": mid,
+                          "repo_config": repo_config, "new_tests": new_tests}
+                    fl = ws / "test_results" / mid / f"{mid}_filter_list.json"
+                    if fl.exists():
+                        ss["filter_list"] = json.loads(fl.read_text(encoding="utf-8"))
+                    ei["source_spec"] = ss
+                yield TaskRecord.from_row(ei)
+            except Exception as e:
+                if on_error == "skip":
+                    logger.warning("iter_task_records: skip %s/%s (%s)", repo, mid, e)
+                    continue
+                raise
