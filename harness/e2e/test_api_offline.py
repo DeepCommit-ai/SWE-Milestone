@@ -150,3 +150,16 @@ def test_should_include_in_snapshot_keeps_generated_and_modifiable():
     assert f.should_include_in_snapshot("src/app_test.go") is False
     # outside src dirs: dropped
     assert f.should_include_in_snapshot("docs/readme.md") is False
+
+
+# ───────────────────── tag derivation consistency ──────────────────────────
+def test_tag_derivation_uses_milestone_id_consistently():
+    # instance_id is unique (<repo>__<mid>) but the completion tag / prompt placeholder must be
+    # the BARE milestone id, so build_instruction (what the agent is told), agent_session_spec
+    # (the completion check) and extract_snapshot (what it archives) all agree on agent-impl-<mid>.
+    tr = TaskRecord.from_row({"docker_image": "r/m1:latest", "problem_statement": "do it",
+                              "instance_id": "r__M001", "source_spec": {"milestone_id": "M001"}})
+    assert api._milestone_id(tr) == "M001"
+    instr = api.build_instruction(tr)
+    assert "agent-impl-M001" in instr and "r__M001" not in instr
+    assert "agent-impl-M001" in api.agent_session_spec(tr).completion["signal_cmd"]

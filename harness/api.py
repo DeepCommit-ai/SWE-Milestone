@@ -137,7 +137,7 @@ def build_instruction(task: TaskRecord, version: str = "milestone_v1") -> str:
     """Final rendered instruction. .replace (not .format): SRS bodies contain braces."""
     return (get_prompt_template(version)
             .replace("{srs_content}", task.problem_statement)
-            .replace("{milestone_id}", task.instance_id))
+            .replace("{milestone_id}", _milestone_id(task)))
 
 
 # ───────────────────────────── container runtime ────────────────────────────
@@ -183,7 +183,7 @@ def agent_session_spec(task: TaskRecord, *, agent: str = "claude-code") -> Agent
     EvoClaw domain knowledge: completion signal + the official nudge."""
     if agent != "claude-code":
         raise NotImplementedError(f"agent_session_spec: only claude-code wired, got {agent!r}")
-    mid = task.instance_id
+    mid = _milestone_id(task)
     return AgentSessionSpec(
         run_as="fakeroot",
         cli_args=["--dangerously-skip-permissions"],
