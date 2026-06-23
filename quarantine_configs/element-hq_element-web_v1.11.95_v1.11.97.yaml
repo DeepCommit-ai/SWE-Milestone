@@ -26,3 +26,10 @@ closure:
   cache_paths:
     - /usr/local/share/.cache/yarn/v6
   offline_build: "cd /testbed && yarn install --offline --frozen-lockfile"
+  # serve@14.2.5 is declared by feature_enhancements/SRS.md and
+  # maintenance_ui_ux/SRS.md as a "Node.js Global Package" used to serve the built
+  # static bundle for playwright tests. It is installed via `npm install -g` (NOT
+  # yarn), so it is NOT in the yarn cache. Baking it in here makes it available
+  # without any offline install step at eval time.
+  global_npm_tools:
+    - serve@14.2.5

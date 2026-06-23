@@ -761,38 +761,154 @@ def test_audit_staging_image_docker_failure_exits(monkeypatch):
 
 # ---- Task 4.4: go ecosystem assembly + toolchain ------------------------------
 
-def test_assemble_go_dockerfile_appends_clean_replace_toolchain():
-    """The go branch unions the module cache (render_union_dockerfile) AND appends a
-    clean-replace toolchain (`RUN rm -rf /usr/local/go` BEFORE
-    `COPY .../usr/local/go`) + `ENV GOTOOLCHAIN=local` to the final stage. No
-    `.info`-synth RUN (the build-scoped gate doesn't need it)."""
+def test_go_online_fetch_cmd_downloads_full_module_graph():
+    """The per-milestone go fetch body runs `go mod download all` (the FULL module
+    graph — incl. indirect + test deps, NOT the build subset) under GOFLAGS=-mod=mod,
+    a real GOPROXY (not the deny-listed CDN), and GOTOOLCHAIN=local, `|| true`'d so one
+    un-fetchable corner doesn't abort the whole multi-milestone warm."""
+    body = boc.go_online_fetch_cmd("/m0")
+    assert body.startswith("cd /m0 && ")
+    assert "go mod download all" in body
+    assert "GOFLAGS=-mod=mod" in body
+    assert "GOPROXY=https://proxy.golang.org,direct" in body
+    assert "GOTOOLCHAIN=local" in body
+    # guarded so a partial graph never fails the build
+    assert body.rstrip().endswith("|| true")
+
+
+def test_assemble_go_dockerfile_online_fetch_emits_go_fetch_stage():
+    """DEFAULT (online_fetch=True): the go assembly emits a `go_fetch` stage that
+    clean-replaces the toolchain FIRST, COPYs each milestone's go.mod+go.sum, runs
+    `go mod download all` per milestone, then the `final` stage COPYs the
+    online-fetched module cache (over the raw-cache union) + the clean-replace
+    toolchain. This is what closes the declared-but-uncompiled (17-module) gap."""
     ms = ["r/x/m01:latest", "r/x/m02:latest"]
     # fake probe: only the LAST milestone has the target go (B-end), as in go-zero
     probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
     df = boc.assemble_go_dockerfile(
         "r/x", ms, ["/go/pkg/mod/cache/download"], "1.21.13", _probe=probe)
-    # base of the assembly is the raw-cache union (final stage + rsync of the cache)
-    assert "FROM r/x/base:latest AS final" in df
+    # exactly one syntax directive at the very top
+    assert df.count("# syntax=docker/dockerfile:1") == 1
+    assert df.startswith("# syntax=docker/dockerfile:1\n")
+    # go_fetch stage present, with the toolchain clean-replaced BEFORE the downloads
+    assert "FROM r/x/base:latest AS go_fetch" in df
+    # raw-cache union still present (belt-and-suspenders + exact A-version bytes)
+    assert "FROM r/x/base:latest AS builder" in df
     assert "rsync -a /milestone_" in df
-    assert "/go/pkg/mod/cache/download" in df
-    # toolchain layer appended AFTER the union's final stage, with a clean-replace
-    # `rm -rf /usr/local/go` BEFORE the COPY (overlay would mix go1.19/go1.21 stdlib
-    # -> `go build` fails "m0 redeclared")
-    assert "RUN rm -rf /usr/local/go" in df
-    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+    assert "FROM r/x/base:latest AS final" in df
+    # go.mod+go.sum COPY'd (the module graph; no source) per milestone, then
+    # `go mod download all` per milestone in the go_fetch stage
+    assert "COPY --from=r/x/m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
+    assert "COPY --from=r/x/m02:latest /testbed/go.mod /testbed/go.sum /m1/" in df
+    assert df.count("go mod download all") == len(ms)
+    # final stage COPYs the online-fetched modcache (over the raw-cache union)
+    assert ("COPY --from=go_fetch /go/pkg/mod/cache/download "
+            "/go/pkg/mod/cache/download") in df
+    # clean-replace toolchain in BOTH go_fetch and final (rm BEFORE the COPY each)
+    assert df.count("RUN rm -rf /usr/local/go") == 2
+    assert df.count("COPY --from=r/x/m02:latest /usr/local/go /usr/local/go") == 2
     assert "ENV GOTOOLCHAIN=local" in df
     # the .info-synth RUN was removed when the gate became build-scoped
     assert ".info" not in df and "find /go/pkg/mod/cache/download" not in df
-    # ordering: union FROM final -> RUN rm -> COPY toolchain -> ENV GOTOOLCHAIN
-    assert df.index("AS final") < df.index("RUN rm -rf /usr/local/go")
-    assert df.index("RUN rm -rf /usr/local/go") < df.index("COPY --from=r/x/m02:latest /usr/local/go")
-    assert df.index("COPY --from=r/x/m02:latest /usr/local/go") < df.index("ENV GOTOOLCHAIN=local")
-    # equals the rendered union + the appended tail (no other mutation)
+    # ordering: go_fetch's rm precedes its toolchain COPY precedes the download
+    i_fetch = df.index("AS go_fetch")
+    i_rm1 = df.index("RUN rm -rf /usr/local/go")
+    i_dl = df.index("go mod download all")
+    assert i_fetch < i_rm1 < i_dl
+    # the go_fetch COPY into final precedes final's toolchain clean-replace
+    assert df.index("COPY --from=go_fetch") < df.rindex("RUN rm -rf /usr/local/go")
+
+
+def test_assemble_go_dockerfile_raw_cache_fallback_no_online_fetch():
+    """online_fetch=False (the `go_mechanism: raw-cache` escape) restores the legacy
+    raw-cache-union-only assembly: render_union + the appended clean-replace toolchain,
+    with NO go_fetch stage and NO `go mod download`."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    df = boc.assemble_go_dockerfile(
+        "r/x", ms, ["/go/pkg/mod/cache/download"], "1.21.13",
+        online_fetch=False, _probe=probe)
+    assert "AS go_fetch" not in df and "go mod download" not in df
+    # equals the rendered union + the single appended toolchain tail (no other change)
     union = boc.render_union_dockerfile("r/x", ms, ["/go/pkg/mod/cache/download"])
     assert df == union + (
         "RUN rm -rf /usr/local/go\n"
         "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go\n"
         "ENV GOTOOLCHAIN=local\n")
+
+
+# ---- go_mechanism dispatch (online-fetch default; raw-cache escape) ------------
+
+def _go_dispatch_harness(monkeypatch, tmp_path, repo, yaml_text):
+    """Run build_closure for a go repo with ALL docker mocked; return the
+    online_fetch flag assemble_go_dockerfile was called with, the gate's
+    goproxy_off/classifier, and whether :latest was tagged."""
+    (tmp_path / "quarantine_configs").mkdir(exist_ok=True)
+    (tmp_path / "quarantine_configs" / f"{repo}.yaml").write_text(yaml_text)
+    seen = {"online_fetch": "UNSET", "goproxy_off": None,
+            "classifier": "UNSET", "tagged": False}
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda r: [f"{repo}/m01:latest", f"{repo}/m02:latest"])
+    monkeypatch.setattr(
+        boc, "assemble_go_dockerfile",
+        lambda repo_lower, ms, cp, tg, online_fetch=True, _probe=None:
+            seen.__setitem__("online_fetch", online_fetch) or "DF")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    def fake_gate(tag, m, ob, **k):
+        seen["goproxy_off"] = k.get("goproxy_off")
+        seen["classifier"] = k.get("classifier")
+        return "PASS"
+    monkeypatch.setattr(boc, "run_offline_gate", fake_gate)
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            seen["tagged"] = True
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    boc.build_closure(repo, tmp_path, push=False, keep=True)
+    return seen
+
+
+_GOZERO_YAML = (
+    "ecosystem: [go]\n"
+    "cache_forbid_globs:\n"
+    "  - /go/pkg/mod/cache/download/github.com/zeromicro/*\n"
+    "closure:\n"
+    "  cache_paths:\n"
+    "    - /go/pkg/mod/cache/download\n"
+    "  offline_build: 'go build -mod=mod ./...'\n"
+    "  toolchain: {go: \"1.21.13\", gotoolchain_local: true}\n")
+
+
+def test_build_closure_go_online_fetch_is_default(monkeypatch, tmp_path):
+    """No go_mechanism key (go-zero) → assemble_go_dockerfile fires with
+    online_fetch=True (the declared-graph fix), the gate gets GOPROXY=off + the go
+    classifier (default None), and :latest is tagged on all-PASS."""
+    seen = _go_dispatch_harness(monkeypatch, tmp_path, "gz", _GOZERO_YAML)
+    assert seen["online_fetch"] is True
+    assert seen["goproxy_off"] is True
+    assert seen["classifier"] is None   # go uses the default classifier
+    assert seen["tagged"] is True
+
+
+def test_build_closure_go_rawcache_mechanism_disables_online_fetch(monkeypatch, tmp_path):
+    """closure.go_mechanism: raw-cache → assemble_go_dockerfile fires with
+    online_fetch=False (the legacy raw-cache-union-only escape)."""
+    yaml_text = _GOZERO_YAML.replace(
+        "  offline_build: 'go build -mod=mod ./...'\n",
+        "  offline_build: 'go build -mod=mod ./...'\n  go_mechanism: raw-cache\n")
+    seen = _go_dispatch_harness(monkeypatch, tmp_path, "gz", yaml_text)
+    assert seen["online_fetch"] is False
+    assert seen["tagged"] is True
+
+
+def test_build_closure_go_unknown_mechanism_exits(monkeypatch, tmp_path):
+    """An unrecognised go_mechanism → fail-closed (no silent fallback)."""
+    bad = _GOZERO_YAML.replace(
+        "  offline_build: 'go build -mod=mod ./...'\n",
+        "  offline_build: 'go build -mod=mod ./...'\n  go_mechanism: bogus\n")
+    with pytest.raises(SystemExit):
+        _go_dispatch_harness(monkeypatch, tmp_path, "gz", bad)
 
 
 # ---- Task 4.4: maven ecosystem assembly + self@B removal ----------------------
@@ -1350,6 +1466,104 @@ def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_p
                                 boc.classify_npm_offline_build_failure]
 
 
+def test_assemble_npm_dockerfile_global_npm_tools_baked_into_final():
+    """global_npm_tools=[serve@14.2.5] → the final stage emits
+    `RUN npm install -g serve@14.2.5` AFTER the yarn cache COPY."""
+    ms = ["ew/m01:latest"]
+    df = boc.assemble_npm_dockerfile("ew", ms, global_npm_tools=["serve@14.2.5"])
+    # The global install line must be present and in the final stage (after the COPY).
+    assert "RUN npm install -g serve@14.2.5" in df
+    # It must come AFTER the yarn cache COPY (closure first, then bake binary).
+    cache = "/usr/local/share/.cache/yarn/v6"
+    copy_line = f"COPY --from=fetch_builder {cache} {cache}"
+    assert df.index("npm install -g") > df.index(copy_line)
+    # The global install line is in the final stage (after "AS final").
+    final_idx = df.index("AS final")
+    assert df.index("npm install -g") > final_idx
+
+
+def test_assemble_npm_dockerfile_no_global_tools_unchanged():
+    """Omitting global_npm_tools (None / not passed) produces no npm install -g line."""
+    ms = ["ew/m01:latest"]
+    df_no_tools = boc.assemble_npm_dockerfile("ew", ms)
+    df_empty_tools = boc.assemble_npm_dockerfile("ew", ms, global_npm_tools=[])
+    assert "npm install -g" not in df_no_tools
+    assert "npm install -g" not in df_empty_tools
+    # The two variants are identical (empty list == not passed).
+    assert df_no_tools == df_empty_tools
+
+
+def test_assemble_npm_dockerfile_multiple_global_tools():
+    """Multiple tools each get their own RUN npm install -g line."""
+    ms = ["ew/m01:latest"]
+    df = boc.assemble_npm_dockerfile("ew", ms,
+                                     global_npm_tools=["serve@14.2.5", "http-server@14"])
+    assert "RUN npm install -g serve@14.2.5" in df
+    assert "RUN npm install -g http-server@14" in df
+
+
+def test_build_closure_npm_branch_passes_global_tools_from_config(monkeypatch, tmp_path):
+    """build_closure npm branch reads closure.global_npm_tools from config and
+    passes it to assemble_npm_dockerfile, so the resulting Dockerfile contains
+    the npm install -g lines for each declared tool."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "ew.yaml").write_text(
+        "ecosystem: [npm]\n"
+        "closure:\n"
+        "  cache_paths:\n"
+        "    - /usr/local/share/.cache/yarn/v6\n"
+        "  offline_build: 'cd /testbed && yarn install --offline --frozen-lockfile'\n"
+        "  global_npm_tools:\n"
+        "    - serve@14.2.5\n")
+
+    built = {}
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["ew/m01:latest", "ew/m02:latest"])
+    def fake_build(df, tag, root):
+        built["df"] = df
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    monkeypatch.setattr(boc, "run_offline_gate", lambda tag, m, ob, **k: "PASS")
+    def fake_sub_run(cmd, *a, **k):
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    boc.build_closure("ew", tmp_path, push=False, keep=True)
+
+    # The built Dockerfile must contain the global tool install line.
+    assert "RUN npm install -g serve@14.2.5" in built["df"]
+    # And it must equal assemble_npm_dockerfile called with the same global_tools.
+    expected = boc.assemble_npm_dockerfile(
+        "ew", ["ew/m01:latest", "ew/m02:latest"], global_npm_tools=["serve@14.2.5"])
+    assert built["df"] == expected
+
+
+def test_build_closure_npm_branch_no_global_tools_key_no_install(monkeypatch, tmp_path):
+    """When global_npm_tools is absent from config, no npm install -g line appears."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "ew.yaml").write_text(
+        "ecosystem: [npm]\n"
+        "closure:\n"
+        "  cache_paths:\n"
+        "    - /usr/local/share/.cache/yarn/v6\n"
+        "  offline_build: 'cd /testbed && yarn install --offline --frozen-lockfile'\n")
+
+    built = {}
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["ew/m01:latest"])
+    def fake_build(df, tag, root):
+        built["df"] = df
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    monkeypatch.setattr(boc, "run_offline_gate", lambda tag, m, ob, **k: "PASS")
+    def fake_sub_run(cmd, *a, **k):
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    boc.build_closure("ew", tmp_path, push=False, keep=True)
+    assert "npm install -g" not in built["df"]
+
+
 def test_pick_go_toolchain_milestone_last_when_correct():
     """Last milestone (B-end) has the target go → it is picked (and probed)."""
     ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
@@ -1807,9 +2021,10 @@ def test_npm_online_fetch_cmd_npm_not_yarn_into_shared_cacache():
 
 
 def test_assemble_go_npm_dockerfile_emits_both_closures():
-    """The dual assembly emits BOTH the go union+toolchain AND the npm cacache warm
-    in ONE multi-stage Dockerfile, with a single syntax directive and a final stage
-    that COPYs the unioned go cache + the go toolchain + the warmed _cacache."""
+    """The dual assembly emits the go closure (raw-cache union + ONLINE go_fetch +
+    toolchain) AND the npm cacache warm in ONE multi-stage Dockerfile, with a single
+    syntax directive and a final stage that COPYs the unioned go cache + the
+    online-fetched go modcache + the go toolchain + the warmed _cacache."""
     ms = ["r/x/m01:latest", "r/x/m02:latest"]
     caches = ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"]
     df = boc.assemble_go_npm_dockerfile(
@@ -1824,10 +2039,14 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     assert ("COPY --from=r/x/m02:latest /testbed/ui/package.json "
             "/testbed/ui/package-lock.json /ui_m1/") in df
     assert "npm ci --cache /root/.npm " in df          # npm, not yarn
-    assert "yarn" not in df
+    # 'yarn' must not appear as the npm tool (the go_fetch download is npm-free too)
+    assert "yarn install" not in df and "yarn --" not in df
     # the WHOLE /testbed is never COPY'd into the npm stage (manifests only)
     assert "/testbed /ui_m" not in df
-    # --- go part: raw-cache rsync union of the go modcache (NOT the npm cacache)
+    # --- go part: ONLINE go_fetch stage (full module graph) over the raw-cache union
+    assert "FROM r/x/base:latest AS go_fetch" in df
+    assert "COPY --from=r/x/m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
+    assert df.count("go mod download all") == len(ms)
     assert "FROM r/x/base:latest AS builder" in df
     assert "FROM r/x/base:latest AS final" in df
     assert "rsync -a /milestone_" in df
@@ -1836,22 +2055,26 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     assert "rsync -a /milestone_0_0/root/.npm/_cacache" not in df
     assert "/staging/root/.npm/_cacache" not in df
     # --- go toolchain: clean-replace from the 1.24.5 milestone + GOTOOLCHAIN=local
-    assert "RUN rm -rf /usr/local/go" in df
-    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+    #     (now in BOTH go_fetch and final → two clean-replaces, two toolchain COPYs)
+    assert df.count("RUN rm -rf /usr/local/go") == 2
+    assert df.count("COPY --from=r/x/m02:latest /usr/local/go /usr/local/go") == 2
     assert "ENV GOTOOLCHAIN=local" in df
-    # --- final stage COPYs the warmed _cacache from the npm_fetch stage
+    # --- final stage COPYs the online-fetched go modcache + the warmed _cacache
+    assert ("COPY --from=go_fetch /go/pkg/mod/cache/download "
+            "/go/pkg/mod/cache/download") in df
     assert "COPY --from=npm_fetch /root/.npm/_cacache /root/.npm/_cacache" in df
-    # ordering: npm_fetch DEFINED before final references it; rm before toolchain
-    # COPY before ENV before the cacache COPY
+    # ordering: go_fetch + npm_fetch DEFINED before final references them; in final,
+    # the go_fetch COPY precedes the final toolchain clean-replace (use rindex for the
+    # FINAL-stage rm, since go_fetch's rm appears earlier), which precedes the cacache
+    assert df.index("AS go_fetch") < df.index("COPY --from=go_fetch /go/pkg")
     assert df.index("AS npm_fetch") < df.index("COPY --from=npm_fetch")
-    assert df.index("AS final") < df.index("RUN rm -rf /usr/local/go")
-    assert df.index("RUN rm -rf /usr/local/go") \
-        < df.index("COPY --from=r/x/m02:latest /usr/local/go")
-    assert df.index("COPY --from=r/x/m02:latest /usr/local/go") \
-        < df.index("ENV GOTOOLCHAIN=local")
-    assert df.index("ENV GOTOOLCHAIN=local") \
+    final_rm = df.rindex("RUN rm -rf /usr/local/go")
+    assert df.index("AS final") < final_rm
+    assert df.index("COPY --from=go_fetch /go/pkg") < final_rm
+    assert final_rm < df.rindex("COPY --from=r/x/m02:latest /usr/local/go")
+    assert df.rindex("ENV GOTOOLCHAIN=local") \
         < df.index("COPY --from=npm_fetch /root/.npm/_cacache")
-    # NO self@B removal for navidrome (no rm -rf of any cache)
+    # NO self@B removal for navidrome (no rm -rf of any cache dir)
     assert "rm -rf /root/.npm" not in df
     assert "rm -rf /go/pkg/mod" not in df
 

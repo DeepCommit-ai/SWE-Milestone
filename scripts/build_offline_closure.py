@@ -1172,50 +1172,176 @@ def pick_go_toolchain_milestone(milestones: list[str], target_go: str,
     sys.exit(1)
 
 
+# Where every base/milestone image keeps its go module download cache. The base
+# image already ships the A-version cache here; the go_fetch stage warms it forward
+# with the FULL declared module graph of each milestone, then the final stage carries
+# the union back in. (Mirrors the single closure.cache_paths entry in the go config.)
+_GO_MODCACHE_DIR = "/go/pkg/mod/cache/download"
+
+# GOPROXY for the BUILD-TIME online fetch (the closure is sealed offline at eval, so a
+# build-time fetch from a non-answer proxy is safe). proxy.golang.org is the public
+# Google-hosted module mirror; `,direct` lets go fall back to the module's VCS origin
+# for anything the proxy can't serve. The repo's OWN module (github.com/zeromicro/*)
+# is never fetched here — `go mod download` only pulls the DEPENDENCIES named in
+# go.mod, not the main module — so the cache cannot leak the answer.
+_GO_FETCH_PROXY = "https://proxy.golang.org,direct"
+
+
+def go_online_fetch_cmd(modroot_dir: str, modcache: str = _GO_MODCACHE_DIR,
+                        proxy: str = _GO_FETCH_PROXY) -> str:
+    """Render the per-milestone ONLINE go declared-deps fetch RUN body (no `RUN `
+    prefix), warming the module cache from the go.mod+go.sum in `modroot_dir`.
+
+    This is the go analogue of `maven_online_fetch_cmd` / `npm_online_fetch_cmd`:
+    the build-warmed module cache shipped in a milestone image is INCOMPLETE — it
+    holds only the modules `go build ./...` actually COMPILED, MISSING modules that
+    go.mod DECLARES but the build never imports (indirect-only deps, test-only deps).
+    `go mod download all` instead materialises the FULL module graph
+    (the `all` package pattern's module closure — including indirect + test deps),
+    so it fetches exactly the modules a later `go test ./...` / `go mod download` /
+    `go mod verify` would demand. proxy.golang.org serves third-party modules (the
+    repo's own module is the MAIN module, never downloaded by `go mod download`), so
+    the build-time fetch is safe; the closure is sealed offline at eval.
+
+    Flags:
+      - `GOFLAGS=-mod=mod`: several milestones' go.mod still declare `go 1.19`, and
+        go1.21's default `-mod=readonly` REFUSES to touch a module needing any
+        go.mod/go.sum bookkeeping ("updates to go.mod needed") even just to download.
+        `-mod=mod` lets go reconcile in-place so the download proceeds.
+      - `GOPROXY=<proxy>`: force the public mirror (the image's baked GOPROXY may be a
+        deny-listed CDN like goproxy.cn). `,direct` falls back to VCS for anything the
+        proxy lacks.
+      - `GOTOOLCHAIN=local`: forbid any auto-toolchain fetch (go.mod's `go 1.21`
+        directive otherwise makes go try to pull a matching toolchain).
+    `|| true`-guarded so a milestone whose graph has one un-fetchable corner never
+    aborts the whole multi-milestone warm — every module it COULD download still
+    enters the shared cache (a truly-gone module surfaces later as a gate gap).
+    """
+    return (f"cd {modroot_dir} && "
+            f"GOFLAGS=-mod=mod GOPROXY={proxy} GOTOOLCHAIN=local "
+            f"go mod download all 2>&1 | tail -3 || true")
+
+
+def _go_fetch_stage(repo_lower: str, milestones: list[str], tc: str,
+                    modcache: str = _GO_MODCACHE_DIR,
+                    modsrc_dir: str = "/testbed") -> str:
+    """Render the `go_fetch` stage: clean-replace the toolchain to the repo's go
+    version FIRST, then COPY each milestone's go.mod+go.sum and `go mod download all`
+    the FULL module graph into the shared module cache. Returns the stage text
+    (ends with a trailing newline); the final stage COPYs `modcache` from it.
+
+    The toolchain is clean-replaced (`rm -rf /usr/local/go` BEFORE the COPY) BEFORE
+    any download so `go mod download` runs under the repo's real go (go-zero: 1.21.13,
+    baked in the milestone images at /usr/local/go) — the base ships go1.19.13, and
+    downloading with the wrong go can mis-resolve toolchain directives. GOTOOLCHAIN=
+    local forbids any auto-toolchain fetch. `go mod download all` needs only
+    go.mod+go.sum (the module GRAPH), not source, so we COPY just those two files per
+    milestone (small context). `modsrc_dir` is where in the milestone image the
+    manifests live (/testbed; navidrome's go module also roots at /testbed).
+    """
+    lines = [f"FROM {repo_lower}/base:latest AS go_fetch"]
+    # Clean-replace the toolchain BEFORE downloading (right go resolves the graph;
+    # GOTOOLCHAIN=local forbids an auto-toolchain fetch from proxy.golang.org).
+    lines.append("RUN rm -rf /usr/local/go")
+    lines.append(f"COPY --from={tc} /usr/local/go /usr/local/go")
+    lines.append("ENV GOTOOLCHAIN=local")
+    # COPY only go.mod+go.sum per milestone (the module graph; no source needed).
+    for i, m in enumerate(milestones):
+        lines.append(
+            f"COPY --from={m} {modsrc_dir}/go.mod {modsrc_dir}/go.sum /m{i}/")
+    # One `go mod download all` per milestone, all warming the SAME shared modcache.
+    for i in range(len(milestones)):
+        lines.append(f"RUN {go_online_fetch_cmd(f'/m{i}', modcache)}")
+    return "\n".join(lines) + "\n"
+
+
 def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
                            cache_paths: list[str], target_go: str,
+                           online_fetch: bool = True,
                            _probe=_probe_go_version) -> str:
-    """Go closure Dockerfile: raw-cache rsync UNION of every milestone's go module
-    cache (render_union_dockerfile) PLUS a clean-replaced newer go toolchain in the
-    final stage.
+    """Go closure Dockerfile: ONLINE-fetch the UNION of every milestone's *declared*
+    module graph into the module cache (a `go_fetch` stage running `go mod download
+    all` per milestone) — the robust pattern pip (`pip download` the union freeze),
+    maven (`test-compile` the reactor), and npm (`yarn install` the lockfiles)
+    already use, now for go — laid OVER the raw-cache rsync UNION of every milestone's
+    build-warmed module cache, with a clean-replaced newer go toolchain in the final
+    stage.
 
-    go-zero's B-source declares `go 1.21`, but base ships go1.19.13. The target
-    toolchain (1.21.13) is baked into the B-milestone images at /usr/local/go, so
-    the final stage gets:
-        RUN rm -rf /usr/local/go
-        COPY --from=<verified milestone> /usr/local/go /usr/local/go
-        ENV GOTOOLCHAIN=local
-    The `rm -rf /usr/local/go` MUST precede the COPY: COPY merges into an existing
-    directory, so without the rm the milestone's go1.21.13 tree is overlaid ON TOP
-    of the base's go1.19.13 tree — files present in 1.19 but renamed/removed in 1.21
-    survive, yielding a mixed stdlib that breaks `go build` (empirically
-    `runtime/internal/sys: m0 redeclared in this block`). Clean-replace removes the
-    base toolchain first so the result is a pristine 1.21.13.
-    GOTOOLCHAIN=local is REQUIRED: without it a `go 1.21` directive makes go try to
-    auto-download a matching toolchain from proxy.golang.org → fails under
-    --network none.
+    Why not raw-COPY the milestone caches ALONE (the old go branch)?  Build-warmed
+    module caches are INCOMPLETE: they hold only the modules `go build ./...` actually
+    COMPILED, and MISS modules a milestone's go.mod DECLARES but the build never
+    imports — indirect-only deps and test-only deps (go-zero: an SRS-vs-image audit
+    caught 17 such modules, e.g. cel.dev/expr, github.com/gorilla/websocket,
+    github.com/IBM/sarama, declared in m013/m018/m020/m025 go.mod but absent from the
+    union of the build-warmed caches). The per-milestone `go build ./...` gate passes
+    WITHOUT them precisely because building doesn't need them — but an agent running
+    `go test ./...`, `go mod download`, or `go mod verify` WILL (same class as the
+    maven-bcprov / npm-caniuse-lite / go-zip gaps). The raw-cache union can only carry
+    what some milestone's build happened to cache; it cannot supply a
+    declared-but-uncompiled module.
 
-    No `.info`-sidecar synthesis: the build-scoped gate (`go build -mod=mod ./...`,
-    see the go-zero quarantine config) resolves what it needs straight from the
-    rsync'd cache. An earlier whole-graph `go mod download` gate needed synthesised
-    `<v>.info` sidecars for version resolution, but switching to the build-scoped
-    gate made them unnecessary — empirically the per-milestone gate passes
-    identically with and without synthesis (21/23 build offline either way; the 2
-    failures are source-state, not missing `.info`). The module cache never
-    contains the repo's own module (github.com/zeromicro/*), so the self-exclusion
-    audit stays clean by construction.
+    Fix: a `go_fetch` stage (FROM <repo>/base:latest, so the base image's EXISTING
+    A-version cache is the starting point — the union therefore spans A→B) COPYs ONLY
+    each milestone's go.mod+go.sum and runs `go mod download all` (the FULL module
+    graph — incl. indirect + test deps, NOT the build-scoped subset) per milestone,
+    all warming the SAME shared module cache. The toolchain is clean-replaced to the
+    repo's go (1.21.13) FIRST so the download resolves under the right go. The final
+    stage COPYs the raw-cache union (belt-and-suspenders; it also pins the exact
+    A-version bytes already shipped in base) AND the online-fetched graph (the
+    superset) into the module cache, then clean-replaces the toolchain. `go mod
+    download` only pulls the DEPENDENCIES named in go.mod — never the MAIN module — so
+    the cache cannot leak github.com/zeromicro/*; the self-exclusion audit stays clean
+    by construction.
+
+    `online_fetch=False` falls back to the legacy raw-cache-union-only assembly (the
+    `go_mechanism: raw-cache` config escape) for parity/debugging — but the DEFAULT
+    online-fetch path is what closes the declared-but-uncompiled gap.
+
+    Toolchain (unchanged): go-zero's B-source declares `go 1.21` but base ships
+    go1.19.13. The target (1.21.13) is baked in the B-milestone images at
+    /usr/local/go, so the final stage does `RUN rm -rf /usr/local/go` BEFORE
+    `COPY --from=<verified milestone> /usr/local/go /usr/local/go` + `ENV
+    GOTOOLCHAIN=local`. The `rm -rf` MUST precede the COPY: an overlay mixes
+    go1.19+go1.21 stdlib and `go build` fails (`m0 redeclared`). GOTOOLCHAIN=local
+    forbids an auto-toolchain fetch from proxy.golang.org under --network none.
+
+    No `.info`-sidecar synthesis: the build-scoped gate (`go build -mod=mod ./...`)
+    resolves straight from the cache.
     """
-    df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+    union = render_union_dockerfile(repo_lower, milestones, cache_paths)
     tc = pick_go_toolchain_milestone(milestones, target_go, _probe=_probe)
-    # render_union_dockerfile's last stage is `FROM ... AS final`; append the
-    # clean-replace toolchain layers to that final stage (the rendered file ends
-    # with a trailing newline). The `rm -rf` MUST come before the COPY so the new
-    # toolchain replaces (not overlays) the base's /usr/local/go — an overlay mixes
-    # go1.19 + go1.21 stdlib and `go build` fails (m0 redeclared).
-    tail = ("RUN rm -rf /usr/local/go\n"
+    # Legacy escape: raw-cache union only (no online fetch). Kept for the
+    # `go_mechanism: raw-cache` config fallback / debugging.
+    if not online_fetch:
+        tail = ("RUN rm -rf /usr/local/go\n"
+                f"COPY --from={tc} /usr/local/go /usr/local/go\n"
+                "ENV GOTOOLCHAIN=local\n")
+        return union + tail
+    # Online-fetch path (default). render_union_dockerfile emits `# syntax=...` then
+    # `FROM ... AS builder` (rsync union) then `FROM ... AS final` (COPY the unioned
+    # cache). We PREPEND the go_fetch stage (its own FROM) — Dockerfile stages may
+    # appear in any order so long as a later COPY --from references an earlier-defined
+    # stage — and APPEND, to the union's (open) final stage, a COPY of the
+    # online-fetched module cache plus the clean-replace toolchain. Keep exactly ONE
+    # `# syntax` directive at the very top.
+    syntax = "# syntax=docker/dockerfile:1\n"
+    union_body = union[len(syntax):] if union.startswith(syntax) else union
+    # The go module cache the union COPYs into the final stage (the config's single
+    # cache_paths entry); the go_fetch stage warms the same path so the final stage
+    # can COPY both. Use the first cache_path that looks like the modcache, else the
+    # canonical default (defensive — the go config has exactly one).
+    modcache = next((cp for cp in (cache_paths or []) if "cache/download" in cp),
+                    _GO_MODCACHE_DIR)
+    fetch_stage = _go_fetch_stage(repo_lower, milestones, tc, modcache)
+    # Tail appended to the union's (open) final stage: COPY the online-fetched graph
+    # OVER the raw-cache union (module cache entries are content-addressed; the online
+    # graph is the superset, so the overlay is additive and same-bytes-safe), then
+    # clean-replace the toolchain. `rm -rf` BEFORE the COPY (overlay mixes stdlib).
+    tail = (f"COPY --from=go_fetch {modcache} {modcache}\n"
+            "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
             "ENV GOTOOLCHAIN=local\n")
-    return df + tail
+    return syntax + fetch_stage + union_body + tail
 
 
 def maven_rm_self_at_b_cmd(forbid_globs: list[str]) -> str:
@@ -1404,7 +1530,8 @@ _YARN_CACHE_DIR = "/usr/local/share/.cache/yarn/v6"
 
 
 def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
-                            yarn_cache: str = _YARN_CACHE_DIR) -> str:
+                            yarn_cache: str = _YARN_CACHE_DIR,
+                            global_npm_tools: list[str] | None = None) -> str:
     """npm/yarn-classic closure Dockerfile: ONLINE-fetch the UNION of every
     milestone's *declared* deps into the yarn cache, then bake it — the robust
     pattern pip (`pip download` the union freeze) and cargo (`cargo vendor` the
@@ -1462,6 +1589,15 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
     No self@B removal: element-web's app source is not published to npm, so there
     is no self@B tarball the cache could serve (cache_forbid_globs is empty → the
     generic audit stays a clean no-op).
+
+    `global_npm_tools` (optional): a list of `<pkg>[@<version>]` specifiers for
+    global npm tools declared by the repo's SRS but installed via
+    `npm install -g <tool>` (NOT via yarn, so NOT in the yarn cache). Each tool is
+    baked into the final stage with `RUN npm install -g <spec>` ONLINE at image
+    build time — the binary is then present in the image without any offline install.
+    registry.npmjs.org is a non-answer registry (it serves generic CLI tools, not
+    the repo's own source), so this fetch is safe at build time. Example:
+    `serve@14.2.5` (a static-file server used by playwright tests in some milestones).
     """
     if not milestones:
         print("Error: assemble_npm_dockerfile got no milestones", file=sys.stderr)
@@ -1490,6 +1626,12 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
             f"RUN cd /m{i} && ( {base} --frozen-lockfile || {base} )")
     lines.append(f"FROM {repo_lower}/base:latest AS final")
     lines.append(f"COPY --from=fetch_builder {yarn_cache} {yarn_cache}")
+    # Bake any SRS-declared global npm tools (e.g. serve@14.2.5) into the final
+    # image so milestones can use them without an offline install. Each tool is
+    # fetched from registry.npmjs.org at BUILD time (online; safe — it is a generic
+    # CLI tool registry, not the repo's own answer source).
+    for tool in (global_npm_tools or []):
+        lines.append(f"RUN npm install -g {tool}")
     return "\n".join(lines) + "\n"
 
 
@@ -1561,10 +1703,14 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     composes the two PROVEN mechanisms into one multi-stage build:
 
     GO part (identical to `assemble_go_dockerfile`, validated on go-zero):
-      - raw-cache rsync UNION of every milestone's go module download cache
-        (`/go/pkg/mod/cache/download`, the go entry of cache_paths) onto base —
-        spans A→B because the union stage is FROM base:latest (the A-baseline
-        cache) and ADDs each milestone's (B) cache on top.
+      - ONLINE-fetch the UNION of every milestone's DECLARED module graph
+        (`go mod download all` per milestone, see `_go_fetch_stage`) into the module
+        cache, laid OVER the raw-cache rsync UNION of every milestone's build-warmed
+        `/go/pkg/mod/cache/download`. The build-warmed caches hold only the modules
+        `go build` COMPILED and MISS indirect-only / test-only deps a go.mod declares
+        (the go-zero 17-module gap class); the online fetch closes that. Both span
+        A→B because every stage is FROM base:latest (the A-baseline cache is the
+        starting point) and ADDs each milestone's (B) modules on top.
       - clean-replace the go toolchain to `target_go` (1.24.5): `RUN rm -rf
         /usr/local/go` BEFORE `COPY --from=<milestone reporting target_go>
         /usr/local/go` + `ENV GOTOOLCHAIN=local`. navidrome's milestones split
@@ -1572,7 +1718,9 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
         matching toolchain); with GOTOOLCHAIN=local a 1.24.4 toolchain can't build
         a `go 1.24.5` milestone (it would try to fetch 1.24.5 from
         proxy.golang.org → fails offline). 1.24.5 builds BOTH, so we standardise on
-        it. `pick_go_toolchain_milestone` finds a milestone that reports it.
+        it. `pick_go_toolchain_milestone` finds a milestone that reports it. The
+        go_fetch stage clean-replaces to this toolchain FIRST so `go mod download`
+        resolves the graph under the right go.
 
     NPM part (the npm — not yarn — analogue of `assemble_npm_dockerfile`):
       - a `npm_fetch` stage (FROM base:latest, so base's A-version _cacache is the
@@ -1583,21 +1731,24 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
         Each fetch ADDs that milestone's declared UI deps to the cache, closing any
         caniuse-lite-style gap the build-warmed milestone _cacache missed.
 
-    FINAL stage (FROM base:latest) COPYs all THREE closures so both land in one
-    image:
-      1. `COPY --from=builder /staging<go-cache> <go-cache>` — the unioned go
-         module cache (from the go union's `builder` stage).
-      2. `RUN rm -rf /usr/local/go` + `COPY --from=<tc> /usr/local/go
+    FINAL stage (FROM base:latest) COPYs all FOUR closures so both ecosystems land
+    in one image:
+      1. `COPY --from=builder /staging<go-cache> <go-cache>` — the raw-cache unioned
+         go module cache (from the go union's `builder` stage).
+      2. `COPY --from=go_fetch <go-cache> <go-cache>` — the online-fetched declared
+         module graph (the superset; additive over the raw-cache union).
+      3. `RUN rm -rf /usr/local/go` + `COPY --from=<tc> /usr/local/go
          /usr/local/go` + `ENV GOTOOLCHAIN=local` — the clean-replaced go
          toolchain.
-      3. `COPY --from=npm_fetch <_cacache> <_cacache>` — the warmed npm cache.
+      4. `COPY --from=npm_fetch <_cacache> <_cacache>` — the warmed npm cache.
 
-    Stage names are disjoint (`builder`/`final` from the go union vs `npm_fetch`),
-    so the three COPYs compose without collision. navidrome has NO self@B in
+    Stage names are disjoint (`builder`/`final` from the go union vs `go_fetch` vs
+    `npm_fetch`), so the COPYs compose without collision. navidrome has NO self@B in
     either cache (the Go self-module github.com/navidrome/* is never in the module
-    cache by construction; the UI package `"ui"` is private/unpublished), so there
-    is NO removal step — the generic audit (cache_forbid_globs target the go
-    modcache, which never holds the self-module) is a clean no-op.
+    cache by construction — `go mod download` only pulls dependencies, never the main
+    module; the UI package `"ui"` is private/unpublished), so there is NO removal step
+    — the generic audit (cache_forbid_globs target the go modcache, which never holds
+    the self-module) is a clean no-op.
     """
     if not milestones:
         print("Error: assemble_go_npm_dockerfile got no milestones", file=sys.stderr)
@@ -1609,6 +1760,12 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     go_cache_paths = [cp for cp in cache_paths if cp != npm_cacache] or cache_paths
     union = render_union_dockerfile(repo_lower, milestones, go_cache_paths)
     tc = pick_go_toolchain_milestone(milestones, target_go, _probe=_probe)
+    # The go module download cache the union COPYs into final; the go_fetch stage
+    # warms the SAME path with the full declared graph (`go mod download all`) so
+    # final can COPY both. Pick the modcache-looking go cache path (defensive).
+    go_modcache = next((cp for cp in go_cache_paths if "cache/download" in cp),
+                       _GO_MODCACHE_DIR)
+    go_fetch_stage = _go_fetch_stage(repo_lower, milestones, tc, go_modcache)
     # render_union_dockerfile already wrote the `final` stage with the go-cache COPY.
     # Split off its trailing so we can interleave: keep the union (incl. its `final`
     # stage header + go-cache COPY), then add the npm fetch stage as a SEPARATE
@@ -1637,15 +1794,17 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     union_body = union
     if union_body.startswith(syntax):
         union_body = union_body[len(syntax):]
-    # Tail appended to the union's (open) `final` stage: clean-replace toolchain then
-    # COPY the warmed npm _cacache. The `rm -rf` MUST precede the toolchain COPY
-    # (overlay would mix go1.24.4/go1.24.5 stdlib → `go build` fails); the _cacache
-    # COPY pulls from the npm_fetch stage defined at the top.
-    tail = ("RUN rm -rf /usr/local/go\n"
+    # Tail appended to the union's (open) `final` stage: COPY the online-fetched go
+    # module graph OVER the raw-cache union (additive, same-bytes-safe), clean-replace
+    # the toolchain, then COPY the warmed npm _cacache. The `rm -rf` MUST precede the
+    # toolchain COPY (overlay would mix go1.24.4/go1.24.5 stdlib → `go build` fails);
+    # the go_fetch / npm_fetch COPYs pull from the stages defined at the top.
+    tail = (f"COPY --from=go_fetch {go_modcache} {go_modcache}\n"
+            "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
             "ENV GOTOOLCHAIN=local\n"
             f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n")
-    return syntax + npm_stage + union_body + tail
+    return syntax + go_fetch_stage + npm_stage + union_body + tail
 
 
 def classify_go_npm_offline_build_failure(staging_tag: str,
@@ -2002,9 +2161,33 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                 sys.exit(1)
             _docker_build(df, staging_tag, project_root)
         elif eco == "go":
-            # Raw-cache rsync UNION of every milestone's go module cache, plus the
-            # newer go toolchain (COPY /usr/local/go from a milestone that reports
-            # the target version) + GOTOOLCHAIN=local in the final stage.
+            # ONLINE-fetch the UNION of every milestone's DECLARED module graph
+            # (`go mod download all`) into the module cache, laid OVER the raw-cache
+            # rsync UNION of the build-warmed caches, plus the newer go toolchain
+            # (COPY /usr/local/go from a milestone reporting the target version) +
+            # GOTOOLCHAIN=local in the final stage (assemble_go_dockerfile). The old
+            # raw-cache-only COPY was a closure gap: build-warmed module caches hold
+            # only what `go build ./...` COMPILED and MISS modules go.mod DECLARES but
+            # the build never imports (indirect-only / test-only deps — go-zero: 17
+            # such modules, e.g. cel.dev/expr, github.com/gorilla/websocket,
+            # github.com/IBM/sarama, declared in m013/m018/m020/m025 but absent from
+            # every milestone cache, so `go test`/`go mod download`/`go mod verify`
+            # would fail; same class as the maven-bcprov / npm-caniuse-lite gaps). The
+            # go_fetch stage is FROM base:latest (whose A-version cache is the starting
+            # point, so the union spans A→B), COPYs each milestone's go.mod+go.sum, and
+            # runs `go mod download all` (the FULL graph) per milestone — each ADDs its
+            # declared modules to the shared cache. proxy.golang.org serves third-party
+            # modules (the repo's own main module is never downloaded), so the
+            # build-time fetch is safe; the closure is sealed offline at eval. NO
+            # self@B removal (cache_forbid_globs target the modcache, which never holds
+            # the main module → the generic audit below is a clean no-op). The
+            # per-milestone B-source gate (go build -mod=mod ./..., GOPROXY=off)
+            # applies unchanged, with the go classifier.
+            #
+            # closure.go_mechanism (optional): "online-fetch" (default) is the path
+            # above; "raw-cache" is the legacy raw-cache-union-only escape (no online
+            # fetch) for parity/debugging — it does NOT close the declared-but-
+            # uncompiled gap and should only be used deliberately.
             cache_paths = cfg["cache_paths"]
             toolchain = cfg.get("toolchain") or {}
             target_go = toolchain.get("go")
@@ -2012,7 +2195,15 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                 print(f"Error: {repo_lower}: go ecosystem needs closure.toolchain.go "
                       f"(target go version)", file=sys.stderr)
                 sys.exit(1)
-            df = assemble_go_dockerfile(repo_lower, milestones, cache_paths, target_go)
+            go_mechanism = (cfg.get("go_mechanism") or "online-fetch").lower()
+            if go_mechanism not in ("online-fetch", "raw-cache"):
+                print(f"Error: {repo_lower}: unknown closure.go_mechanism "
+                      f"{go_mechanism!r} (want 'online-fetch' or 'raw-cache')",
+                      file=sys.stderr)
+                sys.exit(1)
+            df = assemble_go_dockerfile(
+                repo_lower, milestones, cache_paths, target_go,
+                online_fetch=(go_mechanism == "online-fetch"))
             _docker_build(df, staging_tag, project_root)
         elif eco == "maven":
             # ONLINE-fetch the UNION of every milestone's DECLARED deps into the
@@ -2062,7 +2253,13 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             # (cache_forbid_globs empty → the generic audit below is a clean no-op).
             # The per-milestone B-source gate (yarn install --offline
             # --frozen-lockfile) applies unchanged, with the npm/yarn classifier.
-            df = assemble_npm_dockerfile(repo_lower, milestones)
+            # closure.global_npm_tools (optional): SRS-declared global tools
+            # (e.g. serve@14.2.5) that are NOT in the yarn cache but are installed
+            # by milestones via `npm install -g`. Baked into the final stage ONLINE
+            # so milestones can use them without any offline install step.
+            global_npm_tools = cfg.get("global_npm_tools") or []
+            df = assemble_npm_dockerfile(repo_lower, milestones,
+                                         global_npm_tools=global_npm_tools or None)
             _docker_build(df, staging_tag, project_root)
         elif eco == "pip":
             # pip is ASSEMBLED, not cache-COPY'd: collect each milestone's
