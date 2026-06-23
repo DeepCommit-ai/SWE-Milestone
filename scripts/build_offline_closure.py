@@ -1,8 +1,18 @@
 """Unified offline closure builder. Union all milestone images' deps into a
 self-contained <repo>/base-offline:latest. See
 docs/superpowers/specs/2026-06-23-offline-closure-builder-design.md."""
-import argparse, subprocess, sys, yaml
+import argparse, glob as _glob, subprocess, sys, yaml
 from pathlib import Path
+
+def assert_no_self_packages(staging_dir: Path, forbid_globs: list[str]) -> None:
+    offending = []
+    for g in forbid_globs or []:
+        offending += _glob.glob(str(staging_dir / g))
+    if offending:
+        print(f"Error: closure contains forbidden self@B artifact(s): "
+              f"{sorted(offending)[:10]} — refusing to build (would leak the answer).",
+              file=sys.stderr)
+        sys.exit(1)
 
 def discover_milestone_images(repo_lower: str, _docker_images: str | None = None) -> list[str]:
     if _docker_images is None:

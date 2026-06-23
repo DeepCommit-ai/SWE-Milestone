@@ -35,6 +35,16 @@ def test_load_closure_config_returns_block(tmp_path):
     assert cfg["cache_paths"] == ["/c"]
     assert cfg["offline_build"] == "cargo build --offline"
 
+def test_assert_no_self_packages_fires(tmp_path):
+    (tmp_path / "org/apache/dubbo/dubbo-common/3.3.6").mkdir(parents=True)
+    (tmp_path / "org/apache/dubbo/dubbo-common/3.3.6/dubbo-common-3.3.6.jar").write_text("x")
+    with pytest.raises(SystemExit):
+        boc.assert_no_self_packages(tmp_path, ["org/apache/dubbo/*/3.3.[4-9]*"])
+
+def test_assert_no_self_packages_clean(tmp_path):
+    (tmp_path / "io/smallrye/mutiny/2.9.0").mkdir(parents=True)
+    boc.assert_no_self_packages(tmp_path, ["org/apache/dubbo/*/3.3.[4-9]*"])  # no raise
+
 def test_discover_excludes_base_and_dedups():
     fake = ("burntsushi_ripgrep_14.1.1_15.0.0/base:latest\n"
             "burntsushi_ripgrep_14.1.1_15.0.0/base-offline:latest\n"
