@@ -411,6 +411,134 @@ def assert_single_version_or_explain(reqs: list[str]) -> None:
               file=sys.stderr)
         sys.exit(1)
 
+
+def collect_pip_freezes(images: list[str]) -> list[str]:
+    """`docker run --rm <image> pip freeze` for each milestone → list of freeze
+    texts (read-only, never mutates the image).
+
+    The freeze is the dependency snapshot we union: M06's `RUN pip install`
+    additions (array-api-compat, array_api_strict) appear here even though they are
+    in no lockfile — that's the structural gap the host-built A-only wheelhouse
+    missed. Fail-closed if any freeze errors (a bad image / no pip): a missing
+    milestone's deps would silently drop out of the closure.
+    """
+    out = []
+    for img in images:
+        r = subprocess.run(["docker", "run", "--rm", img, "pip", "freeze"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"Error: `pip freeze` failed for milestone {img} "
+                  f"(exit {r.returncode}) — cannot collect its deps into the "
+                  f"closure:\n{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            sys.exit(1)
+        out.append(r.stdout or "")
+    return out
+
+
+def assemble_pip_dockerfile(repo_lower: str, reqs_basename: str,
+                            wheelhouse: str = "/wheelhouse",
+                            reqs_in_image: str = "/tmp/union_reqs.txt") -> str:
+    """Multi-stage pip closure Dockerfile.
+
+    Unlike the cache-COPY ecosystems (cargo/go/maven/npm union a milestone's raw
+    cache), pip BUILDS its closure: a `wheel_builder` stage runs `pip download -r
+    <union reqs> -d /wheelhouse` ONLINE in the repo's OWN base image (so the wheel
+    platform/python tags match the runtime exactly — no tag mismatch), and the
+    `final` stage (same base) carries `/wheelhouse` + the reqs file forward. The
+    reqs file is `COPY`'d from the build context (the driver writes it there).
+
+    `pip download` is given a one-version-per-package reqs file
+    (assert_single_version_or_explain guarantees this), so resolution can't hit
+    ResolutionImpossible. The reqs file is also present in the final image because
+    the offline gate / runtime installs with `-r <reqs_in_image>`.
+    """
+    return (
+        "# syntax=docker/dockerfile:1\n"
+        f"FROM {repo_lower}/base:latest AS wheel_builder\n"
+        f"COPY {reqs_basename} {reqs_in_image}\n"
+        # ONLINE download of the whole union into the wheelhouse. One version per
+        # package upstream, so no ResolutionImpossible.
+        f"RUN pip download -r {reqs_in_image} -d {wheelhouse}\n"
+        f"FROM {repo_lower}/base:latest AS final\n"
+        f"COPY --from=wheel_builder {wheelhouse} {wheelhouse}\n"
+        f"COPY {reqs_basename} {reqs_in_image}\n")
+
+
+def _wheel_is_forbidden(wheel_filename: str, forbid: list[str]) -> bool:
+    """True iff a wheel file's distribution name is in `forbid` (normalized).
+
+    A wheel filename is `{dist}-{version}(-{build})?-{py}-{abi}-{plat}.whl`; the
+    dist name is everything before the FIRST hyphen that begins the version. We
+    take the leading dist token and normalize (lower, `_`→`-`) — matching is on the
+    FULL dist name, never a prefix, so `scikit-image`/`scikit_image` and
+    `scikit-learn-extra` are NOT matched by a `scikit-learn` forbid entry (full-name
+    boundary). Only an exact normalized dist-name equality counts.
+    """
+    name = wheel_filename.strip()
+    if name.endswith(".whl"):
+        name = name[: -len(".whl")]
+    # dist name = text up to the first '-' (the version segment starts after it).
+    dist = name.split("-", 1)[0]
+    norm = dist.strip().lower().replace("_", "-")
+    fb = {f.strip().lower().replace("_", "-") for f in (forbid or [])}
+    return norm in fb
+
+
+def audit_wheelhouse_self_exclusion(staging_tag: str, forbid: list[str]) -> None:
+    """pip-specific in-image self-exclusion AUDIT (fail-closed).
+
+    The cache-COPY ecosystems audit host-glob paths inside the image
+    (audit_staging_image); pip's closure is a `/wheelhouse` of downloaded wheels, so
+    we instead `ls /wheelhouse` INSIDE the staging image and check each wheel's
+    normalized DIST name against `forbid`. A forbidden wheel (e.g.
+    `scikit_learn-1.6.0-…whl`, `sklearn-…whl`) means the offline index could serve
+    the repo's own answer → refuse (sys.exit 1). `scikit_image` wheels are KEPT —
+    the matcher is full-name, not prefix.
+    """
+    if not forbid:
+        return
+    r = subprocess.run(
+        ["docker", "run", "--rm", staging_tag, "sh", "-c",
+         "ls /wheelhouse 2>/dev/null; true"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"Error: wheelhouse audit docker run failed for {staging_tag} "
+              f"(exit {r.returncode}):\n{(r.stderr or r.stdout).strip()}",
+              file=sys.stderr)
+        sys.exit(1)
+    offending = [w for w in (r.stdout or "").split()
+                 if w.endswith(".whl") and _wheel_is_forbidden(w, forbid)]
+    if offending:
+        print(f"Error: offline closure AUDIT failed for {staging_tag}: /wheelhouse "
+              f"contains forbidden self@B wheel(s) — refusing (the offline index "
+              f"would serve the answer):\n{sorted(offending)[:10]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run_pip_offline_gate(staging_tag: str, offline_build: str) -> None:
+    """pip OFFLINE GATE: prove the whole union installs offline (fail-closed).
+
+    `docker run --rm --network none <staging> sh -c '<offline_build>'` where
+    offline_build is `pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt`.
+    EXIT 0 proves the entire union resolves from `/wheelhouse` with no network — so
+    every milestone's subset (a subset of the union) installs too. No `/testbed`
+    injection is needed (unlike the go/cargo build gate): pip's gate is a pure
+    install check, the milestone B-source is irrelevant. A non-zero install means a
+    needed wheel (or transitive) is missing from the closure → a real CLOSURE GAP →
+    sys.exit 1 with the install tail.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", staging_tag,
+         "sh", "-c", offline_build],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        tail = "\n".join(out.splitlines()[-40:])
+        print(f"Error: pip OFFLINE GATE failed for {staging_tag} (install exit "
+              f"{r.returncode}) — closure is INSUFFICIENT (a needed wheel/transitive "
+              f"is missing from /wheelhouse):\n{tail}", file=sys.stderr)
+        sys.exit(1)
+
 def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
     lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
              "RUN command -v rsync || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)"]
@@ -572,6 +700,78 @@ def _docker_build(dockerfile: str, tag: str, project_root: Path) -> None:
             pass
 
 
+def _build_pip_closure(repo_lower: str, project_root: Path, milestones: list[str],
+                       cfg: dict, staging_tag: str, latest_tag: str,
+                       push: bool, keep: bool) -> None:
+    """pip ASSEMBLY path (freeze → union → download → audit → gate → tag).
+
+    Self-contained: collects every milestone's `pip freeze`, unions them (dropping
+    editable/git/self-pkg lines), asserts one version per package, writes the reqs
+    into the build context, builds the multi-stage wheelhouse image, runs the
+    wheelhouse self-exclusion audit + the single-union offline-install gate, and on
+    all-green tags :latest. The reqs file in the build context is removed in a
+    `finally`; the staging image is cleaned up by the caller's `finally` (unless
+    keep). Fail-closed: a version conflict, forbidden wheel, or failed offline
+    install exits non-zero before :latest is tagged.
+    """
+    forbid = load_quarantine_yaml(repo_lower, project_root).get("wheelhouse_forbid") or []
+    offline_build = cfg["offline_build"]
+
+    print(f"pip: collecting `pip freeze` from {len(milestones)} milestone(s) ...",
+          flush=True)
+    freezes = collect_pip_freezes(milestones)
+    reqs = pip_union_requirements(freezes, forbid)
+    assert_single_version_or_explain(reqs)
+    print(f"pip: union has {len(reqs)} requirement(s) (forbid={list(forbid)})",
+          flush=True)
+
+    # Write the union reqs INTO the build context so the wheel_builder stage can
+    # `COPY` it. Named uniquely; removed in the finally so the repo tree stays clean.
+    import tempfile, os
+    fd, reqs_path = tempfile.mkstemp(prefix="union_reqs.", suffix=".txt",
+                                     dir=str(project_root))
+    reqs_basename = os.path.basename(reqs_path)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(reqs) + ("\n" if reqs else ""))
+        df = assemble_pip_dockerfile(repo_lower, reqs_basename)
+        _docker_build(df, staging_tag, project_root)
+
+        # 1) Wheelhouse self-exclusion AUDIT (fail-closed): no scikit_learn/sklearn
+        #    wheel may sit in /wheelhouse (would serve the answer offline). Keeps
+        #    scikit_image (full-name boundary, not a forbid match).
+        audit_wheelhouse_self_exclusion(staging_tag, forbid)
+        print(f"pip: wheelhouse audit clean: {staging_tag} "
+              f"(forbid={list(forbid)})", flush=True)
+
+        # 2) Offline GATE: the WHOLE union must `pip install --no-index` from
+        #    /wheelhouse with --network none. EXIT 0 ⇒ every milestone's subset
+        #    installs offline too. A non-zero is a real closure gap (missing wheel).
+        print(f"pip: offline gate (union install --network none) ...", flush=True)
+        run_pip_offline_gate(staging_tag, offline_build)
+        print(f"pip: offline gate PASS (union installs offline from /wheelhouse)",
+              flush=True)
+
+        # 3) All green → publish.
+        tr = subprocess.run(["docker", "tag", staging_tag, latest_tag])
+        if tr.returncode != 0:
+            print(f"Error: docker tag {staging_tag} -> {latest_tag} failed",
+                  file=sys.stderr)
+            sys.exit(tr.returncode)
+        if push:
+            pr = subprocess.run(["docker", "push", latest_tag])
+            if pr.returncode != 0:
+                print(f"Error: docker push {latest_tag} failed", file=sys.stderr)
+                sys.exit(pr.returncode)
+        print(f"SUCCESS: {latest_tag} published ({len(reqs)} wheel reqs, offline "
+              f"install gate passed{', pushed' if push else ''}).")
+    finally:
+        try:
+            os.unlink(reqs_path)
+        except OSError:
+            pass
+
+
 def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                   keep: bool = False) -> None:
     """Build, AUDIT, GATE, and tag the offline dependency closure for a repo.
@@ -623,7 +823,16 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             # driver wiring (+ build) is a later task. Don't half-build it here.
             raise NotImplementedError(f"ecosystem {eco}: task 4.4")
         elif eco == "pip":
-            raise NotImplementedError(f"ecosystem {eco}: task 4.5 (freeze-union-download)")
+            # pip is ASSEMBLED, not cache-COPY'd: collect each milestone's
+            # `pip freeze`, union (dropping editable/git/self entries), assert one
+            # version per package, then `pip download` the union into an in-image
+            # /wheelhouse (online, in the repo's OWN base so wheel tags match). The
+            # audit + gate are pip-specific (wheelhouse glob, single union install),
+            # so this branch is self-contained and returns — the generic
+            # host-glob audit / per-milestone B-source gate below do not apply.
+            _build_pip_closure(repo_lower, project_root, milestones, cfg,
+                               staging_tag, latest_tag, push, keep)
+            return
         else:
             print(f"Error: {repo_lower}: unsupported ecosystem {eco!r}", file=sys.stderr)
             sys.exit(1)

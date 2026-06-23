@@ -603,3 +603,235 @@ def test_missing_gosum_plain_module_still_works(monkeypatch):
         "r/x/base-offline:staging",
         "missing go.sum entry for module github.com/some/dep\n")
     assert kind == "source_state"
+
+
+# ---- Task 4.5: pip ecosystem assembly (freeze → union → download) ------------
+
+def test_collect_pip_freezes_runs_each_image(monkeypatch):
+    """One `docker run --rm <m> pip freeze` per milestone; returns the texts."""
+    seen = []
+    def fake_run(cmd, *a, **k):
+        # docker run --rm <image> pip freeze
+        assert cmd[:3] == ["docker", "run", "--rm"]
+        assert cmd[-2:] == ["pip", "freeze"]
+        img = cmd[-3]
+        seen.append(img)
+        return _R(0, f"numpy==2.4.1\n# from {img}\n")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    out = boc.collect_pip_freezes(["r/x/m01:latest", "r/x/m06:latest"])
+    assert seen == ["r/x/m01:latest", "r/x/m06:latest"]
+    assert len(out) == 2
+    assert "numpy==2.4.1" in out[0]
+
+
+def test_collect_pip_freezes_fail_exits(monkeypatch):
+    """A `pip freeze` non-zero (bad image / no pip) is fail-closed."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(1, "", "no such image"))
+    with pytest.raises(SystemExit):
+        boc.collect_pip_freezes(["r/x/m01:latest"])
+
+
+def test_assemble_pip_dockerfile_two_stage_wheel_builder():
+    """Multi-stage: wheel_builder does `pip download -r <reqs> -d /wheelhouse`
+    off base:latest; final COPYs /wheelhouse + the reqs file back in."""
+    df = boc.assemble_pip_dockerfile("r/x", "union_reqs.txt")
+    # builder stage off base:latest
+    assert "FROM r/x/base:latest AS wheel_builder" in df
+    # copies the reqs from the build context and downloads into /wheelhouse (online)
+    assert "COPY union_reqs.txt /tmp/union_reqs.txt" in df
+    assert "pip download -r /tmp/union_reqs.txt -d /wheelhouse" in df
+    # final stage off the SAME base, carrying the wheelhouse + reqs
+    assert "FROM r/x/base:latest AS final" in df
+    assert "COPY --from=wheel_builder /wheelhouse /wheelhouse" in df
+    # the reqs file must also exist in the final image (gate -r reads it)
+    assert df.count("COPY union_reqs.txt /tmp/union_reqs.txt") == 2
+    # ordering: builder download BEFORE final COPY of the wheelhouse
+    assert df.index("pip download") < df.index("COPY --from=wheel_builder")
+
+
+def test_audit_wheelhouse_self_exclusion_empty_forbid_noop(monkeypatch):
+    """No forbid names → no docker run, just return (nothing to audit)."""
+    called = []
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: called.append(a) or _R(0, ""))
+    boc.audit_wheelhouse_self_exclusion("r/x/base-offline:staging", [])
+    assert called == []
+
+
+def test_audit_wheelhouse_self_exclusion_clean_passes(monkeypatch):
+    """Forbid names present but no matching wheel in /wheelhouse → return, no exit.
+    Runs an in-image `ls /wheelhouse` against the staging image."""
+    captured = {}
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _R(0, "")   # empty = no forbidden wheel
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.audit_wheelhouse_self_exclusion(
+        "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+    assert captured["cmd"][:3] == ["docker", "run", "--rm"]
+    assert "r/x/base-offline:staging" in captured["cmd"]
+    assert "/wheelhouse" in " ".join(captured["cmd"])
+
+
+def test_audit_wheelhouse_self_exclusion_forbidden_wheel_exits(monkeypatch):
+    """A forbidden wheel in /wheelhouse (the answer would be served) → sys.exit(1)."""
+    monkeypatch.setattr(
+        boc.subprocess, "run",
+        lambda *a, **k: _R(0, "scikit_learn-1.6.0-cp310-cp310-linux_x86_64.whl\n"))
+    with pytest.raises(SystemExit) as e:
+        boc.audit_wheelhouse_self_exclusion(
+            "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+    assert e.value.code == 1
+
+
+def test_audit_wheelhouse_self_exclusion_full_name_boundary():
+    """scikit-image / scikit_image are NOT a forbid match for scikit-learn — the
+    matcher must use the wheel's full normalized DIST name, not a prefix. This
+    tests the pure name-matcher (no docker)."""
+    forbid = ["scikit-learn", "scikit_learn", "sklearn"]
+    # forbidden
+    assert boc._wheel_is_forbidden("scikit_learn-1.6.0-cp310-cp310-linux_x86_64.whl", forbid)
+    assert boc._wheel_is_forbidden("sklearn-0.0-py3-none-any.whl", forbid)
+    # NOT forbidden — full-name boundary (scikit_image is a legit third-party dep)
+    assert not boc._wheel_is_forbidden("scikit_image-0.26.0-cp310-cp310-linux_x86_64.whl", forbid)
+    assert not boc._wheel_is_forbidden("scikit_learn_extra-0.3.0-py3-none-any.whl", forbid)
+    assert not boc._wheel_is_forbidden("numpy-2.4.1-cp310-cp310-linux_x86_64.whl", forbid)
+
+
+def test_audit_wheelhouse_self_exclusion_match_among_many(monkeypatch):
+    """Given a /wheelhouse listing with many wheels incl. scikit_image (keep) and
+    a scikit_learn (forbidden), the audit must fire on the scikit_learn only."""
+    listing = ("array_api_compat-1.13.0-py3-none-any.whl\n"
+               "array_api_strict-2.4.1-py3-none-any.whl\n"
+               "scikit_image-0.26.0-cp310-cp310-linux_x86_64.whl\n"
+               "numpy-2.4.1-cp310-cp310-linux_x86_64.whl\n"
+               "scikit_learn-1.6.0-cp310-cp310-linux_x86_64.whl\n")
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, listing))
+    with pytest.raises(SystemExit):
+        boc.audit_wheelhouse_self_exclusion(
+            "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+
+
+def test_run_pip_offline_gate_install_ok_no_exit(monkeypatch):
+    """`pip install --no-index` of the union exits 0 → no raise. Runs the staging
+    image with --network none (no /testbed injection needed for pip)."""
+    captured = {}
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _R(0, "Successfully installed numpy-2.4.1\n")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.run_pip_offline_gate(
+        "r/x/base-offline:staging",
+        "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt")
+    run = captured["cmd"]
+    assert run[:3] == ["docker", "run", "--rm"]
+    assert "--network" in run and "none" in run
+    assert "r/x/base-offline:staging" in run
+    joined = " ".join(run)
+    assert "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt" in joined
+    # pip gate must NOT bind-mount a milestone /testbed (unlike the go/cargo gate)
+    assert not any(isinstance(x, str) and x.endswith(":/testbed") for x in run)
+
+
+def test_run_pip_offline_gate_install_fail_exits(monkeypatch):
+    """A non-zero `pip install` offline = a needed wheel is missing → sys.exit(1)."""
+    monkeypatch.setattr(
+        boc.subprocess, "run",
+        lambda *a, **k: _R(1, "", "ERROR: No matching distribution found for foo==1.0"))
+    with pytest.raises(SystemExit) as e:
+        boc.run_pip_offline_gate(
+            "r/x/base-offline:staging",
+            "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt")
+    assert e.value.code == 1
+
+
+def test_build_closure_pip_branch_wires_freeze_union_audit_gate(monkeypatch, tmp_path):
+    """End-to-end-ish (all docker mocked): the pip branch in build_closure collects
+    freezes, unions+asserts, builds the staging image, runs the wheelhouse audit and
+    the pip offline gate, then tags :latest. Asserts the call ORDER and that the
+    reqs handed to download exclude scikit-learn but include array-api-compat."""
+    # quarantine config: pip ecosystem, forbid sklearn family
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "sk.yaml").write_text(
+        "ecosystem: [pip]\n"
+        "wheelhouse_forbid: [scikit-learn, scikit_learn, sklearn]\n"
+        "closure:\n"
+        "  cache_paths: []\n"
+        "  offline_build: 'pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt'\n")
+
+    events = []
+    # milestone discovery → two fake milestones
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["sk/m01:latest", "sk/m06:latest"])
+    # freeze: base-like m01 lacks array-api; m06 has it + the editable comment + scikit
+    def fake_collect(images):
+        events.append(("freeze", list(images)))
+        return [
+            "numpy==2.4.1\nscikit-image==0.26.0\n",
+            "numpy==2.4.1\narray-api-compat==1.13.0\narray_api_strict==2.4.1\n"
+            "scikit-image==0.26.0\n# Editable install scikit-learn==1.6.dev0\n",
+        ]
+    monkeypatch.setattr(boc, "collect_pip_freezes", fake_collect)
+
+    built = {}
+    def fake_build(df, tag, root):
+        events.append(("build", tag))
+        built["df"] = df
+        built["tag"] = tag
+        # capture the reqs file the dockerfile references and that it was written
+        # to the build context
+        ctx_reqs = list(Path(root).glob("union_reqs*.txt"))
+        built["reqs_files"] = ctx_reqs
+        built["reqs_text"] = ctx_reqs[0].read_text() if ctx_reqs else ""
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_wheelhouse_self_exclusion",
+                        lambda tag, forbid: events.append(("audit", tag, tuple(forbid))))
+    monkeypatch.setattr(boc, "run_pip_offline_gate",
+                        lambda tag, ob: events.append(("gate", tag)))
+    # docker tag / rmi
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            events.append(("tag", cmd[2], cmd[3]))
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    boc.build_closure("sk", tmp_path, push=False, keep=True)
+
+    kinds = [e[0] for e in events]
+    # freeze BEFORE build BEFORE audit BEFORE gate BEFORE tag
+    assert kinds.index("freeze") < kinds.index("build") < kinds.index("audit") \
+        < kinds.index("gate") < kinds.index("tag")
+    # staging built, :latest tagged
+    assert built["tag"] == "sk/base-offline:staging"
+    assert ("tag", "sk/base-offline:staging", "sk/base-offline:latest") in events
+    # the reqs handed to the wheel_builder: array-api-compat IN, scikit-learn OUT
+    assert "array-api-compat==1.13.0" in built["reqs_text"]
+    assert "array_api_strict==2.4.1" in built["reqs_text"]
+    assert "scikit-image==0.26.0" in built["reqs_text"]   # legit dep kept
+    assert "scikit-learn" not in built["reqs_text"]
+    assert "scikit_learn" not in built["reqs_text"]
+    # audit got the forbid list from the yaml
+    audit_ev = next(e for e in events if e[0] == "audit")
+    assert audit_ev[2] == ("scikit-learn", "scikit_learn", "sklearn")
+
+
+def test_build_closure_pip_branch_multi_version_exits(monkeypatch, tmp_path):
+    """If two milestones freeze the SAME package at different versions, the pip
+    branch fail-closes (assert_single_version_or_explain) before building."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "sk.yaml").write_text(
+        "ecosystem: [pip]\n"
+        "wheelhouse_forbid: [scikit-learn]\n"
+        "closure:\n"
+        "  cache_paths: []\n"
+        "  offline_build: 'pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt'\n")
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["sk/m01:latest", "sk/m06:latest"])
+    monkeypatch.setattr(boc, "collect_pip_freezes",
+                        lambda images: ["numpy==2.4.1\n", "numpy==2.5.0\n"])
+    monkeypatch.setattr(boc, "_docker_build",
+                        lambda *a, **k: pytest.fail("must not build on version conflict"))
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, ""))
+    with pytest.raises(SystemExit):
+        boc.build_closure("sk", tmp_path, push=False, keep=True)
