@@ -43,3 +43,19 @@ def load_closure_config(repo_lower: str, project_root: Path) -> dict:
     if not closure or "cache_paths" not in closure or "offline_build" not in closure:
         print(f"Error: {conf}: closure block must have cache_paths and offline_build", file=sys.stderr); sys.exit(1)
     return closure
+
+def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
+    lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
+             "RUN command -v rsync || (apt-get update && apt-get install -y rsync) || true"]
+    for i, m in enumerate(milestones):
+        for j, cp in enumerate(cache_paths):
+            lines.append(f"COPY --from={m} {cp} /milestone_{i}_{j}{cp}")
+    # rsync-merge each milestone subtree into /staging (same-bytes dedup is harmless)
+    merge = " && ".join(
+        f"rsync -a /milestone_{i}_{j}{cp}/ /staging{cp}/"
+        for i in range(len(milestones)) for j, cp in enumerate(cache_paths))
+    lines.append(f"RUN mkdir -p /staging && {merge or 'true'}")
+    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    for cp in cache_paths:
+        lines.append(f"COPY --from=builder /staging{cp} {cp}")
+    return "\n".join(lines) + "\n"

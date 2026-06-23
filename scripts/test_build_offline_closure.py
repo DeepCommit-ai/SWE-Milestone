@@ -53,3 +53,12 @@ def test_discover_excludes_base_and_dedups():
             "other_repo/m01:latest\n")
     got = boc.discover_milestone_images("burntsushi_ripgrep_14.1.1_15.0.0", _docker_images=fake)
     assert got == ["burntsushi_ripgrep_14.1.1_15.0.0/m01:latest"]
+
+def test_render_union_dockerfile_structure():
+    df = boc.render_union_dockerfile(
+        "r/x", ["r/x/m01:latest", "r/x/m02:latest"], ["/usr/local/cargo/registry/cache"])
+    assert "FROM r/x/base:latest AS final" in df
+    assert df.count("COPY --from=r/x/m01:latest") >= 1
+    assert df.count("COPY --from=r/x/m02:latest") >= 1
+    assert "rsync" in df
+    assert "COPY --from=builder /staging" in df
