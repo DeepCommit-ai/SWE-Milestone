@@ -466,3 +466,140 @@ def test_probe_go_version_returns_empty_on_failure(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(1, "", "no such image"))
     assert boc._probe_go_version("r/x/nope:latest") == ""
+
+
+# ---- Fix 1: @v-sound probe —————————————————————————————————————————————————
+# These tests pin the CRITICAL soundness fix: _go_cache_has_path must check
+# <path>/@v (not just the parent dir). Before the fix, a parent org-dir hit
+# (e.g. github.com/go-redis/) would cause a false HIT even when the specific
+# module's @v dir was absent.
+
+def test_go_cache_probe_parent_dir_only_is_miss(monkeypatch):
+    """Parent org-dir exists but /@v does NOT → probe returns False → closure_gap.
+
+    This is the soundness bug: the old `[ -d "$d" ]` would HIT on the parent dir
+    github.com/go-redis/ even when github.com/go-redis/redis/v8/@v is absent.
+    The fixed probe uses `[ -d "$d/@v" ]` so the parent-only case is a MISS.
+    """
+    captured_cmds = []
+
+    def fake_run(cmd, *a, **k):
+        captured_cmds.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            # Simulate: parent dirs exist as plain dirs, but none have @v.
+            # The fixed probe tests each candidate as "$d/@v" — no HIT returned.
+            return _R(0, "")   # empty stdout → no HIT
+        return _R(0, "")
+
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    result = boc._go_cache_has_path("r/x/base-offline:staging",
+                                    "github.com/go-redis/redis/v8")
+    assert result is False   # must be False (miss): parent dir ≠ @v present
+
+
+def test_go_cache_probe_at_v_present_is_hit(monkeypatch):
+    """<path>/@v exists in the container → probe returns True → source_state."""
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "run"]:
+            # The shell for-loop finds a candidate whose /@v dir exists → HIT.
+            return _R(0, "HIT\n")
+        return _R(0, "")
+
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    result = boc._go_cache_has_path("r/x/base-offline:staging",
+                                    "github.com/go-redis/redis/v8")
+    assert result is True   # @v present → source_state path
+
+
+def test_go_cache_probe_shell_uses_at_v(monkeypatch):
+    """The shell command sent to docker run must test `$d/@v`, not just `$d`."""
+    captured = {}
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _R(0, "")
+
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc._go_cache_has_path("r/x/base-offline:staging", "github.com/foo/bar")
+    sh_cmd = " ".join(captured.get("cmd", []))
+    # Must contain the @v suffix in the directory test — NOT just `[ -d "$d" ]`
+    assert '[ -d "$d/@v" ]' in sh_cmd
+    assert '[ -d "$d" ] ' not in sh_cmd  # old pattern must NOT be present
+
+
+def test_classify_missing_from_cache_is_gap_at_v(monkeypatch):
+    """classify uses _go_cache_has_path; when @v absent → closure_gap (end-to-end)."""
+    # Simulate: docker run for probe returns no HIT (the @v dir is absent)
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, ""))   # no HIT → miss
+    kind, detail = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "x.go:1:2: no required module provides package github.com/go-redis/redis/v8;\n")
+    assert kind == "closure_gap"
+    assert "github.com/go-redis/redis/v8" in detail
+
+
+# ---- Fix 2: GOPROXY=off in go gate ————————————————————————————————————————
+
+def test_run_offline_gate_go_sets_goproxy_off(monkeypatch):
+    """`goproxy_off=True` must inject `-e GOPROXY=off` into the docker run argv."""
+    docker_run_args = []
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            docker_run_args.extend(cmd)
+            return _R(0, "")
+        return _R(0, "")
+
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                         "go build ./...", goproxy_off=True)
+    joined = " ".join(docker_run_args)
+    assert "-e" in docker_run_args and "GOPROXY=off" in docker_run_args
+
+
+def test_run_offline_gate_non_go_no_goproxy(monkeypatch):
+    """`goproxy_off=False` (default, non-go) must NOT inject GOPROXY=off."""
+    docker_run_args = []
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            docker_run_args.extend(cmd)
+            return _R(0, "")
+        return _R(0, "")
+
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                         "cargo build --offline")  # no goproxy_off kwarg
+    assert "GOPROXY=off" not in docker_run_args
+
+
+# ---- Fix 3: missing go.sum entry for module providing package regex ————————
+
+def test_missing_gosum_providing_package_extracted(monkeypatch):
+    """The 'providing package' variant captures the package path, not 'providing'."""
+    # No probe needed: we're testing token extraction only (compile error path).
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, "HIT\n"))
+    kind, detail = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "verifier/foo.go:5:2: missing go.sum entry for module providing package "
+        "github.com/foo/bar/baz; to add:\n\tgo mod tidy\n")
+    # Token extracted should be the package path, not the word "providing"
+    assert kind == "source_state"   # HIT in cache → source_state
+    assert "providing" not in detail or "github.com/foo/bar/baz" in detail
+
+
+def test_missing_gosum_plain_module_still_works(monkeypatch):
+    """The plain 'missing go.sum entry for module <module>' variant still works."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, "HIT\n"))
+    kind, _ = boc.classify_offline_build_failure(
+        "r/x/base-offline:staging",
+        "missing go.sum entry for module github.com/some/dep\n")
+    assert kind == "source_state"

@@ -217,6 +217,9 @@ _GO_MISSING_TOKEN_RES = [
     _re.compile(r"no required module provides package ([^\s;]+)"),
     _re.compile(r"finding module for package ([^\s;]+)"),
     _re.compile(r"cannot find module providing package ([^\s;]+)"),
+    # More-specific pattern first: "missing go.sum entry for module providing package <pkg>"
+    _re.compile(r"missing go\.sum entry for module providing package ([^\s;]+)"),
+    # Fallback: "missing go.sum entry for module <module>" (plain module path, not a package)
     _re.compile(r"missing go\.sum entry for module ([^\s;]+)"),
     _re.compile(r"^\s*([\w.\-/]+@[^\s:]+): .*(?:GOPROXY|network is unreachable|"
                 r"module lookup disabled)", _re.MULTILINE),
@@ -230,20 +233,34 @@ def _go_cache_has_path(staging_tag: str, import_or_module: str) -> bool:
     `github.com/go-redis/redis/v8` or `.../redis/v8/internal`) or a
     `module@version`. The download cache is keyed by *module* path, so we strip any
     `@version` and walk prefixes of the slash-path (longest first) looking for a
-    populated `…/cache/download/<prefix>` dir. A hit means the bytes are present and
-    the build failure is a go.mod/source-state issue, not a closure gap.
+    populated `…/cache/download/<prefix>/@v` dir. A hit means the bytes are present
+    and the build failure is a go.mod/source-state issue, not a closure gap.
+
+    Classifier semantics (SOUND + SAFE, fail-closed):
+    - cited missing module has <path>/@v in cache → source_state (the build failure
+      is a go.mod/source mismatch or compile error, not a missing dependency).
+    - cited module's @v ABSENT from cache → closure_gap (conservative: fail-closed;
+      never false-pass).
+    - unknown/no-token error → closure_gap (fail-closed), handled by the caller.
+
+    The `@v` sub-dir check (not just the parent org-dir) is critical for soundness:
+    the module cache stores a downloaded module at
+    /go/pkg/mod/cache/download/<module-path>/@v/; testing only the parent dir
+    (e.g. github.com/go-redis/) would HIT on an org dir even when the specific
+    module version was never fetched.
     """
     path = import_or_module.split("@", 1)[0].strip().strip("/")
     if not path:
         return False
     parts = path.split("/")
     # Probe longest→shortest prefix: the module path is a prefix of the import path.
+    # Each candidate must have an @v sub-dir to be a valid cache hit.
     cands = ["/go/pkg/mod/cache/download/" + "/".join(parts[:n])
              for n in range(len(parts), 0, -1)]
     quoted = " ".join(f"'{c}'" for c in cands)
     r = subprocess.run(
         ["docker", "run", "--rm", staging_tag, "sh", "-c",
-         f"for d in {quoted}; do [ -d \"$d\" ] && {{ echo HIT; break; }}; done; true"],
+         f"for d in {quoted}; do [ -d \"$d/@v\" ] && {{ echo HIT; break; }}; done; true"],
         capture_output=True, text=True)
     return "HIT" in (r.stdout or "")
 
@@ -283,7 +300,8 @@ def classify_offline_build_failure(staging_tag: str, output: str) -> tuple[str, 
             f"(go.mod/source inconsistency, not a gap): {tokens[:8]}")
 
 
-def run_offline_gate(staging_tag: str, milestone: str, offline_build: str) -> str:
+def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
+                     goproxy_off: bool = False) -> str:
     """Per-milestone OFFLINE GATE: prove the closure is sufficient to build the
     milestone's B-source with no network.
 
@@ -291,6 +309,13 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str) -> st
     A-baseline baked into the staging image. We materialise it on the host via an
     ephemeral `docker create`/`cp`/`rm`, bind-mount it over `/testbed`, and run
     `cd /testbed && <offline_build>` with `--network none`.
+
+    For go ecosystems, pass `goproxy_off=True` to also set `-e GOPROXY=off` in the
+    docker run. Without GOPROXY=off, a genuinely-missing module yields a network
+    error prefixed `go: <module>@v: dial tcp ...` that escapes the classifier's
+    `^<module@version>:` pattern (fail-OPEN). With GOPROXY=off, missing modules
+    deterministically produce `module lookup disabled by GOPROXY=off`, which is a
+    recognized closure-gap token.
 
     Outcome:
       - build exit 0 → return "PASS".
@@ -325,12 +350,15 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str) -> st
             subprocess.run(["docker", "rm", cid],
                           capture_output=True, text=True)
         # Bind-mount the milestone's /testbed over the image's baseline and build
-        # fully offline.
-        run = subprocess.run(
-            ["docker", "run", "--rm", "--network", "none",
-             "-v", f"{hosttmp}/testbed:/testbed", staging_tag,
-             "sh", "-c", f"cd /testbed && {offline_build}"],
-            capture_output=True, text=True)
+        # fully offline. For go ecosystems, also set GOPROXY=off so missing modules
+        # produce a deterministic "module lookup disabled by GOPROXY=off" token
+        # (without it, dial-tcp errors escape the classifier and cause fail-OPEN).
+        docker_run_argv = ["docker", "run", "--rm", "--network", "none"]
+        if goproxy_off:
+            docker_run_argv += ["-e", "GOPROXY=off"]
+        docker_run_argv += ["-v", f"{hosttmp}/testbed:/testbed", staging_tag,
+                            "sh", "-c", f"cd /testbed && {offline_build}"]
+        run = subprocess.run(docker_run_argv, capture_output=True, text=True)
         if run.returncode == 0:
             return "PASS"
         out = ((run.stdout or "") + (run.stderr or "")).strip()
@@ -611,10 +639,15 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         #    milestone's own source/go.mod is inconsistent though the closure has
         #    the bytes) is recorded but does NOT block publish — the closure is not
         #    at fault.
+        # For go ecosystems set GOPROXY=off so missing modules produce a
+        # deterministic "module lookup disabled by GOPROXY=off" classifier token
+        # (without it, dial-tcp errors escape the pattern and cause fail-OPEN).
+        gate_goproxy_off = (eco == "go")
         source_state = []
         for i, m in enumerate(milestones, 1):
             print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
-            result = run_offline_gate(staging_tag, m, offline_build)
+            result = run_offline_gate(staging_tag, m, offline_build,
+                                     goproxy_off=gate_goproxy_off)
             if result == "SOURCE_STATE":
                 source_state.append(m)
                 print(f"offline gate [{i}/{len(milestones)}] {m}: SOURCE-STATE "
