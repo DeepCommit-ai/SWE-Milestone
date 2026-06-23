@@ -432,18 +432,6 @@ def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
     return "\n".join(lines) + "\n"
 
 
-def offline_gate_cmd(staging_image: str, milestone: str, offline_build: str) -> list[str]:
-    # NOTE: /testbed inside the container should contain the B-source from `milestone`,
-    # NOT the A-baseline baked into `staging_image`. This function returns the command
-    # skeleton; the driver (Task 4.2/4.3) is responsible for injecting the milestone's
-    # /testbed — either via `docker create <milestone>` + `docker cp <cid>:/testbed` +
-    # `-v <host_path>:/testbed:ro`, or via `COPY --from=<milestone> /testbed /verify_testbed`
-    # at assembly time. Until injection is wired, the staging image's own /testbed
-    # (A-baseline) is used as a placeholder.
-    return ["docker", "run", "--rm", "--network", "none", staging_image,
-            "sh", "-c", f"cd /testbed && {offline_build}"]
-
-
 def audit_staging_image(staging_tag: str, forbid_globs: list[str]) -> None:
     """In-image self-exclusion AUDIT: run the cache_forbid_globs INSIDE the
     staging image and fail-closed if any glob matches (self@B leaked).
@@ -1887,8 +1875,8 @@ def classify_go_npm_offline_build_failure(staging_tag: str,
 
 
 # --------------------------------------------------------------------------- #
-# Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
-# tag/publish are Task 4.3 and are intentionally NOT done here.                #
+# Driver: build staging → in-image self-exclusion audit → per-milestone        #
+# offline gate → tag/publish base-offline:latest (fail-closed at each step).    #
 # --------------------------------------------------------------------------- #
 
 def _ecosystems_of(repo_lower: str, project_root: Path) -> list[str]:
@@ -2428,9 +2416,9 @@ def main(argv=None):
     ap.add_argument("--repo", required=True,
                     help="repo id, e.g. burntsushi_ripgrep_14.1.1_15.0.0")
     ap.add_argument("--push", action="store_true",
-                    help="(Task 4.3) push the published image")
+                    help="push the published base-offline:latest image")
     ap.add_argument("--keep-staging", action="store_true",
-                    help="keep the staging image (default: kept; cleanup is Task 4.3)")
+                    help="keep the staging image (default: removed after tagging)")
     args = ap.parse_args(argv)
     root = Path(__file__).resolve().parent.parent
     build_closure(args.repo.lower(), root, args.push, args.keep_staging)

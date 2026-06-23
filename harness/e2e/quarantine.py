@@ -11,7 +11,6 @@ consume those vars. See docs/quarantine.md.
 from __future__ import annotations
 
 import ipaddress
-import os
 import sys
 from pathlib import Path
 
@@ -58,37 +57,6 @@ def cidr_overlaps_any(cidr: str, deny_cidrs: list[str]) -> bool:
         except ValueError:
             continue
     return False
-
-
-def _assert_wheelhouse_excludes(wheelhouse: str, forbid: list[str]) -> None:
-    """Fail closed if the offline quarantine wheelhouse contains an artifact
-    whose distribution name matches a forbidden prefix (the repo-under-test's own
-    package). Without this, an un-audited wheelhouse could silently serve the
-    answer offline via PIP_FIND_LINKS, defeating the network deny.
-
-    NOTE: This function is no longer called at runtime — the equivalent audit
-    (audit_wheelhouse_self_exclusion) now runs at BUILD TIME inside
-    scripts/build_offline_closure.py (Phase 2.1). Kept here for reference.
-    """
-    norm_forbid = [f.strip().lower().replace("_", "-") for f in forbid if f.strip()]
-    if not norm_forbid:
-        return
-    offending = []
-    for name in os.listdir(wheelhouse):
-        low = name.lower().replace("_", "-")
-        if not low.endswith((".whl", ".tar.gz", ".zip")):
-            continue
-        if any(low.startswith(pref + "-") for pref in norm_forbid):
-            offending.append(name)
-    if offending:
-        print(
-            f"Error: quarantine wheelhouse {wheelhouse} contains forbidden "
-            f"artifact(s) {sorted(offending)} matching wheelhouse_forbid={forbid}. "
-            f"Refusing to run — this would serve the repo's own target source "
-            f"offline. Rebuild the offline-closure image with scripts/build_offline_closure.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
 
 def load_quarantine_config(repo_name: str, project_root: Path) -> dict | None:
