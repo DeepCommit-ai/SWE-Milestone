@@ -471,6 +471,79 @@ def classify_maven_offline_build_failure(self_at_b_globs: list[str]):
     return _classify
 
 
+# Yarn(-classic) offline-resolution failure signatures. Under
+# `yarn install --offline`, a package whose bytes are NOT in the cache surfaces as
+# one of these, OR as a network attempt (yarn falling back to the registry despite
+# --offline — itself proof the package is missing from the cache). Each is a real
+# CLOSURE GAP. Matched case-insensitively against the combined stdout+stderr.
+_NPM_CLOSURE_GAP_SIGS = [
+    _re.compile(r"error Couldn't find any versions for", _re.IGNORECASE),
+    _re.compile(r"Couldn't find package", _re.IGNORECASE),
+    _re.compile(r"No matching version found", _re.IGNORECASE),
+    # yarn's offline-cache-miss ENOENT (the tarball isn't in the offline mirror).
+    _re.compile(r"error An unexpected error occurred:.*ENOENT.*\.yarn-cache",
+                _re.IGNORECASE | _re.DOTALL),
+    # THE canonical yarn-classic offline cache-miss: yarn needs a tarball/version it
+    # cannot serve from the mirror and would have to fetch, so under --offline it
+    # aborts `error Can't make a request in offline mode ("<registry-url>")`. This is
+    # the most common gap signal (e.g. caniuse-lite-1.0.x missing from the union) —
+    # a network attempt blocked by --offline = the bytes weren't in the cache.
+    _re.compile(r"Can't make a request in offline mode", _re.IGNORECASE),
+    # Defensive: any other "<verb> in offline mode" abort that names a registry/http
+    # URL is yarn refusing a network fetch it needed → the package wasn't cached.
+    _re.compile(r"in offline mode.*https?://", _re.IGNORECASE | _re.DOTALL),
+    # A network attempt under --offline = the package wasn't served from the cache.
+    _re.compile(r"request to https?://registry", _re.IGNORECASE),
+]
+
+
+def classify_npm_offline_build_failure(staging_tag: str, output: str) -> tuple[str, str]:
+    """npm/yarn offline-build failure classifier `(staging_tag, output) ->
+    (kind, detail)` for `run_offline_gate`.
+
+    The go/maven classifiers don't recognise yarn's offline-resolution strings, so a
+    yarn `--offline` failure would fall through to a "no token" → source_state branch
+    (fail-OPEN, masking a real gap). This classifier instead pattern-matches yarn's
+    cache-miss / registry-request signatures:
+      - ANY of _NPM_CLOSURE_GAP_SIGS present (`Couldn't find any versions for`,
+        `Couldn't find package`, `No matching version found`, an ENOENT against the
+        yarn cache, the canonical `Can't make a request in offline mode ("<url>")`,
+        or a `request to https://registry…` — a network attempt under --offline is
+        itself proof the bytes weren't in the cache) → "closure_gap": the offline
+        mirror is genuinely missing a needed package → BLOCK.
+      - A `--frozen-lockfile` integrity failure (the milestone's yarn.lock disagrees
+        with package.json / node_modules — a mid-change SOURCE state, the bytes ARE
+        in the cache) → "source_state": not a closure gap.
+      - Any other non-zero with no gap signature (a webpack/tsc/eslint build or lint
+        error, a `package.json: command not found` script failure) → "source_state":
+        a compile/lint/script error is not a missing dependency.
+
+    `staging_tag` is accepted for signature-compatibility with the go classifier but
+    unused — the yarn decision is pure-text (no in-image cache probe is needed: a
+    cache-miss or registry-request string is definitive). Fail-closed: when a gap
+    signature is present we BLOCK; when none is, the only non-gap explanations are
+    frozen-lockfile/compile/lint, so source_state is the sound call.
+    """
+    text = output or ""
+    for rx in _NPM_CLOSURE_GAP_SIGS:
+        if rx.search(text):
+            return ("closure_gap",
+                    f"yarn offline resolution gap (missing from cache): "
+                    f"matched {rx.pattern!r}")
+    # No cache-miss / registry-request signature. A frozen-lockfile integrity error
+    # is a yarn.lock-vs-tree mismatch (source-state, the cache has the bytes); any
+    # other non-zero is a webpack/tsc/eslint/script failure — neither is a gap.
+    if _re.search(r"frozen-?lockfile|lockfile.*(?:out of date|needs? to be updated|"
+                  r"doesn't match)|Your lockfile needs to be updated",
+                  text, _re.IGNORECASE):
+        return ("source_state",
+                "yarn --frozen-lockfile integrity mismatch (yarn.lock vs "
+                "package.json/node_modules — source-state, not a closure gap)")
+    return ("source_state",
+            "no yarn cache-miss/registry-request signature "
+            "(webpack/tsc/eslint/script error — not a missing dependency)")
+
+
 def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
                      goproxy_off: bool = False, classifier=None) -> str:
     """Per-milestone OFFLINE GATE: prove the closure is sufficient to build the
@@ -1120,9 +1193,18 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                                            forbid_globs)
             _docker_build(df, staging_tag, project_root)
         elif eco == "npm":
-            # Raw-cache rsync union path — render_union_dockerfile exists, but the
-            # npm driver wiring (+ build) is a later task. Don't half-build it here.
-            raise NotImplementedError(f"ecosystem {eco}: task 4.4")
+            # Raw-cache rsync UNION of every milestone's yarn cache
+            # (render_union_dockerfile). Like go/maven the union ADDS the milestone
+            # yarn caches on top of the base image's OWN yarn cache, so it spans A→B
+            # (no A-baseline gap like cargo's vendor-replace had). No toolchain step
+            # (yarn ships in the base) and NO self@B removal: element-web's app source
+            # is not published to npm, so there is no self@B tarball to strip
+            # (cache_forbid_globs is empty → the generic audit below is a clean
+            # no-op). The per-milestone B-source gate (yarn install --offline
+            # --frozen-lockfile) applies unchanged, with the npm/yarn classifier.
+            cache_paths = cfg["cache_paths"]
+            df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+            _docker_build(df, staging_tag, project_root)
         elif eco == "pip":
             # pip is ASSEMBLED, not cache-COPY'd: collect each milestone's
             # `pip freeze`, union (dropping editable/git/self entries), assert one
@@ -1160,8 +1242,18 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         # design; the agent builds it from the reactor) as source_state and any
         # unresolved THIRD-PARTY artifact as a real closure gap → BLOCK. The self@B
         # patterns are the SAME cache_forbid_globs that drove the rm.
-        gate_classifier = (classify_maven_offline_build_failure(forbid_globs)
-                           if eco == "maven" else None)
+        # npm needs a yarn-aware classifier for the same reason: the default (go)
+        # classifier doesn't recognise yarn's `Couldn't find any versions for` /
+        # `request to https://registry…` offline strings and would fail-OPEN on a
+        # real yarn cache gap. The npm classifier treats a yarn cache-miss /
+        # registry-request as a closure gap → BLOCK, and a --frozen-lockfile
+        # integrity mismatch (yarn.lock vs tree — source-state) as source_state.
+        if eco == "maven":
+            gate_classifier = classify_maven_offline_build_failure(forbid_globs)
+        elif eco == "npm":
+            gate_classifier = classify_npm_offline_build_failure
+        else:
+            gate_classifier = None
         source_state = []
         for i, m in enumerate(milestones, 1):
             print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)

@@ -774,6 +774,213 @@ def test_run_offline_gate_maven_self_at_b_is_source_state(monkeypatch):
     assert got == "SOURCE_STATE"
 
 
+# ---- Task 4.6: npm ecosystem assembly + yarn classifier (element-web e2e) ------
+# element-web (yarn classic) is the simplest cache-COPY ecosystem: the union ADDs
+# the milestone yarn caches on top of the base image's own yarn cache (spans A→B,
+# like go), with NO toolchain step and NO self@B removal (the app source is not
+# published to npm, so cache_forbid_globs is empty → the generic audit is a no-op).
+# A yarn `--offline` failure is classified by classify_npm_offline_build_failure: a
+# cache-miss / registry-request is a real closure gap (BLOCK); a frozen-lockfile
+# integrity mismatch or a webpack/tsc/eslint error is source-state (does not block).
+
+# Representative yarn `--offline` failure outputs.
+_YARN_OFFLINE_NO_VERSIONS = (
+    "yarn install v1.22.22\n"
+    "[1/4] Resolving packages...\n"
+    "error Couldn't find any versions for \"matrix-js-sdk\" that match "
+    "\"^37.0.0\" in our cache (possible versions are: \"36.1.0\")\n"
+    "info Visit https://yarnpkg.com/en/docs/cli/install for documentation.\n")
+
+_YARN_OFFLINE_REGISTRY_REQUEST = (
+    "yarn install v1.22.22\n"
+    "[2/4] Fetching packages...\n"
+    "error An unexpected error occurred: \"request to "
+    "https://registry.yarnpkg.com/some-pkg/-/some-pkg-1.2.3.tgz failed, reason: "
+    "getaddrinfo ENOTFOUND registry.yarnpkg.com\".\n")
+
+_YARN_OFFLINE_FROZEN_LOCKFILE = (
+    "yarn install v1.22.22\n"
+    "[1/4] Resolving packages...\n"
+    "error Your lockfile needs to be updated, but yarn was run with "
+    "`--frozen-lockfile`.\n"
+    "info Visit https://yarnpkg.com/en/docs/cli/install for documentation.\n")
+
+_YARN_BUILD_COMPILE_ERROR = (
+    "yarn run v1.22.22\n"
+    "$ tsc -p tsconfig.json\n"
+    "src/components/Foo.tsx:42:13 - error TS2339: Property 'bar' does not exist on "
+    "type 'Props'.\n"
+    "error Command failed with exit code 2.\n")
+
+
+def test_classify_npm_no_versions_is_closure_gap():
+    """`error Couldn't find any versions for` (yarn cache lacks the version a
+    lockfile pins) is a REAL closure gap → BLOCK. Pure-text (no docker probe)."""
+    kind, detail = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging", _YARN_OFFLINE_NO_VERSIONS)
+    assert kind == "closure_gap"
+    assert "find any versions" in detail.lower() or "gap" in detail.lower()
+
+
+_YARN_OFFLINE_CANT_REQUEST = (
+    "yarn install v1.22.22\n"
+    "[1/5] Validating package.json...\n"
+    "[2/5] Resolving packages...\n"
+    "[3/5] Fetching packages...\n"
+    "info Visit https://yarnpkg.com/en/docs/cli/install for documentation about "
+    "this command.\n"
+    "error Can't make a request in offline mode "
+    "(\"https://registry.yarnpkg.com/caniuse-lite/-/caniuse-lite-1.0.30001701.tgz\")\n")
+
+
+def test_classify_npm_cant_make_request_offline_is_closure_gap():
+    """THE canonical yarn-classic offline cache-miss: `error Can't make a request in
+    offline mode ("<registry url>")` — yarn needs a tarball it can't serve from the
+    mirror and would have to fetch (e.g. caniuse-lite-1.0.30001701 missing from the
+    union) → a real CLOSURE GAP → BLOCK. This is the fail-OPEN the first integration
+    run exposed: the string doesn't contain `request to https://registry` so it was
+    mis-labelled source_state; the classifier must now catch it."""
+    kind, detail = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging", _YARN_OFFLINE_CANT_REQUEST)
+    assert kind == "closure_gap"
+    assert "offline mode" in detail.lower() or "gap" in detail.lower()
+
+
+def test_classify_npm_registry_request_is_closure_gap():
+    """A `request to https://registry…` under --offline = yarn fell back to the
+    network because the bytes weren't in the cache → closure gap → BLOCK. (This is
+    the fail-OPEN the go classifier would miss — it doesn't know yarn's strings.)"""
+    kind, detail = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging", _YARN_OFFLINE_REGISTRY_REQUEST)
+    assert kind == "closure_gap"
+
+
+def test_classify_npm_couldnt_find_package_is_closure_gap():
+    """`Couldn't find package` (the package itself is absent from the cache) is a
+    closure gap too."""
+    kind, _ = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging",
+        "error Couldn't find package \"@matrix-org/olm@^3.2.15\" required by "
+        "\"matrix-react-sdk\" on the \"npm\" registry.\n")
+    assert kind == "closure_gap"
+
+
+def test_classify_npm_frozen_lockfile_is_source_state():
+    """A `--frozen-lockfile` integrity mismatch (yarn.lock disagrees with
+    package.json/node_modules — a mid-change source state; the cache HAS the bytes)
+    is SOURCE-STATE, not a closure gap → must NOT block."""
+    kind, _ = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging", _YARN_OFFLINE_FROZEN_LOCKFILE)
+    assert kind == "source_state"
+
+
+def test_classify_npm_compile_error_is_source_state():
+    """A webpack/tsc compile error (no yarn cache-miss/registry-request signature) is
+    SOURCE-STATE — it is not a missing dependency, so it must not BLOCK."""
+    kind, _ = boc.classify_npm_offline_build_failure(
+        "r/x/base-offline:staging", _YARN_BUILD_COMPILE_ERROR)
+    assert kind == "source_state"
+
+
+def test_run_offline_gate_uses_npm_classifier_gap_exits(monkeypatch):
+    """run_offline_gate with the npm classifier injected: a yarn `Couldn't find any
+    versions` offline failure → closure_gap → sys.exit(1)."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(1, _YARN_OFFLINE_NO_VERSIONS)   # the offline yarn install fails
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit) as e:
+        boc.run_offline_gate(
+            "r/x/base-offline:staging", "r/x/m01:latest",
+            "cd /testbed && yarn install --offline --frozen-lockfile",
+            classifier=boc.classify_npm_offline_build_failure)
+    assert e.value.code == 1
+
+
+def test_run_offline_gate_npm_frozen_lockfile_is_source_state(monkeypatch):
+    """With the npm classifier injected, a frozen-lockfile mismatch → SOURCE_STATE
+    (does not block), returned as the sentinel."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(1, _YARN_OFFLINE_FROZEN_LOCKFILE)
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    got = boc.run_offline_gate(
+        "r/x/base-offline:staging", "r/x/m01:latest",
+        "cd /testbed && yarn install --offline --frozen-lockfile",
+        classifier=boc.classify_npm_offline_build_failure)
+    assert got == "SOURCE_STATE"
+
+
+def test_build_closure_npm_branch_dispatches_union_audit_gate(monkeypatch, tmp_path):
+    """End-to-end-ish (all docker mocked): the npm branch in build_closure unions the
+    yarn caches (render_union_dockerfile — NO toolchain, NO self@B rm), builds the
+    staging image, runs the generic audit (empty forbid → no-op) + per-milestone
+    offline gate with the npm classifier, then tags :latest. Asserts call ORDER, that
+    the built Dockerfile is the plain union (no rm/toolchain), and that the gate got
+    the npm classifier."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "ew.yaml").write_text(
+        "ecosystem: [npm]\n"
+        "closure:\n"
+        "  cache_paths:\n"
+        "    - /usr/local/share/.cache/yarn/v6\n"
+        "  offline_build: 'cd /testbed && yarn install --offline --frozen-lockfile'\n")
+
+    events = []
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["ew/m01:latest", "ew/m02:latest"])
+    built = {}
+    def fake_build(df, tag, root):
+        events.append(("build", tag))
+        built["df"] = df
+        built["tag"] = tag
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_staging_image",
+                        lambda tag, globs: events.append(("audit", tag, tuple(globs))))
+    gate_classifiers = []
+    def fake_gate(tag, m, ob, **k):
+        gate_classifiers.append(k.get("classifier"))
+        events.append(("gate", m))
+        return "PASS"
+    monkeypatch.setattr(boc, "run_offline_gate", fake_gate)
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            events.append(("tag", cmd[2], cmd[3]))
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    boc.build_closure("ew", tmp_path, push=False, keep=True)
+
+    kinds = [e[0] for e in events]
+    # build BEFORE audit BEFORE (per-milestone) gate BEFORE tag
+    assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
+        < kinds.index("tag")
+    assert built["tag"] == "ew/base-offline:staging"
+    assert ("tag", "ew/base-offline:staging", "ew/base-offline:latest") in events
+    # the staging Dockerfile is the PLAIN yarn-cache union: no self@B rm, no toolchain
+    assert "rsync -a /milestone_" in built["df"]
+    assert "/usr/local/share/.cache/yarn/v6" in built["df"]
+    assert "rm -rf" not in built["df"]            # no self@B removal for element-web
+    assert "GOTOOLCHAIN" not in built["df"] and "rustup" not in built["df"]
+    # it equals render_union_dockerfile exactly (no appended tail)
+    expected = boc.render_union_dockerfile(
+        "ew", ["ew/m01:latest", "ew/m02:latest"], ["/usr/local/share/.cache/yarn/v6"])
+    assert built["df"] == expected
+    # the generic audit got the (empty) forbid globs → clean no-op
+    audit_ev = next(e for e in events if e[0] == "audit")
+    assert audit_ev[2] == ()
+    # one offline gate per milestone, each handed the npm/yarn classifier
+    assert [e[1] for e in events if e[0] == "gate"] == ["ew/m01:latest", "ew/m02:latest"]
+    assert gate_classifiers == [boc.classify_npm_offline_build_failure,
+                                boc.classify_npm_offline_build_failure]
+
+
 def test_pick_go_toolchain_milestone_last_when_correct():
     """Last milestone (B-end) has the target go → it is picked (and probed)."""
     ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
