@@ -77,6 +77,37 @@ def cargo_config_toml(vendor_dir: str) -> str:
             f'directory = "{vendor_dir}"\n')
 
 
+def _dist_name(req: str) -> str:
+    for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", "@", " "):
+        if sep in req:
+            return req.split(sep, 1)[0].strip().lower().replace("_", "-")
+    return req.strip().lower().replace("_", "-")
+
+def pip_union_requirements(freezes: list[str], forbid: list[str]) -> list[str]:
+    fb = {f.strip().lower().replace("_", "-") for f in forbid}
+    out = {}
+    for txt in freezes:
+        for line in txt.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("-e") or s.startswith("git+") or "@ file://" in s:
+                continue
+            if _dist_name(s) in fb:
+                continue
+            out[s] = None
+    return list(out)
+
+def assert_single_version_or_explain(reqs: list[str]) -> None:
+    seen = {}
+    for r in reqs:
+        n = _dist_name(r)
+        seen.setdefault(n, set()).add(r)
+    multi = {n: v for n, v in seen.items() if len(v) > 1}
+    if multi:
+        print(f"Error: pip closure has >1 version for {list(multi)} — "
+              f"download per-version into the shared dir, do NOT merge into one -r.",
+              file=sys.stderr)
+        sys.exit(1)
+
 def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
     lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
              "RUN command -v rsync || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)"]

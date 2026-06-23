@@ -85,3 +85,16 @@ def test_cargo_config_points_to_vendor():
     assert '[source.crates-io]' in cfg
     assert 'replace-with = "vendored-sources"' in cfg
     assert 'directory = "/opt/vendor"' in cfg
+
+def test_pip_union_drops_self_and_editable():
+    f1 = "numpy==2.4.1\n-e /testbed\narray-api-compat==1.13.0\n"
+    f2 = "# scikit-learn==1.6.dev0\nnumpy==2.4.1\nscikit_learn==1.6.0\n"
+    reqs = boc.pip_union_requirements([f1, f2], ["scikit-learn", "scikit_learn", "sklearn"])
+    assert "array-api-compat==1.13.0" in reqs
+    assert "numpy==2.4.1" in reqs
+    assert not any("scikit" in r or "sklearn" in r for r in reqs)
+    assert not any(r.startswith("-e") or r.startswith("#") for r in reqs)
+
+def test_pip_multi_version_raises():
+    with pytest.raises(SystemExit):
+        boc.assert_single_version_or_explain(["foo==1.0", "foo==2.0"])
