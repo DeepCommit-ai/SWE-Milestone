@@ -1492,3 +1492,345 @@ def test_build_closure_pip_branch_multi_version_exits(monkeypatch, tmp_path):
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, ""))
     with pytest.raises(SystemExit):
         boc.build_closure("sk", tmp_path, push=False, keep=True)
+
+
+# ---- DUAL go+npm ecosystem assembly (navidrome e2e) ---------------------------
+# navidrome combines a Go backend (raw-cache modcache union + clean-replaced go
+# toolchain, like go-zero) with an npm-managed React UI (warm /root/.npm/_cacache
+# from each milestone's ui/package-lock.json — npm, NOT yarn). The dual branch
+# composes BOTH into ONE staging image and gates with `npm ci --offline && npm run
+# build && GOPROXY=off go build ./...`, classified by BOTH the npm and go
+# classifiers. No self@B in either cache → no removal, audit is a clean no-op.
+
+def _go_probe_124(target="r/x/m02:latest"):
+    """Fake go probe: only `target` reports go1.24.5 (the B-side toolchain bump);
+    the rest report go1.24.4 — mirrors navidrome's milestone split."""
+    return lambda img: "go1.24.5" if img == target else "go1.24.4"
+
+
+def test_npm_online_fetch_cmd_npm_not_yarn_into_shared_cacache():
+    """The per-milestone UI fetch uses `npm ci` (NOT yarn), prefers a real online
+    fetch (--prefer-offline=false), writes into the SHARED _cacache via npm's
+    `--cache` = the PARENT of _cacache (npm appends /_cacache itself), ignores
+    scripts, and falls back to `npm install` if `npm ci` aborts (mid-change lock)."""
+    body = boc.npm_online_fetch_cmd("/ui_m3", "/root/.npm/_cacache")
+    assert body.startswith("cd /ui_m3 && (")
+    # npm ci preferred, npm install fallback (|| inside the RUN)
+    assert "npm ci --cache /root/.npm " in body
+    assert "|| npm install --cache /root/.npm " in body
+    # NOT yarn
+    assert "yarn" not in body
+    # --cache is the PARENT of _cacache (npm re-appends /_cacache); NOT _cacache itself
+    assert "--cache /root/.npm " in body
+    assert "--cache /root/.npm/_cacache" not in body
+    # online (force a real fetch), no postinstall, quiet
+    assert "--prefer-offline=false" in body
+    assert body.count("--ignore-scripts") == 2
+    assert "--no-audit" in body and "--no-fund" in body
+
+
+def test_assemble_go_npm_dockerfile_emits_both_closures():
+    """The dual assembly emits BOTH the go union+toolchain AND the npm cacache warm
+    in ONE multi-stage Dockerfile, with a single syntax directive and a final stage
+    that COPYs the unioned go cache + the go toolchain + the warmed _cacache."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    caches = ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"]
+    df = boc.assemble_go_npm_dockerfile(
+        "r/x", ms, caches, "1.24.5", _probe=_go_probe_124())
+    # exactly ONE syntax directive, at the very top
+    assert df.count("# syntax=docker/dockerfile:1") == 1
+    assert df.startswith("# syntax=docker/dockerfile:1\n")
+    # --- npm part: a npm_fetch stage that COPYs ONLY the UI manifests + warms cacache
+    assert "FROM r/x/base:latest AS npm_fetch" in df
+    assert ("COPY --from=r/x/m01:latest /testbed/ui/package.json "
+            "/testbed/ui/package-lock.json /ui_m0/") in df
+    assert ("COPY --from=r/x/m02:latest /testbed/ui/package.json "
+            "/testbed/ui/package-lock.json /ui_m1/") in df
+    assert "npm ci --cache /root/.npm " in df          # npm, not yarn
+    assert "yarn" not in df
+    # the WHOLE /testbed is never COPY'd into the npm stage (manifests only)
+    assert "/testbed /ui_m" not in df
+    # --- go part: raw-cache rsync union of the go modcache (NOT the npm cacache)
+    assert "FROM r/x/base:latest AS builder" in df
+    assert "FROM r/x/base:latest AS final" in df
+    assert "rsync -a /milestone_" in df
+    assert "/go/pkg/mod/cache/download" in df
+    # the npm _cacache must NOT be rsync-union'd as a go cache path
+    assert "rsync -a /milestone_0_0/root/.npm/_cacache" not in df
+    assert "/staging/root/.npm/_cacache" not in df
+    # --- go toolchain: clean-replace from the 1.24.5 milestone + GOTOOLCHAIN=local
+    assert "RUN rm -rf /usr/local/go" in df
+    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+    assert "ENV GOTOOLCHAIN=local" in df
+    # --- final stage COPYs the warmed _cacache from the npm_fetch stage
+    assert "COPY --from=npm_fetch /root/.npm/_cacache /root/.npm/_cacache" in df
+    # ordering: npm_fetch DEFINED before final references it; rm before toolchain
+    # COPY before ENV before the cacache COPY
+    assert df.index("AS npm_fetch") < df.index("COPY --from=npm_fetch")
+    assert df.index("AS final") < df.index("RUN rm -rf /usr/local/go")
+    assert df.index("RUN rm -rf /usr/local/go") \
+        < df.index("COPY --from=r/x/m02:latest /usr/local/go")
+    assert df.index("COPY --from=r/x/m02:latest /usr/local/go") \
+        < df.index("ENV GOTOOLCHAIN=local")
+    assert df.index("ENV GOTOOLCHAIN=local") \
+        < df.index("COPY --from=npm_fetch /root/.npm/_cacache")
+    # NO self@B removal for navidrome (no rm -rf of any cache)
+    assert "rm -rf /root/.npm" not in df
+    assert "rm -rf /go/pkg/mod" not in df
+
+
+def test_assemble_go_npm_dockerfile_no_milestones_exits():
+    with pytest.raises(SystemExit):
+        boc.assemble_go_npm_dockerfile(
+            "r/x", [], ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5")
+
+
+def test_assemble_go_npm_dockerfile_toolchain_fallback_scans():
+    """If the LAST milestone lacks the target go, an earlier one that reports it is
+    picked for the toolchain COPY (pick_go_toolchain_milestone scan)."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    # only m02 has go1.24.5; m03 (last) regressed to go1.24.4
+    df = boc.assemble_go_npm_dockerfile(
+        "r/x", ms, ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5",
+        _probe=_go_probe_124("r/x/m02:latest"))
+    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+
+
+# ---- DUAL go+npm gate classifier ----------------------------------------------
+
+_NPM_CI_OFFLINE_GAP = (
+    "npm error code ENOTCACHED\n"
+    "npm error request to https://registry.npmjs.org/caniuse-lite/-/"
+    "caniuse-lite-1.0.30001701.tgz failed: cache mode is \"only-if-cached\" but no "
+    "cached response is available.\n")
+
+_GO_BUILD_GAP = ("core/x.go:1:2: no required module provides package "
+                 "example.com/totally/absent; to add it:\n")
+
+_GO_BUILD_SOURCESTATE_COMPILE = "core/foo.go:12:9: undefined: tests.MockBar\n"
+
+_UI_TSC_ERROR = (
+    "> ui@ build\n> vite build\n"
+    "src/components/Foo.tsx:42:13 - error TS2339: Property 'bar' does not exist.\n"
+    "npm error Lifecycle script `build` failed with error code 2\n")
+
+
+def test_classify_go_npm_npm_cache_miss_is_gap():
+    """An `npm ci --offline` cache-miss (ENOTCACHED / only-if-cached) → closure_gap,
+    tagged [npm]. The go classifier alone would miss npm's strings (fail-OPEN)."""
+    kind, detail = boc.classify_go_npm_offline_build_failure(
+        "r/x/base-offline:staging", _NPM_CI_OFFLINE_GAP)
+    assert kind == "closure_gap"
+    assert "[npm]" in detail
+
+
+def test_classify_go_npm_go_module_gap_is_gap(monkeypatch):
+    """A go build that cites a module ABSENT from the modcache → closure_gap, tagged
+    [go]. The npm classifier finds no gap signature, so the go classifier (which
+    probes the cache) is consulted and BLOCKs."""
+    # probe: no HIT → the module is absent from the cache
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, ""))
+    kind, detail = boc.classify_go_npm_offline_build_failure(
+        "r/x/base-offline:staging", _GO_BUILD_GAP)
+    assert kind == "closure_gap"
+    assert "[go]" in detail
+    assert "example.com/totally/absent" in detail
+
+
+def test_classify_go_npm_go_compile_error_is_source_state(monkeypatch):
+    """A pure go compile error (no missing-module token, no npm signature) →
+    source_state (a mid-migration milestone), tagged [go] — must NOT block."""
+    called = {"probe": False}
+    def fake_run(*a, **k):
+        called["probe"] = True
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    kind, detail = boc.classify_go_npm_offline_build_failure(
+        "r/x/base-offline:staging", _GO_BUILD_SOURCESTATE_COMPILE)
+    assert kind == "source_state"
+    assert called["probe"] is False     # no token → no cache probe
+
+
+def test_classify_go_npm_ui_build_error_is_source_state():
+    """A UI tsc/vite build error (no npm cache-miss, no go module token) →
+    source_state — a compile error is not a missing dependency."""
+    kind, _ = boc.classify_go_npm_offline_build_failure(
+        "r/x/base-offline:staging", _UI_TSC_ERROR)
+    assert kind == "source_state"
+
+
+def test_classify_go_npm_npm_gap_wins_over_go_token(monkeypatch):
+    """If BOTH an npm cache-miss AND a go module token appear, the npm gap is
+    returned (fail-closed: any real missing dep blocks; npm is checked first)."""
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, "HIT\n"))
+    kind, detail = boc.classify_go_npm_offline_build_failure(
+        "r/x/base-offline:staging", _NPM_CI_OFFLINE_GAP + _GO_BUILD_GAP)
+    assert kind == "closure_gap"
+    assert "[npm]" in detail
+
+
+# ---- _ecosystems_of (multi-aware reader) + dual gate constant -----------------
+
+def test_ecosystems_of_returns_list(tmp_path):
+    """`_ecosystems_of` returns the normalized lowercase LIST (order preserved) for
+    both a scalar and a list `ecosystem`."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "nav.yaml").write_text(
+        "ecosystem: [Go, NPM]\nclosure:\n  cache_paths: ['/a']\n  offline_build: 'x'\n")
+    assert boc._ecosystems_of("nav", tmp_path) == ["go", "npm"]
+    (tmp_path / "quarantine_configs" / "sk.yaml").write_text(
+        "ecosystem: pip\nclosure:\n  cache_paths: []\n  offline_build: 'x'\n")
+    assert boc._ecosystems_of("sk", tmp_path) == ["pip"]
+
+
+def test_ecosystems_of_missing_exits(tmp_path):
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "no.yaml").write_text(
+        "closure:\n  cache_paths: []\n  offline_build: 'x'\n")
+    with pytest.raises(SystemExit):
+        boc._ecosystems_of("no", tmp_path)
+
+
+def test_go_npm_offline_gate_constant_shape():
+    """The dual gate: npm ci --offline (rebuild node_modules from _cacache) → npm
+    run build → GOPROXY=off go build ./... (build-scoped, like go-zero)."""
+    g = boc._GO_NPM_OFFLINE_GATE
+    assert "cd /testbed/ui && npm ci --offline && npm run build" in g
+    assert "cd /testbed && GOPROXY=off go build ./..." in g
+    # build-scoped go build, NOT a whole-graph `go mod download`
+    assert "go mod download" not in g
+
+
+# ---- build_closure DUAL dispatch (no longer sys.exit on [go, npm]) ------------
+
+def _write_navidrome_cfg(tmp_path):
+    (tmp_path / "quarantine_configs").mkdir(exist_ok=True)
+    (tmp_path / "quarantine_configs" / "nav.yaml").write_text(
+        "ecosystem: [go, npm]\n"
+        "cache_forbid_globs:\n"
+        "  - /go/pkg/mod/cache/download/github.com/navidrome/*\n"
+        "  - /go/pkg/mod/github.com/navidrome/*\n"
+        "closure:\n"
+        "  cache_paths:\n"
+        "    - /go/pkg/mod/cache/download\n"
+        "    - /root/.npm/_cacache\n"
+        "  offline_build: 'cd /testbed/ui && npm ci --offline && npm run build && "
+        "cd /testbed && GOPROXY=off go build ./...'\n"
+        "  toolchain: {go: \"1.24.5\", gotoolchain_local: true}\n")
+
+
+def test_build_closure_dual_go_npm_dispatches_not_sysexit(monkeypatch, tmp_path):
+    """The dual branch is dispatched for `ecosystem: [go, npm]` (NO sys.exit). It
+    builds the dual staging image (go union+toolchain + npm cacache warm), runs the
+    generic audit + per-milestone DUAL gate (goproxy_off + the go+npm classifier),
+    then tags :latest. Asserts call ORDER + the built Dockerfile carries BOTH
+    closures + the gate used the dual command and classifier."""
+    _write_navidrome_cfg(tmp_path)
+
+    events = []
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+    # assemble_go_npm_dockerfile picks the toolchain milestone via
+    # pick_go_toolchain_milestone(... _probe=<default-bound _probe_go_version>); the
+    # default arg is bound at def-time so reassigning boc._probe_go_version won't
+    # take. Stub the picker itself (its probe/scan logic is unit-tested separately)
+    # so the dispatch test exercises only the dual wiring.
+    monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
+                        lambda ms, tg, _probe=None: "nav/m02:latest")
+    built = {}
+    def fake_build(df, tag, root):
+        events.append(("build", tag))
+        built["df"] = df
+        built["tag"] = tag
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_staging_image",
+                        lambda tag, globs: events.append(("audit", tag, tuple(globs))))
+    gate_calls = []
+    def fake_gate(tag, m, ob, **k):
+        gate_calls.append((m, ob, k.get("goproxy_off"), k.get("classifier")))
+        events.append(("gate", m))
+        return "PASS"
+    monkeypatch.setattr(boc, "run_offline_gate", fake_gate)
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            events.append(("tag", cmd[2], cmd[3]))
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    # must NOT raise SystemExit (the whole point — dual is supported now)
+    boc.build_closure("nav", tmp_path, push=False, keep=True)
+
+    kinds = [e[0] for e in events]
+    assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
+        < kinds.index("tag")
+    assert built["tag"] == "nav/base-offline:staging"
+    assert ("tag", "nav/base-offline:staging", "nav/base-offline:latest") in events
+    # the staging Dockerfile carries BOTH the go union+toolchain AND the npm warm
+    df = built["df"]
+    assert "FROM nav/base:latest AS npm_fetch" in df
+    assert "npm ci --cache /root/.npm " in df
+    assert "rsync -a /milestone_" in df and "/go/pkg/mod/cache/download" in df
+    assert "RUN rm -rf /usr/local/go" in df and "ENV GOTOOLCHAIN=local" in df
+    assert "COPY --from=nav/m02:latest /usr/local/go /usr/local/go" in df  # 1.24.5
+    assert "COPY --from=npm_fetch /root/.npm/_cacache /root/.npm/_cacache" in df
+    # it equals assemble_go_npm_dockerfile exactly (the dual assembly); the picker
+    # is stubbed above, so both this and the dispatch use the same toolchain pick.
+    expected = boc.assemble_go_npm_dockerfile(
+        "nav", ["nav/m01:latest", "nav/m02:latest"],
+        ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5")
+    assert df == expected
+    # one DUAL gate per milestone: the dual command, goproxy_off=True, dual classifier
+    assert [e[1] for e in events if e[0] == "gate"] == ["nav/m01:latest", "nav/m02:latest"]
+    for (m, ob, gpo, clf) in gate_calls:
+        assert ob == boc._GO_NPM_OFFLINE_GATE
+        assert gpo is True
+        assert clf is boc.classify_go_npm_offline_build_failure
+
+
+def test_build_closure_dual_go_npm_gap_blocks_no_tag(monkeypatch, tmp_path):
+    """A real closure gap in the dual gate (run_offline_gate sys.exit) fail-closes:
+    :latest is NEVER tagged."""
+    _write_navidrome_cfg(tmp_path)
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+    monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
+                        lambda ms, tg, _probe=None: "nav/m02:latest")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    # the gate fail-closes (a real gap) by sys.exit, as run_offline_gate would
+    def fake_gate(tag, m, ob, **k):
+        raise SystemExit(1)
+    monkeypatch.setattr(boc, "run_offline_gate", fake_gate)
+    tagged = []
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            tagged.append(cmd)
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    with pytest.raises(SystemExit):
+        boc.build_closure("nav", tmp_path, push=False, keep=True)
+    assert tagged == []     # :latest never tagged on a closure gap
+
+
+def test_build_closure_dual_go_npm_source_state_still_tags(monkeypatch, tmp_path):
+    """A SOURCE-STATE-only failure (the dual gate returns SOURCE_STATE, not a gap)
+    does NOT block: :latest is still tagged (closure has the bytes)."""
+    _write_navidrome_cfg(tmp_path)
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+    monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
+                        lambda ms, tg, _probe=None: "nav/m02:latest")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    # m01 source-state, m02 pass
+    monkeypatch.setattr(
+        boc, "run_offline_gate",
+        lambda tag, m, ob, **k: "SOURCE_STATE" if m == "nav/m01:latest" else "PASS")
+    tagged = []
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            tagged.append((cmd[2], cmd[3]))
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    boc.build_closure("nav", tmp_path, push=False, keep=True)
+    assert ("nav/base-offline:staging", "nav/base-offline:latest") in tagged

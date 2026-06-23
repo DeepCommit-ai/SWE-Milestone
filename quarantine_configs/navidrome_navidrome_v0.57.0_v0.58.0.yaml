@@ -39,5 +39,10 @@ closure:
   cache_paths:
     - /go/pkg/mod/cache/download
     - /root/.npm/_cacache
-  offline_build: "cd /testbed/ui && npm run build && cd /testbed && go mod download"
+  # Dual go+npm offline gate: `npm ci --offline` rebuilds node_modules from the
+  # warmed _cacache (npm run build alone can't — it needs node_modules present),
+  # then build the UI, then build-scope the Go backend with GOPROXY=off +
+  # GOTOOLCHAIN=local (the build-scoped `go build ./...` gate, like go-zero — not a
+  # whole-graph `go mod download`).
+  offline_build: "cd /testbed/ui && npm ci --offline && npm run build && cd /testbed && GOPROXY=off go build ./..."
   toolchain: {go: "1.24.5", gotoolchain_local: true}

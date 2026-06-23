@@ -494,6 +494,13 @@ _NPM_CLOSURE_GAP_SIGS = [
     _re.compile(r"in offline mode.*https?://", _re.IGNORECASE | _re.DOTALL),
     # A network attempt under --offline = the package wasn't served from the cache.
     _re.compile(r"request to https?://registry", _re.IGNORECASE),
+    # npm (NOT yarn) `npm ci --offline` cache-miss markers (navidrome's UI is
+    # npm-managed). With --offline npm sets fetch cache mode `only-if-cached`; a
+    # tarball not in _cacache then fails `code ENOTCACHED` / "cache mode is
+    # \"only-if-cached\" but no cached response is available". Either is a definitive
+    # closure gap (the warmed _cacache lacks a lockfile-pinned tarball).
+    _re.compile(r"\bENOTCACHED\b", _re.IGNORECASE),
+    _re.compile(r"only-if-cached.*no cached response", _re.IGNORECASE | _re.DOTALL),
 ]
 
 
@@ -1229,16 +1236,228 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
     return "\n".join(lines) + "\n"
 
 
+# Where npm (NOT yarn) keeps its global content-addressable cache in the
+# base/milestone images. navidrome's UI is npm-managed (package-lock.json,
+# `npm ci`), so the closure must warm THIS dir — the npm equivalent of yarn's
+# _YARN_CACHE_DIR. (Mirrors the second closure.cache_paths entry in the
+# navidrome config.)
+_NPM_CACACHE_DIR = "/root/.npm/_cacache"
+
+
+def npm_online_fetch_cmd(testbed_ui_dir: str, cacache: str = _NPM_CACACHE_DIR) -> str:
+    """Render the per-milestone ONLINE npm declared-deps fetch RUN body (no `RUN `
+    prefix), warming the npm content-addressable cache `cacache` from the
+    package.json + package-lock.json in `testbed_ui_dir`.
+
+    This is the npm (NOT yarn) analogue of `assemble_npm_dockerfile`'s yarn
+    install: navidrome's UI uses npm (`/testbed/ui/package-lock.json`,
+    `npm ci`), so the warm command is `npm`, not `yarn`. The build-warmed
+    `_cacache` shipped in a milestone image is INCOMPLETE the same way yarn's was
+    (a lockfile can pin a tarball — caniuse-lite-style — that no milestone's build
+    actually fetched into _cacache), so we re-populate it ONLINE from each
+    milestone's declared deps. registry.npmjs.org serves third-party packages
+    (navidrome's UI package, private name `"ui"`, is unpublished), so the
+    build-time fetch is safe; the closure is sealed offline at eval.
+
+    PREFER `npm ci` (installs EXACTLY the lockfile-pinned tree → fetches exactly
+    the tarballs the offline gate's `npm ci --offline` will later demand), with:
+      - `--cache <cacache>` so the fetched tarballs land in the SHARED cache dir
+        (every milestone writes the same dir — the union accumulates). Unlike
+        yarn's `--cache-folder` GOTCHA, npm's `--cache` IS the literal cache
+        directory (no version segment is appended), so we pass `_cacache`'s PARENT
+        — npm itself appends `/_cacache`. The base/milestone real cache is
+        `/root/.npm/_cacache`, so `--cache` must be `/root/.npm` and npm
+        re-appends `_cacache`. (Passing `_cacache` directly would write into
+        `/root/.npm/_cacache/_cacache`, invisible to the offline gate.)
+      - `--prefer-offline=false` to force a real registry fetch of anything not
+        already cached (we are ONLINE here precisely to fill the gaps a prior
+        milestone's cache missed — never silently fall back to a stale cache).
+      - `--ignore-scripts` so a postinstall (native build, husky, etc.) that wants
+        tools the manifest-only dir lacks can't abort the cache-warming; we only
+        need `_cacache` POPULATED with tarballs, not a built node_modules.
+      - `--no-audit --no-fund` keep the log readable / avoid extra network calls.
+    FALL BACK to `npm install` (same flags) when `npm ci` errors because the
+    milestone's lockfile is itself mid-change (source-state: package-lock.json
+    disagrees with package.json — `npm ci` is strict and aborts, but a non-strict
+    `npm install` still resolves+fetches the deps into the cache). The fallback is
+    a shell `||` inside the RUN so one milestone's source-state lockfile never
+    aborts the whole multi-milestone fetch.
+    """
+    from pathlib import PurePosixPath
+    cache_parent = str(PurePosixPath(cacache).parent)
+    base = (f"npm ci --cache {cache_parent} --prefer-offline=false "
+            f"--ignore-scripts --no-audit --no-fund")
+    fallback = (f"npm install --cache {cache_parent} --prefer-offline=false "
+                f"--ignore-scripts --no-audit --no-fund")
+    return f"cd {testbed_ui_dir} && ( {base} || {fallback} )"
+
+
+def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
+                               cache_paths: list[str], target_go: str,
+                               npm_cacache: str = _NPM_CACACHE_DIR,
+                               _probe=_probe_go_version) -> str:
+    """DUAL go+npm closure Dockerfile (navidrome): ONE staging image carrying BOTH
+    a complete go closure AND a complete npm closure.
+
+    navidrome is a dual-ecosystem repo — a Go backend plus an npm-managed React UI
+    (`/testbed/ui`). Neither single-ecosystem assembly suffices alone, so this
+    composes the two PROVEN mechanisms into one multi-stage build:
+
+    GO part (identical to `assemble_go_dockerfile`, validated on go-zero):
+      - raw-cache rsync UNION of every milestone's go module download cache
+        (`/go/pkg/mod/cache/download`, the go entry of cache_paths) onto base —
+        spans A→B because the union stage is FROM base:latest (the A-baseline
+        cache) and ADDs each milestone's (B) cache on top.
+      - clean-replace the go toolchain to `target_go` (1.24.5): `RUN rm -rf
+        /usr/local/go` BEFORE `COPY --from=<milestone reporting target_go>
+        /usr/local/go` + `ENV GOTOOLCHAIN=local`. navidrome's milestones split
+        between `go 1.24.4` and `go 1.24.5` go.mod directives (and ship the
+        matching toolchain); with GOTOOLCHAIN=local a 1.24.4 toolchain can't build
+        a `go 1.24.5` milestone (it would try to fetch 1.24.5 from
+        proxy.golang.org → fails offline). 1.24.5 builds BOTH, so we standardise on
+        it. `pick_go_toolchain_milestone` finds a milestone that reports it.
+
+    NPM part (the npm — not yarn — analogue of `assemble_npm_dockerfile`):
+      - a `npm_fetch` stage (FROM base:latest, so base's A-version _cacache is the
+        starting point) COPYs ONLY each milestone's `ui/package.json` +
+        `ui/package-lock.json` (small context, no source) and runs one ONLINE
+        `npm ci` (fallback `npm install`) per milestone (see
+        `npm_online_fetch_cmd`), all warming the SAME shared `/root/.npm/_cacache`.
+        Each fetch ADDs that milestone's declared UI deps to the cache, closing any
+        caniuse-lite-style gap the build-warmed milestone _cacache missed.
+
+    FINAL stage (FROM base:latest) COPYs all THREE closures so both land in one
+    image:
+      1. `COPY --from=builder /staging<go-cache> <go-cache>` — the unioned go
+         module cache (from the go union's `builder` stage).
+      2. `RUN rm -rf /usr/local/go` + `COPY --from=<tc> /usr/local/go
+         /usr/local/go` + `ENV GOTOOLCHAIN=local` — the clean-replaced go
+         toolchain.
+      3. `COPY --from=npm_fetch <_cacache> <_cacache>` — the warmed npm cache.
+
+    Stage names are disjoint (`builder`/`final` from the go union vs `npm_fetch`),
+    so the three COPYs compose without collision. navidrome has NO self@B in
+    either cache (the Go self-module github.com/navidrome/* is never in the module
+    cache by construction; the UI package `"ui"` is private/unpublished), so there
+    is NO removal step — the generic audit (cache_forbid_globs target the go
+    modcache, which never holds the self-module) is a clean no-op.
+    """
+    if not milestones:
+        print("Error: assemble_go_npm_dockerfile got no milestones", file=sys.stderr)
+        sys.exit(1)
+    # ---- GO: raw-cache union + clean-replace toolchain (reuse the proven go path).
+    # render_union_dockerfile emits `... AS builder` (rsync union) then `... AS
+    # final` (COPY the unioned cache). We append the npm fetch stage and the
+    # toolchain/_cacache COPYs to that, keeping stage names disjoint.
+    go_cache_paths = [cp for cp in cache_paths if cp != npm_cacache] or cache_paths
+    union = render_union_dockerfile(repo_lower, milestones, go_cache_paths)
+    tc = pick_go_toolchain_milestone(milestones, target_go, _probe=_probe)
+    # render_union_dockerfile already wrote the `final` stage with the go-cache COPY.
+    # Split off its trailing so we can interleave: keep the union (incl. its `final`
+    # stage header + go-cache COPY), then add the npm fetch stage as a SEPARATE
+    # stage BEFORE final would be cleaner, but Dockerfile stages may appear in any
+    # order as long as a later COPY --from references an earlier-defined stage. We
+    # therefore emit the npm_fetch stage AFTER the union's final stage is opened is
+    # NOT allowed (can't reopen `final`). So instead: define npm_fetch FIRST (its own
+    # FROM), then the go union (builder+final), then COPY from npm_fetch into final.
+    #
+    # Simplest correct layout: prepend the npm_fetch stage, then the full go union,
+    # then the toolchain + _cacache COPY tail appended to the (already-open) final
+    # stage.
+    npm_lines = [f"FROM {repo_lower}/base:latest AS npm_fetch"]
+    for i, m in enumerate(milestones):
+        npm_lines.append(
+            f"COPY --from={m} /testbed/ui/package.json "
+            f"/testbed/ui/package-lock.json /ui_m{i}/")
+    for i in range(len(milestones)):
+        npm_lines.append(f"RUN {npm_online_fetch_cmd(f'/ui_m{i}', npm_cacache)}")
+    npm_stage = "\n".join(npm_lines) + "\n"
+    # The go union begins with `# syntax=...` then `FROM ... AS builder`. Strip the
+    # union's leading `# syntax` line and put a single one at the very top, then the
+    # npm_fetch stage, then the union's stages (builder + final). This keeps exactly
+    # ONE syntax directive and a valid multi-stage ordering.
+    syntax = "# syntax=docker/dockerfile:1\n"
+    union_body = union
+    if union_body.startswith(syntax):
+        union_body = union_body[len(syntax):]
+    # Tail appended to the union's (open) `final` stage: clean-replace toolchain then
+    # COPY the warmed npm _cacache. The `rm -rf` MUST precede the toolchain COPY
+    # (overlay would mix go1.24.4/go1.24.5 stdlib → `go build` fails); the _cacache
+    # COPY pulls from the npm_fetch stage defined at the top.
+    tail = ("RUN rm -rf /usr/local/go\n"
+            f"COPY --from={tc} /usr/local/go /usr/local/go\n"
+            "ENV GOTOOLCHAIN=local\n"
+            f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n")
+    return syntax + npm_stage + union_body + tail
+
+
+def classify_go_npm_offline_build_failure(staging_tag: str,
+                                          output: str) -> tuple[str, str]:
+    """DUAL go+npm offline-build failure classifier `(staging_tag, output) ->
+    (kind, detail)` for navidrome's combined gate.
+
+    The dual gate runs `npm ci --offline && npm run build && ... go build ./...`,
+    so a failure can come from EITHER ecosystem. We first try the npm/yarn
+    classifier: if the output carries an npm/yarn offline cache-miss /
+    registry-request signature it is unambiguously an npm CLOSURE GAP (the go
+    classifier doesn't recognise those strings and would fail-OPEN). Only if the
+    npm classifier finds NO gap signature do we defer to the go classifier (which
+    probes the in-image module cache for any cited go module) — so a go module gap
+    BLOCKs and a go.mod/compile/source-state issue is recorded, not blocked.
+
+    Ordering rationale (fail-closed): the npm classifier returns closure_gap ONLY
+    on a definitive npm cache-miss/registry signature; for any other npm non-zero
+    it returns source_state (frozen-lockfile / webpack / tsc / eslint). A real npm
+    gap therefore wins immediately; otherwise the go classifier gets to probe the
+    module cache, which is the right authority for go failures. A pure UI build
+    error (tsc/webpack) → npm says source_state, go finds no module token → go also
+    says source_state ⇒ recorded, not blocked (correct: not a missing dependency).
+    """
+    npm_kind, npm_detail = classify_npm_offline_build_failure(staging_tag, output)
+    if npm_kind == "closure_gap":
+        return (npm_kind, f"[npm] {npm_detail}")
+    go_kind, go_detail = classify_offline_build_failure(staging_tag, output)
+    if go_kind == "closure_gap":
+        return (go_kind, f"[go] {go_detail}")
+    # Neither ecosystem reports a missing-dependency gap. Prefer the go detail when
+    # a go module token was seen (it probed the cache); otherwise the npm detail.
+    if "no missing-module token" not in go_detail:
+        return ("source_state", f"[go] {go_detail}")
+    return ("source_state", f"[npm] {npm_detail}")
+
+
 # --------------------------------------------------------------------------- #
 # Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
 # tag/publish are Task 4.3 and are intentionally NOT done here.                #
 # --------------------------------------------------------------------------- #
 
+def _ecosystems_of(repo_lower: str, project_root: Path) -> list[str]:
+    """Top-level `ecosystem` from the quarantine yaml as a normalized lowercase
+    LIST (order preserved).
+
+    Accepts a scalar (`ecosystem: pip` → `["pip"]`) or a list
+    (`ecosystem: [go, npm]` → `["go", "npm"]`). This is the multi-aware reader the
+    dual-ecosystem dispatch uses; `_ecosystem_of` stays the single-id reader for
+    the single-ecosystem branches. Fail-closed if `ecosystem` is missing/empty.
+    """
+    data = load_quarantine_yaml(repo_lower, project_root)
+    eco = data.get("ecosystem")
+    if isinstance(eco, list):
+        out = [str(e).strip().lower() for e in eco if str(e).strip()]
+        if out:
+            return out
+    elif isinstance(eco, str) and eco.strip():
+        return [eco.strip().lower()]
+    print(f"Error: {repo_lower}: quarantine config has no `ecosystem`", file=sys.stderr)
+    sys.exit(1)
+
+
 def _ecosystem_of(repo_lower: str, project_root: Path) -> str:
     """Top-level `ecosystem` from the quarantine yaml, as a single lowercase id.
 
     Accepts a scalar or a one-element list (the configs use `ecosystem: [cargo]`).
-    Multi-ecosystem repos are out of scope for the closure builder.
+    Multi-ecosystem repos are routed by the dual dispatch (see `_ecosystems_of`),
+    not here.
     """
     data = load_quarantine_yaml(repo_lower, project_root)
     eco = data.get("ecosystem")
@@ -1352,6 +1571,108 @@ def _build_pip_closure(repo_lower: str, project_root: Path, milestones: list[str
             pass
 
 
+# The DUAL go+npm per-milestone OFFLINE GATE command (navidrome). Run with
+# `cd /testbed && <this>` (run_offline_gate prepends that), so it cd's into the UI
+# first. `npm ci --offline` rebuilds node_modules from the warmed _cacache (the
+# config's `npm run build` alone can't — it needs node_modules present), then
+# `npm run build` builds the UI, then `GOPROXY=off go build ./...` build-scopes the
+# Go backend (the same build-scoped gate go-zero uses — not a whole-graph
+# `go mod download`). GOPROXY=off + GOTOOLCHAIN=local (baked in the image) make a
+# missing module deterministic and forbid any toolchain auto-download. EXIT 0 =
+# pass.
+_GO_NPM_OFFLINE_GATE = ("cd /testbed/ui && npm ci --offline && npm run build && "
+                        "cd /testbed && GOPROXY=off go build ./...")
+
+
+def _build_go_npm_closure(repo_lower: str, project_root: Path,
+                          milestones: list[str], cfg: dict,
+                          forbid_globs: list[str], staging_tag: str,
+                          latest_tag: str, push: bool, keep: bool) -> None:
+    """DUAL go+npm ASSEMBLY path (navidrome): build ONE staging image carrying both
+    the go closure (modcache union + clean-replaced 1.24.5 toolchain) and the npm
+    closure (warmed /root/.npm/_cacache), AUDIT it, run the per-milestone DUAL
+    offline gate, and on all-green tag :latest.
+
+    Self-contained (like `_build_pip_closure`): the generic single-ecosystem
+    audit/gate flow in `build_closure` is single-classifier; the dual gate needs
+    BOTH the go and npm classifiers (`classify_go_npm_offline_build_failure`) and a
+    build that first installs the UI offline then compiles both ecosystems, so this
+    branch owns the whole pipeline and returns.
+
+    Gate command: `_GO_NPM_OFFLINE_GATE` (npm ci --offline + npm run build +
+    GOPROXY=off go build ./...), run per milestone with its B-source /testbed
+    injected and `--network none` (+ `-e GOPROXY=off`). A real CLOSURE GAP (a UI
+    tarball missing from _cacache, or a go module missing from the modcache union)
+    fail-closes inside run_offline_gate; a SOURCE-STATE failure (a mid-migration
+    milestone whose UI/backend source doesn't compile though the closure HAS the
+    bytes) is recorded but does not block. navidrome has no self@B in either cache,
+    so there is NO removal step and the generic in-image audit (forbid_globs) is a
+    clean no-op.
+    """
+    cache_paths = cfg["cache_paths"]
+    toolchain = cfg.get("toolchain") or {}
+    target_go = toolchain.get("go")
+    if not target_go:
+        print(f"Error: {repo_lower}: go+npm ecosystem needs closure.toolchain.go "
+              f"(target go version)", file=sys.stderr)
+        sys.exit(1)
+
+    # ---- assemble the ONE dual Dockerfile (go union+toolchain + npm cacache warm).
+    df = assemble_go_npm_dockerfile(repo_lower, milestones, cache_paths, target_go)
+    _docker_build(df, staging_tag, project_root)
+
+    try:
+        # 1) In-image self-exclusion AUDIT (defense-in-depth; navidrome's
+        #    cache_forbid_globs target the go modcache, which never holds the
+        #    self-module → clean no-op, but run it for parity/fail-closed).
+        audit_staging_image(staging_tag, forbid_globs)
+        print(f"audit clean: {staging_tag} (forbid_globs={len(forbid_globs)})",
+              flush=True)
+
+        # 2) Per-milestone DUAL OFFLINE GATE. GOPROXY=off (go half) + the combined
+        #    go+npm classifier so a UI _cacache gap AND a go modcache gap each BLOCK,
+        #    while a compile/source-state issue is recorded.
+        source_state = []
+        for i, m in enumerate(milestones, 1):
+            print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
+            result = run_offline_gate(
+                staging_tag, m, _GO_NPM_OFFLINE_GATE, goproxy_off=True,
+                classifier=classify_go_npm_offline_build_failure)
+            if result == "SOURCE_STATE":
+                source_state.append(m)
+                print(f"offline gate [{i}/{len(milestones)}] {m}: SOURCE-STATE "
+                      f"(not a closure gap; recorded)", flush=True)
+            else:
+                print(f"offline gate [{i}/{len(milestones)}] {m}: PASS", flush=True)
+
+        # 3) No closure gap (any gap exited above) → publish. Only now tag :latest.
+        passed = len(milestones) - len(source_state)
+        tr = subprocess.run(["docker", "tag", staging_tag, latest_tag])
+        if tr.returncode != 0:
+            print(f"Error: docker tag {staging_tag} -> {latest_tag} failed",
+                  file=sys.stderr)
+            sys.exit(tr.returncode)
+        if push:
+            pr = subprocess.run(["docker", "push", latest_tag])
+            if pr.returncode != 0:
+                print(f"Error: docker push {latest_tag} failed", file=sys.stderr)
+                sys.exit(pr.returncode)
+        if source_state:
+            print(f"SUCCESS (with source-state concerns): {latest_tag} published — "
+                  f"{passed}/{len(milestones)} milestone gate(s) built offline; "
+                  f"{len(source_state)} milestone(s) failed on SOURCE-STATE issues "
+                  f"(NOT closure gaps; closure has the bytes): {source_state}"
+                  f"{', pushed' if push else ''}.")
+        else:
+            print(f"SUCCESS: {latest_tag} published "
+                  f"({len(milestones)} milestone gate(s) passed"
+                  f"{', pushed' if push else ''}).")
+    finally:
+        if not keep:
+            subprocess.run(["docker", "rmi", "-f", staging_tag],
+                          capture_output=True, text=True)
+
+
 def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                   keep: bool = False) -> None:
     """Build, AUDIT, GATE, and tag the offline dependency closure for a repo.
@@ -1367,7 +1688,7 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
     :latest tag always stays.
     """
     cfg = load_closure_config(repo_lower, project_root)
-    eco = _ecosystem_of(repo_lower, project_root)
+    ecos = _ecosystems_of(repo_lower, project_root)
     # cache_forbid_globs is a TOP-LEVEL key in the quarantine yaml (not inside the
     # `closure` block), so read it from the full config. Default [] (audit no-op).
     forbid_globs = load_quarantine_yaml(repo_lower, project_root).get(
@@ -1380,6 +1701,15 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         sys.exit(1)
     staging_tag = f"{repo_lower}/base-offline:staging"
     latest_tag = f"{repo_lower}/base-offline:latest"
+
+    # DUAL go+npm (navidrome): a multi-ecosystem repo the single-id `_ecosystem_of`
+    # rejects. Detect the set {go, npm} and route to the self-contained dual path
+    # (build BOTH closures, audit, per-milestone dual gate, tag) which returns.
+    if set(ecos) == {"go", "npm"}:
+        _build_go_npm_closure(repo_lower, project_root, milestones, cfg,
+                              forbid_globs, staging_tag, latest_tag, push, keep)
+        return
+    eco = _ecosystem_of(repo_lower, project_root)
 
     try:
         if eco == "cargo":
