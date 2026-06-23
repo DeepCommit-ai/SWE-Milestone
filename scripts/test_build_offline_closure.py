@@ -300,3 +300,88 @@ def test_audit_staging_image_docker_failure_exits(monkeypatch):
     with pytest.raises(SystemExit) as e:
         boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
     assert e.value.code == 1
+
+
+# ---- Task 4.4: go ecosystem assembly + toolchain ------------------------------
+
+def test_assemble_go_dockerfile_appends_toolchain_and_gotoolchain_local():
+    """The go branch unions the module cache (render_union_dockerfile) AND appends
+    `COPY .../usr/local/go` + `ENV GOTOOLCHAIN=local` (+ .info synth) to the final
+    stage."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    # fake probe: only the LAST milestone has the target go (B-end), as in go-zero
+    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    df = boc.assemble_go_dockerfile(
+        "r/x", ms, ["/go/pkg/mod/cache/download"], "1.21.13", _probe=probe)
+    # base of the assembly is the raw-cache union (final stage + rsync of the cache)
+    assert "FROM r/x/base:latest AS final" in df
+    assert "rsync -a /milestone_" in df
+    assert "/go/pkg/mod/cache/download" in df
+    # toolchain layer appended AFTER the union's final stage
+    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+    assert "ENV GOTOOLCHAIN=local" in df
+    # .info synthesis appended after the toolchain (so the offline gate's
+    # `go mod download` can resolve versions from the cache with no network)
+    assert ".info" in df and 'printf' in df and '"Version"' in df
+    # ordering: union FROM final -> COPY toolchain -> ENV GOTOOLCHAIN -> RUN synth
+    assert df.index("AS final") < df.index("COPY --from=r/x/m02:latest /usr/local/go")
+    assert df.index("COPY --from=r/x/m02:latest /usr/local/go") < df.index("ENV GOTOOLCHAIN=local")
+    assert df.index("ENV GOTOOLCHAIN=local") < df.index('printf')
+    # equals the rendered union + the appended tail (no other mutation)
+    union = boc.render_union_dockerfile("r/x", ms, ["/go/pkg/mod/cache/download"])
+    assert df == union + (
+        "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go\n"
+        "ENV GOTOOLCHAIN=local\n"
+        f"RUN {boc._GO_SYNTH_INFO_RUN}\n")
+
+
+def test_pick_go_toolchain_milestone_last_when_correct():
+    """Last milestone (B-end) has the target go → it is picked (and probed)."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    probed = []
+    def probe(img):
+        probed.append(img)
+        return "go1.21.13" if img == "r/x/m03:latest" else "go1.19.13"
+    got = boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
+    assert got == "r/x/m03:latest"
+    assert probed[0] == "r/x/m03:latest"   # last-first probing
+
+
+def test_pick_go_toolchain_milestone_falls_back_when_last_wrong():
+    """If the last milestone has the wrong go, an earlier one that matches is used."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    # only m02 has the target; m03 (last) regressed/lacks it
+    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    got = boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
+    assert got == "r/x/m02:latest"
+
+
+def test_pick_go_toolchain_milestone_none_matches_exits():
+    """No milestone reports the target go → fail-closed (would break offline gate)."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    probe = lambda img: "go1.19.13"
+    with pytest.raises(SystemExit) as e:
+        boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
+    assert e.value.code == 1
+
+
+def test_pick_go_toolchain_milestone_accepts_go_prefixed_target():
+    """target_go may be given as "go1.21.13" or "1.21.13"; both match."""
+    ms = ["r/x/m01:latest"]
+    probe = lambda img: "go1.21.13"
+    assert boc.pick_go_toolchain_milestone(ms, "go1.21.13", _probe=probe) == "r/x/m01:latest"
+    assert boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe) == "r/x/m01:latest"
+
+
+def test_probe_go_version_parses_token(monkeypatch):
+    """_probe_go_version extracts the bare go token from `go version` output."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, "go version go1.21.13 linux/amd64\n"))
+    assert boc._probe_go_version("r/x/m01:latest") == "go1.21.13"
+
+
+def test_probe_go_version_returns_empty_on_failure(monkeypatch):
+    """Probe failure (no such image / no go) → "" (picker treats as non-match)."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(1, "", "no such image"))
+    assert boc._probe_go_version("r/x/nope:latest") == ""

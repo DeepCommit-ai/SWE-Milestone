@@ -305,6 +305,107 @@ def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths:
     return "\n".join(lines) + "\n"
 
 
+def _probe_go_version(image: str) -> str:
+    """`docker run --rm <image> go version` → the reported go version token.
+
+    Returns the bare version (e.g. "go1.21.13"); "" if the probe fails (image
+    missing, daemon down, no `go` on PATH). Pure read-only — never mutates the
+    image. Split out so the milestone picker can be unit-tested with a fake probe.
+    """
+    r = subprocess.run(["docker", "run", "--rm", image, "go", "version"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return ""
+    # "go version go1.21.13 linux/amd64" → "go1.21.13"
+    for tok in (r.stdout or "").split():
+        if tok.startswith("go") and tok[2:3].isdigit():
+            return tok
+    return ""
+
+
+def pick_go_toolchain_milestone(milestones: list[str], target_go: str,
+                                _probe=_probe_go_version) -> str:
+    """Choose the milestone image whose baked `/usr/local/go` reports `target_go`.
+
+    The newer go toolchain (go-zero needs 1.21.13; base ships 1.19.13) lives in
+    the B-milestone images at /usr/local/go. The simplest robust pick is the LAST
+    milestone (B-end), but it is VERIFIED: we probe `go version` and, if the last
+    one is wrong, scan the rest (newest-first) for a match. Fail-closed if none of
+    the milestones report the target — a wrong/old toolchain COPY would make
+    `go mod download` auto-fetch from proxy.golang.org and break offline.
+    """
+    if not milestones:
+        print("Error: pick_go_toolchain_milestone got no milestones", file=sys.stderr)
+        sys.exit(1)
+    want = f"go{target_go}" if not str(target_go).startswith("go") else str(target_go)
+    seen = {}
+    # Probe last→first: the target toolchain is a B-side bump, so it lives at the end.
+    for m in reversed(milestones):
+        v = _probe(m)
+        seen[m] = v
+        if v == want:
+            return m
+    print(f"Error: no milestone image reports go version {want}; probed "
+          f"{ {m: (seen.get(m) or '?') for m in milestones} } — cannot COPY a "
+          f"correct /usr/local/go toolchain (an old toolchain would auto-download "
+          f"from proxy.golang.org and break the offline gate).", file=sys.stderr)
+    sys.exit(1)
+
+
+# A POSIX-sh one-liner that, for every `<v>.mod` under the module cache's
+# download/.../@v/ dirs, ensures a sibling `<v>.info` exists by synthesising a
+# minimal `{"Version":"<v>"}` when it is absent. NETWORK-FREE: it only writes
+# files derived from `.mod` basenames already in the cache; it never fabricates a
+# missing module (no `.mod`/`.zip` → still fails the gate, fail-closed).
+#
+# Why this is needed: the milestone images' module caches were warmed by
+# `go build`, which writes `<v>.mod`/`<v>.zip`/`<v>.ziphash` but often NOT the
+# `<v>.info` sidecar. `go mod download` (the offline gate) needs `<v>.info` to
+# resolve the version and, under `--network none` with `GOPROXY` still pointing at
+# goproxy.cn, falls through to the network and fails. The hand-built base-offline
+# had the `.info`s because a human ran an online `go mod download`; the unioned
+# raw cache does not, so we mint the missing ones offline at assembly time.
+_GO_SYNTH_INFO_RUN = (
+    'find /go/pkg/mod/cache/download -type f -name "*.mod" | while IFS= read -r m; '
+    'do i="${m%.mod}.info"; '
+    '[ -f "$i" ] || { v="$(basename "$m" .mod)"; printf \'{"Version":"%s"}\\n\' "$v" > "$i"; }; '
+    'done'
+)
+
+
+def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
+                           cache_paths: list[str], target_go: str,
+                           _probe=_probe_go_version) -> str:
+    """Go closure Dockerfile: raw-cache rsync UNION of every milestone's go module
+    cache (render_union_dockerfile) PLUS the newer go toolchain AND `.info`-sidecar
+    synthesis in the final stage.
+
+    go-zero's B-source declares `go 1.21`, but base ships go1.19.13. The target
+    toolchain (1.21.13) is baked into the B-milestone images at /usr/local/go, so
+    the final stage gets:
+        COPY --from=<verified milestone> /usr/local/go /usr/local/go
+        ENV GOTOOLCHAIN=local
+        RUN <synthesise missing .info sidecars>
+    GOTOOLCHAIN=local is REQUIRED: without it a `go 1.21` directive makes go try to
+    auto-download a matching toolchain from proxy.golang.org → fails under
+    --network none. The `.info` synthesis is REQUIRED: the unioned raw cache (warmed
+    by `go build`) lacks `<v>.info` sidecars that `go mod download` needs to resolve
+    versions offline (empirically: m001's miniredis/v2@v2.31.1 had .mod/.zip but no
+    .info → gate failed reaching goproxy.cn). The module cache never contains the
+    repo's own module (github.com/zeromicro/*), so the self-exclusion audit stays
+    clean by construction.
+    """
+    df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+    tc = pick_go_toolchain_milestone(milestones, target_go, _probe=_probe)
+    # render_union_dockerfile's last stage is `FROM ... AS final`; append the
+    # toolchain + .info-synthesis layers to that final stage (the rendered file
+    # ends with a trailing newline).
+    tail = (f"COPY --from={tc} /usr/local/go /usr/local/go\n"
+            "ENV GOTOOLCHAIN=local\n"
+            f"RUN {_GO_SYNTH_INFO_RUN}\n")
+    return df + tail
+
+
 # --------------------------------------------------------------------------- #
 # Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
 # tag/publish are Task 4.3 and are intentionally NOT done here.                #
@@ -389,9 +490,22 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         if eco == "cargo":
             df = assemble_cargo_dockerfile(repo_lower, milestones)
             _docker_build(df, staging_tag, project_root)
-        elif eco in ("go", "maven", "npm"):
+        elif eco == "go":
+            # Raw-cache rsync UNION of every milestone's go module cache, plus the
+            # newer go toolchain (COPY /usr/local/go from a milestone that reports
+            # the target version) + GOTOOLCHAIN=local in the final stage.
+            cache_paths = cfg["cache_paths"]
+            toolchain = cfg.get("toolchain") or {}
+            target_go = toolchain.get("go")
+            if not target_go:
+                print(f"Error: {repo_lower}: go ecosystem needs closure.toolchain.go "
+                      f"(target go version)", file=sys.stderr)
+                sys.exit(1)
+            df = assemble_go_dockerfile(repo_lower, milestones, cache_paths, target_go)
+            _docker_build(df, staging_tag, project_root)
+        elif eco in ("maven", "npm"):
             # Raw-cache rsync union path — render_union_dockerfile exists, but the
-            # driver wiring (+ build) is Task 4.4. Don't half-build it here.
+            # driver wiring (+ build) is a later task. Don't half-build it here.
             raise NotImplementedError(f"ecosystem {eco}: task 4.4")
         elif eco == "pip":
             raise NotImplementedError(f"ecosystem {eco}: task 4.5 (freeze-union-download)")
