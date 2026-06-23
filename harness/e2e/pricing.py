@@ -103,6 +103,9 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30, "cache_read": 0.01875},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00, "cache_read": 0.3125},
     # ── Z.AI GLM ──────────────────────────────────────────────────────────
+    # glm-5.2: cache_write ("Cached Input Storage") is a limited-time promo (free);
+    # list price is expected to track glm-5.1's 1.4 once the promo ends.
+    "glm-5.2": {"input": 1.4, "output": 4.4, "cache_read": 0.26, "cache_write": 0.0},
     "glm-5.1": {"input": 1.4, "output": 4.4, "cache_read": 0.26, "cache_write": 1.4},
     "glm-5": {"input": 1.0, "output": 3.2, "cache_read": 0.20, "cache_write": 1.0},
     "glm-5-turbo": {"input": 1.2, "output": 4.0, "cache_read": 0.24, "cache_write": 1.2},
@@ -198,6 +201,7 @@ _MATCH_ORDER = [
     ("gemini-1.5-flash", "gemini-1.5-flash"),
     ("gemini-1.5-pro", "gemini-1.5-pro"),
     # GLM (only needed for versioned suffixes like "glm-5-20260401")
+    ("glm-5.2", "glm-5.2"),      # must come before "glm-5"
     ("glm-5.1", "glm-5.1"),      # must come before "glm-5"
     ("glm-5-turbo", "glm-5-turbo"),  # must come before "glm-5"
     ("glm-5", "glm-5"),
