@@ -34,3 +34,12 @@ closure:
     - /usr/local/cargo/registry/cache
   offline_build: "cargo build --offline"
   toolchain: {rust: "1.88.0", install_online: true}
+  # nushell pins `reedline` from crates.io AND github.com/nushell/reedline?branch=main
+  # at the SAME version 0.41.0 (milestone g04_1ddae02). `cargo vendor` lays every
+  # crate in one flat <name>-<ver>/ dir and cannot hold two same-name+version crates
+  # from different sources (exit 101 "found duplicate version of package reedline
+  # v0.41.0 vendored from two sources" — confirmed with AND without --versioned-dirs).
+  # The raw cargo cache has no conflict: registry crates and git checkouts live in
+  # separate trees. So warm $CARGO_HOME online (cargo fetch --locked per milestone)
+  # and bake it, instead of vendoring. Ripgrep stays on the default `vendor`.
+  cargo_mechanism: raw-cache

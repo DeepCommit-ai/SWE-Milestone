@@ -206,6 +206,188 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     return "\n".join(lines) + "\n"
 
 
+def _probe_rust_channel(image: str) -> str:
+    """`docker run --rm <image> cat /testbed/rust-toolchain.toml` → the pinned
+    `channel = "X.Y.Z"` value (bare, e.g. "1.87.0"); "" if absent/unparseable.
+
+    Pure read-only — never mutates the image. Split out so the channel survey can be
+    unit-tested with a fake probe (mirrors `_probe_go_version`).
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", image, "cat", "/testbed/rust-toolchain.toml"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return ""
+    for line in (r.stdout or "").splitlines():
+        s = line.strip()
+        # The toolchain file's comments mention "1.72.0" etc.; only the real
+        # `channel = "..."` assignment counts (leading `channel`, not `# ...`).
+        if s.startswith("channel") and "=" in s:
+            val = s.split("=", 1)[1].strip().strip('"').strip("'")
+            if val:
+                return val
+    return ""
+
+
+def cargo_pinned_channels(repo_lower: str, milestones: list[str],
+                          configured: str | None = None,
+                          _probe=_probe_rust_channel) -> list[str]:
+    """The set of rust channels the closure must carry: every distinct
+    `rust-toolchain.toml` channel pinned by the A-baseline (`<repo>/base:latest`)
+    and each milestone, UNIONed with the configured `closure.toolchain.rust`.
+
+    nushell's milestones are HETEROGENEOUS on the rust channel — A-baseline + most
+    pin 1.86.0, a few pin 1.87.0, a few pin 1.88.0. The base image ships only 1.86.0
+    as the active toolchain; if a milestone pins 1.87/1.88 and that channel is NOT
+    installed, entering its /testbed makes rustup try to `sync channel updates for
+    <ver>` from static.rust-lang.org → fails under `--network none` (the offline
+    gate dies with a rustup dns error, NOT a cargo closure gap). So EVERY pinned
+    channel must be installed (online) at build time. Returned sorted ascending so
+    the highest is last (a stable, deterministic default pick).
+    """
+    chans = set()
+    base = f"{repo_lower}/base:latest"
+    for img in [base, *milestones]:
+        ch = _probe(img)
+        if ch:
+            chans.add(ch)
+    if configured:
+        chans.add(str(configured))
+    # Sort by (major, minor, patch) numeric tuple when possible; fall back to str.
+    def _key(v):
+        try:
+            return (0, tuple(int(p) for p in v.split(".")))
+        except ValueError:
+            return (1, v)
+    return sorted(chans, key=_key)
+
+
+def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
+                                       toolchain: dict | None = None,
+                                       _probe=_probe_rust_channel) -> str:
+    """Cargo closure via the RAW-CACHE + ONLINE-WARM pattern (NOT `cargo vendor`).
+
+    Why not vendor: nushell pins `reedline` from BOTH crates.io AND a git branch,
+    and one milestone (g04_1ddae02) carries the git checkout published as the SAME
+    `version = 0.41.0` as the registry crate. `cargo vendor` lays every crate into a
+    single `<name>[-<ver>]/` dir keyed by name (+version) and CANNOT hold two
+    same-name+version crates from different sources — it aborts the union with
+    `found duplicate version of package reedline v0.41.0 vendored from two sources`
+    (confirmed empirically WITH and WITHOUT `--versioned-dirs`). The raw cargo cache
+    has no such conflict: registry crates live under `registry/{cache,index,src}/`
+    keyed by source-hash, and git deps live in a SEPARATE tree `git/{db,checkouts}/`
+    keyed by repo-hash — so registry-0.41.0 and git-0.41.0 coexist by construction.
+
+    Mechanism (mirrors go/maven/npm's "online-warm the union", adapted for cargo):
+      fetch_builder  FROM <repo>/base:latest
+        - The base image's `$CARGO_HOME` (/usr/local/cargo) is ALREADY warm with the
+          A-baseline's registry crates, and its /testbed IS the A-baseline workspace
+          (Cargo.lock pins the OLD versions). So the union STARTS from A — no extra
+          COPY needed for the A side (mirrors go/maven/npm ADDing milestone caches on
+          top of the base cache; only the old `cargo vendor` REPLACED via a redirect).
+        - Install EVERY pinned rust toolchain ONLINE first (the milestones are
+          heterogeneous: 1.86/1.87/1.88; `cargo fetch` inside a workspace honours its
+          rust-toolchain.toml, so each channel must exist or rustup would try to
+          auto-install mid-fetch).
+        - COPY each milestone's FULL /testbed (cargo fetch reads the whole workspace
+          + its Cargo.lock; the git revs are pinned in the lock) and run plain
+          `cargo fetch` (NO --locked) per milestone INTO the shared `$CARGO_HOME`.
+          Each fetch ADDs that milestone's registry crates AND any git checkouts
+          (e.g. reedline @ branch=main) to the cache. `cargo fetch` for the base's
+          OWN /testbed warms the A side too. --locked is NOT used: nushell's milestone
+          locks are mid-migration checkpoints that don't match Cargo.toml (8/13 fail
+          `cargo fetch --locked`), so the online fetch re-resolves+warms a superset;
+          the offline gate's plain `cargo build --offline` re-resolves identically.
+      final          FROM <repo>/base:latest
+        - COPY the warmed `$CARGO_HOME` forward (registry cache/index/src + git
+          db/checkouts). NO `$CARGO_HOME/config.toml` redirect — unlike vendor this
+          path keeps the real registry index, so `cargo build --offline` resolves
+          from the cache natively (the hand-built reference image proves a redirect
+          is neither present nor needed here).
+        - Install the rust toolchain ONLINE + `rustup default <ver>` so cargo uses it
+          for any path outside /testbed too (rust-toolchain.toml only overrides
+          inside the workspace; the B milestones pin 1.88, the A-baseline pins 1.86 —
+          both channels end up present: 1.86 ships in the base, 1.88 is installed).
+
+    Self-exclusion: the repo's OWN nu-* workspace crates are PATH deps (under
+    /testbed/crates/*) — `cargo fetch` never downloads them into registry/cache or
+    git/, so the cache cannot leak nu-*-0.10[6-9] / nushell-* @ B (verified: only
+    legitimate third-party `nu-ansi-term` etc. appear). The generic forbid-glob audit
+    stays as defense-in-depth.
+
+    `static.rust-lang.org` (rustup's source) and crates.io/the git host are reachable
+    at build time but the closure is SEALED offline at eval; warming from them is
+    safe (they are not the answer — the answer is the repo's own B source, which is a
+    path dep and never fetched).
+    """
+    if not milestones:
+        print("Error: assemble_cargo_rawcache_dockerfile got no milestones",
+              file=sys.stderr)
+        sys.exit(1)
+    cargo_home = "/usr/local/cargo"
+    rust_ver = (toolchain or {}).get("rust")
+    # Survey EVERY rust channel the A-baseline + milestones pin (heterogeneous:
+    # 1.86/1.87/1.88), unioned with the configured one. Each must be installed or the
+    # offline gate dies on a rustup channel-sync (see cargo_pinned_channels). Install
+    # with `--profile default` because the workspaces pin `profile = "default"` and
+    # the agent (and some gates) may invoke clippy/rustfmt — the minimal profile would
+    # leave those absent and a `profile=default` workspace could trigger an offline
+    # component sync. The base ships 1.86.0 (minimal) as the active default; we
+    # install the rest (and re-assert the configured default). `rustup default` makes
+    # cargo use it for any path OUTSIDE a workspace (a workspace's rust-toolchain.toml
+    # still overrides inside /testbed).
+    channels = cargo_pinned_channels(repo_lower, milestones, rust_ver, _probe=_probe)
+    installs = [f"rustup toolchain install {c} --profile default" for c in channels]
+    default_ver = rust_ver or (channels[-1] if channels else None)
+    if default_ver:
+        installs.append(f"rustup default {default_ver}")
+    toolchain_run = (" && ".join(installs)) if installs else None
+
+    lines = [
+        "# syntax=docker/dockerfile:1",
+        f"FROM {repo_lower}/base:latest AS fetch_builder",
+    ]
+    # Install ALL pinned toolchains BEFORE any fetch: `cargo fetch` inside a workspace
+    # honours its rust-toolchain.toml, so the pinned channel must exist or rustup
+    # would try to auto-install it mid-build. Network is available here; rustup's
+    # source (static.rust-lang.org) is not an answer registry.
+    if toolchain_run:
+        lines.append(f"RUN {toolchain_run}")
+    for i, m in enumerate(milestones):
+        lines.append(f"COPY --from={m} /testbed /tb/m{i}")
+    # Warm the shared $CARGO_HOME from the A-baseline (the base's own /testbed) and
+    # every milestone's B-source. ONE `cargo fetch` per workspace; each ADDs its
+    # resolved deps (registry crates AND git checkouts) to /usr/local/cargo. The base
+    # /testbed (A) is fetched first so the A side is explicitly warmed; the pre-baked
+    # A cache already covers it, but this makes the A→B span unconditional.
+    #
+    # NO `--locked`: nushell's milestone Cargo.lock files are mid-migration START
+    # checkpoints whose lock does NOT match Cargo.toml even under their OWN pinned
+    # rustc (empirically `cargo fetch --locked` fails 8/13 with "the lock file needs
+    # to be updated but --locked was passed" — and the milestone IMAGES themselves
+    # were built without --locked). The online fetch therefore re-resolves+updates the
+    # lock in this throwaway builder and downloads the resulting (superset) closure;
+    # the offline GATE later runs the config's plain `cargo build --offline` (also no
+    # --locked) which re-resolves from this now-rich cache identically. `||` per
+    # workspace is NOT used: a fetch failure must surface (fail the build), not be
+    # swallowed — every workspace's deps must enter the cache.
+    fetch_dirs = ["/testbed"] + [f"/tb/m{i}" for i in range(len(milestones))]
+    fetches = " && ".join(f"cd {d} && cargo fetch" for d in fetch_dirs)
+    lines.append(f"RUN {fetches}")
+
+    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    # COPY the WHOLE warmed $CARGO_HOME (registry cache/index/src + git db/checkouts)
+    # forward. Unlike vendor there is no config.toml redirect — the real registry
+    # index is preserved, so `cargo build --offline` resolves from the cache.
+    lines.append(f"COPY --from=fetch_builder {cargo_home} {cargo_home}")
+    # ONLINE toolchain install in the final stage (the published image): install every
+    # pinned channel + set the default, so the agent's A-baseline start (1.86) and any
+    # milestone-pinned channel (1.87/1.88) all resolve offline.
+    if toolchain_run:
+        lines.append(f"RUN {toolchain_run}")
+    return "\n".join(lines) + "\n"
+
+
 def offline_gate_cmd(staging_image: str, milestone: str, offline_build: str) -> list[str]:
     # NOTE: /testbed inside the container should contain the B-source from `milestone`,
     # NOT the A-baseline baked into `staging_image`. This function returns the command
@@ -551,6 +733,66 @@ def classify_npm_offline_build_failure(staging_tag: str, output: str) -> tuple[s
             "(webpack/tsc/eslint/script error — not a missing dependency)")
 
 
+# Cargo offline-resolution failure signatures — strings cargo emits when the warmed
+# $CARGO_HOME cannot supply a crate the build needs (a real CLOSURE GAP). Distinct
+# from a COMPILE error (rustc syntax/type error in the milestone's own source — a
+# mid-migration START checkpoint), which is a SOURCE-STATE problem the closure is not
+# at fault for. The go classifier doesn't recognise these, so a cargo gap would fall
+# through its "no token → source_state" branch (fail-OPEN); this classifier closes
+# that hole.
+_CARGO_CLOSURE_GAP_RES = (
+    # A git dep whose checkout isn't in git/checkouts (e.g. reedline @ branch=main).
+    _re.compile(r"can't checkout from .*offline", _re.IGNORECASE),
+    _re.compile(r"failed to (?:load|get|update|sync) .*source", _re.IGNORECASE),
+    _re.compile(r"Unable to update .*(?:registry|git|https?://)", _re.IGNORECASE),
+    # A registry crate version absent from the cache index/cache.
+    _re.compile(r"failed to select a version", _re.IGNORECASE),
+    _re.compile(r"not found in vendored sources", _re.IGNORECASE),
+    _re.compile(r"no matching package(?: named)?\b", _re.IGNORECASE),
+    _re.compile(r"unable to get packages from source", _re.IGNORECASE),
+    _re.compile(r"failed to download .*(?:from|crate)", _re.IGNORECASE),
+    # Any network attempt under --offline is itself proof the bytes weren't cached.
+    _re.compile(r"you are in (?:the )?offline mode", _re.IGNORECASE),
+    _re.compile(r"(?:dns error|name resolution|network is unreachable|"
+                r"error sending request|Temporary failure in name resolution)",
+                _re.IGNORECASE),
+    _re.compile(r"the lock file .* needs to be updated but --locked", _re.IGNORECASE),
+)
+
+
+def classify_cargo_offline_build_failure(staging_tag: str, output: str) -> tuple[str, str]:
+    """Cargo offline-build failure classifier `(staging_tag, output) -> (kind,
+    detail)` for `run_offline_gate`.
+
+    nushell's milestone /testbeds are mid-migration START checkpoints: several FAIL
+    `cargo build --offline` on a rustc COMPILE error (e.g. `unexpected closing
+    delimiter`, `could not compile <crate>`, `error[E0432] unresolved import`) — the
+    SOURCE isn't a clean buildable state, but every dependency byte IS in the warmed
+    cache, so this is NOT a closure gap. A REAL closure gap (a crate/git checkout the
+    cache lacks) instead trips one of `_CARGO_CLOSURE_GAP_RES` (`can't checkout from
+    … offline`, `failed to select a version`, `no matching package`, a network/dns
+    attempt under --offline, …).
+
+    Decision (fail-closed): ANY closure-gap signature present → "closure_gap" (BLOCK).
+    Otherwise the non-zero is a rustc compile/type/syntax error (or a build-script
+    failure) → "source_state" (record, do not block). `staging_tag` is accepted for
+    signature-compatibility with the go classifier but unused — cargo's gap strings
+    are definitive in-text (no cache probe needed). This is sound: cargo names a
+    missing crate/source explicitly, so the absence of every gap signature means the
+    bytes were present and rustc simply couldn't compile the source.
+    """
+    text = output or ""
+    for rx in _CARGO_CLOSURE_GAP_RES:
+        if rx.search(text):
+            return ("closure_gap",
+                    f"cargo offline resolution gap (crate/source missing from the "
+                    f"warmed cache): matched {rx.pattern!r}")
+    return ("source_state",
+            "no cargo offline-resolution signature (rustc compile/type/syntax or "
+            "build-script error — the milestone source isn't a clean buildable "
+            "state; the closure has the dependency bytes)")
+
+
 def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
                      goproxy_off: bool = False, classifier=None) -> str:
     """Per-milestone OFFLINE GATE: prove the closure is sufficient to build the
@@ -611,7 +853,16 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
         # fully offline. For go ecosystems, also set GOPROXY=off so missing modules
         # produce a deterministic "module lookup disabled by GOPROXY=off" token
         # (without it, dial-tcp errors escape the classifier and cause fail-OPEN).
-        docker_run_argv = ["docker", "run", "--rm", "--network", "none"]
+        #
+        # --ulimit nofile: the docker default soft limit is 1024, which a large
+        # parallel `cargo build` (nushell's ~1000-crate graph) blows through with
+        # `Too many open files (os error 24)` — an ENVIRONMENT artifact that would
+        # masquerade as a (mis-classified) build failure and mask whether the closure
+        # is actually complete. Raise it to the daemon hard limit's headroom
+        # (65536:524288) so the gate genuinely exercises dependency availability. A
+        # higher fd ceiling is harmless for every other ecosystem's gate.
+        docker_run_argv = ["docker", "run", "--rm", "--network", "none",
+                           "--ulimit", "nofile=65536:524288"]
         if goproxy_off:
             docker_run_argv += ["-e", "GOPROXY=off"]
         docker_run_argv += ["-v", f"{hosttmp}/testbed:/testbed", staging_tag,
@@ -672,8 +923,14 @@ def run_cargo_abaseline_gate(staging_tag: str, offline_build: str) -> None:
     (sys.exit 1). The closure-gap signatures above are called out explicitly in the
     error so the cause (missing vendored A-version) is unambiguous.
     """
+    # --ulimit nofile: same reason as run_offline_gate — nushell's large parallel
+    # cargo build exhausts the docker-default 1024 fd soft limit (`Too many open
+    # files`), an environment artifact that would masquerade as a closure-gap failure
+    # here (where ANY non-zero fails closed). Raise it so the A-baseline build runs to
+    # completion and the gate's pass/fail reflects the closure, not the fd ceiling.
     r = subprocess.run(
-        ["docker", "run", "--rm", "--network", "none", staging_tag,
+        ["docker", "run", "--rm", "--network", "none",
+         "--ulimit", "nofile=65536:524288", staging_tag,
          "sh", "-c", f"cd /testbed && {offline_build}"],
         capture_output=True, text=True)
     if r.returncode == 0:
@@ -1714,11 +1971,35 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
     try:
         if eco == "cargo":
             # closure.toolchain.rust (optional): some repos pin a rust channel
-            # (nushell → 1.88.0) the base image lacks; assemble_cargo_dockerfile
-            # then installs it ONLINE in the final stage. Absent → no rust-install
-            # line (ripgrep unchanged).
-            df = assemble_cargo_dockerfile(repo_lower, milestones,
-                                           toolchain=cfg.get("toolchain"))
+            # (nushell → 1.88.0) the base image lacks; both cargo mechanisms then
+            # install it ONLINE in the final stage. Absent → no rust-install line
+            # (ripgrep unchanged).
+            #
+            # closure.cargo_mechanism selects HOW the cargo closure is built:
+            #   "vendor"    (default): `cargo vendor` the union of milestone locks
+            #               into /opt/vendor + a $CARGO_HOME redirect. Solves the
+            #               sparse-index re-resolution problem and works for repos
+            #               whose deps are all registry/path crates (ripgrep).
+            #   "raw-cache": warm the raw $CARGO_HOME (registry cache/index/src +
+            #               git db/checkouts) ONLINE via `cargo fetch` per milestone,
+            #               then COPY it forward. REQUIRED for nushell:
+            #               it pins `reedline` from crates.io AND a git branch at the
+            #               SAME version 0.41.0, which `cargo vendor` cannot represent
+            #               (one flat <name>-<ver>/ dir → "found duplicate version …
+            #               from two sources"), but the raw cache holds trivially
+            #               (registry and git live in separate trees).
+            mechanism = (cfg.get("cargo_mechanism") or "vendor").lower()
+            if mechanism == "raw-cache":
+                df = assemble_cargo_rawcache_dockerfile(
+                    repo_lower, milestones, toolchain=cfg.get("toolchain"))
+            elif mechanism == "vendor":
+                df = assemble_cargo_dockerfile(repo_lower, milestones,
+                                               toolchain=cfg.get("toolchain"))
+            else:
+                print(f"Error: {repo_lower}: unknown closure.cargo_mechanism "
+                      f"{mechanism!r} (want 'vendor' or 'raw-cache')",
+                      file=sys.stderr)
+                sys.exit(1)
             _docker_build(df, staging_tag, project_root)
         elif eco == "go":
             # Raw-cache rsync UNION of every milestone's go module cache, plus the
@@ -1826,10 +2107,19 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         # real yarn cache gap. The npm classifier treats a yarn cache-miss /
         # registry-request as a closure gap → BLOCK, and a --frozen-lockfile
         # integrity mismatch (yarn.lock vs tree — source-state) as source_state.
+        # cargo needs a cargo-aware classifier for the same reason: the default (go)
+        # classifier doesn't recognise cargo's offline-resolution strings (`can't
+        # checkout from … offline`, `failed to select a version`, `no matching
+        # package`, a network/dns attempt under --offline) and would fall through to
+        # "no token → source_state" (fail-OPEN on a real crate/git gap). The cargo
+        # classifier treats those as a closure gap → BLOCK, and a rustc compile/type/
+        # syntax error (nushell's mid-migration START checkpoints) as source_state.
         if eco == "maven":
             gate_classifier = classify_maven_offline_build_failure(forbid_globs)
         elif eco == "npm":
             gate_classifier = classify_npm_offline_build_failure
+        elif eco == "cargo":
+            gate_classifier = classify_cargo_offline_build_failure
         else:
             gate_classifier = None
         source_state = []

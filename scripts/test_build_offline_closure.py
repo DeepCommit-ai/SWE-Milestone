@@ -201,6 +201,283 @@ def test_assemble_cargo_dockerfile_no_toolchain_no_rust_install():
         assert "rustup default" not in df
 
 
+# ---------------------------------------------------------------------------
+# Cargo RAW-CACHE + ONLINE-WARM mechanism (nushell — reedline crates.io/git
+# collision that `cargo vendor` cannot represent).
+# ---------------------------------------------------------------------------
+
+# A fake rust-toolchain.toml channel probe: the A-baseline (base:latest) + most
+# milestones pin 1.86.0, two pin 1.88.0, one pins 1.87.0 (mirrors nushell).
+def _rust_probe(channels):
+    """Return a `_probe(image) -> channel` fake from an {image: channel} map."""
+    return lambda img: channels.get(img, "")
+
+
+def test_cargo_pinned_channels_unions_base_milestones_and_configured():
+    """Every distinct rust-toolchain.toml channel pinned by the A-baseline + each
+    milestone is collected, UNIONed with the configured one, sorted ascending."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
+             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
+    got = boc.cargo_pinned_channels("r/x", ms, configured="1.88.0",
+                                    _probe=_rust_probe(chans))
+    assert got == ["1.86.0", "1.87.0", "1.88.0"]
+
+
+def test_cargo_pinned_channels_adds_configured_even_if_unpinned():
+    """A configured channel absent from every toolchain file is still installed
+    (defensive: the config is the source of truth for the primary version)."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest"]
+    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0"}
+    got = boc.cargo_pinned_channels("r/x", ms, configured="1.90.0",
+                                    _probe=_rust_probe(chans))
+    assert got == ["1.86.0", "1.90.0"]
+
+
+def test_cargo_pinned_channels_dedups_and_probes_base():
+    """The A-baseline (base:latest) is probed too (the agent starts there); dupes
+    collapse to one entry."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    # base pins a channel NO milestone pins → it must still appear (agent A-start).
+    chans = {base: "1.85.0", "r/x/m00:latest": "1.88.0", "r/x/m01:latest": "1.88.0"}
+    got = boc.cargo_pinned_channels("r/x", ms, configured=None,
+                                    _probe=_rust_probe(chans))
+    assert got == ["1.85.0", "1.88.0"]
+
+
+def test_probe_rust_channel_skips_comments_picks_assignment(monkeypatch):
+    """_probe_rust_channel returns the real `channel = "X"` line, ignoring the
+    comment lines that mention other versions (1.72.0 etc.)."""
+    toml = ('# the channel should be 1.70.0 ... latest stable release is 1.72.0\n'
+            'profile = "default"\n'
+            'channel = "1.88.0"\n')
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, toml))
+    assert boc._probe_rust_channel("r/x/m00:latest") == "1.88.0"
+
+
+def test_probe_rust_channel_absent_returns_empty(monkeypatch):
+    """No toolchain file (probe fails) → empty string (caller unions away)."""
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(1, "", "no such file"))
+    assert boc._probe_rust_channel("r/x/m00:latest") == ""
+
+
+def test_assemble_cargo_rawcache_structure():
+    """Raw-cache assembly: fetch_builder warms $CARGO_HOME via `cargo fetch` per
+    workspace (A-baseline + every milestone), the final stage COPYs the whole
+    $CARGO_HOME forward, and there is NO vendor dir / config.toml redirect."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
+             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
+    df = boc.assemble_cargo_rawcache_dockerfile(
+        "r/x", ms, toolchain={"rust": "1.88.0", "install_online": True},
+        _probe=_rust_probe(chans))
+    # two stages off base:latest
+    assert "FROM r/x/base:latest AS fetch_builder" in df
+    assert "FROM r/x/base:latest AS final" in df
+    # one COPY --from per milestone into /tb/m<i>
+    for i, m in enumerate(ms):
+        assert f"COPY --from={m} /testbed /tb/m{i}" in df
+    # warm via cargo fetch — the A-baseline (/testbed) AND every milestone copy
+    assert "cd /testbed && cargo fetch" in df
+    for i in range(len(ms)):
+        assert f"cd /tb/m{i} && cargo fetch" in df
+    # final stage COPYs the WHOLE $CARGO_HOME forward
+    assert "COPY --from=fetch_builder /usr/local/cargo /usr/local/cargo" in df
+    # raw-cache uses the real index — NO vendor dir, NO config.toml redirect
+    assert "/opt/vendor" not in df
+    assert "config.toml" not in df
+    assert "vendored-sources" not in df
+
+
+def test_assemble_cargo_rawcache_no_locked():
+    """The warm step must NOT pass --locked: nushell milestone Cargo.lock files are
+    mid-migration checkpoints whose lock doesn't match Cargo.toml (cargo fetch
+    --locked fails 8/13). Plain `cargo fetch` re-resolves+warms a superset."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest"]
+    df = boc.assemble_cargo_rawcache_dockerfile(
+        "r/x", ms, toolchain={"rust": "1.88.0"},
+        _probe=_rust_probe({base: "1.88.0", "r/x/m00:latest": "1.88.0"}))
+    assert "cargo fetch --locked" not in df
+    assert "cargo fetch" in df
+
+
+def test_assemble_cargo_rawcache_installs_all_channels_default_profile():
+    """Every distinct pinned channel (1.86/1.87/1.88) is installed with --profile
+    default (the workspaces pin profile=default; the agent may run clippy/rustfmt),
+    in BOTH the fetch_builder (so `cargo fetch` honours each workspace's channel) and
+    the final published stage. The configured rust is set as `rustup default`."""
+    base = "r/x/base:latest"
+    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
+             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
+    df = boc.assemble_cargo_rawcache_dockerfile(
+        "r/x", ms, toolchain={"rust": "1.88.0"}, _probe=_rust_probe(chans))
+    for c in ("1.86.0", "1.87.0", "1.88.0"):
+        assert f"rustup toolchain install {c} --profile default" in df
+    assert "rustup default 1.88.0" in df
+    assert "--profile minimal" not in df
+    # installs appear in BOTH stages (fetch_builder before the COPYs, final after).
+    fb_idx = df.index("FROM r/x/base:latest AS fetch_builder")
+    final_idx = df.index("FROM r/x/base:latest AS final")
+    first_install = df.index("rustup toolchain install 1.86.0")
+    last_install = df.rindex("rustup toolchain install 1.86.0")
+    assert fb_idx < first_install < final_idx < last_install
+    # fetch_builder installs the channels BEFORE copying/fetching the workspaces.
+    assert first_install < df.index("COPY --from=r/x/m00:latest")
+
+
+def test_assemble_cargo_rawcache_empty_milestones_exits():
+    """No milestones → fail-closed (an empty cargo closure is never valid)."""
+    with pytest.raises(SystemExit):
+        boc.assemble_cargo_rawcache_dockerfile("r/x", [], toolchain={"rust": "1.88.0"})
+
+
+# ---- cargo offline-build failure classifier -------------------------------
+# A genuine cargo CLOSURE GAP (missing crate / un-cached git checkout / any network
+# attempt under --offline) must BLOCK; a rustc compile/syntax/type error (nushell's
+# mid-migration START checkpoints) is SOURCE-STATE and must NOT block.
+
+def test_classify_cargo_git_checkout_offline_is_gap():
+    """A git dep whose checkout isn't cached (`can't checkout from … offline`) is a
+    real closure gap → BLOCK (this is exactly the reedline-from-git case)."""
+    out = ("error: failed to load source for dependency `reedline`\n"
+           "Caused by:\n  Unable to update https://github.com/nushell/reedline?branch=main\n"
+           "Caused by:\n  can't checkout from 'https://github.com/nushell/reedline': "
+           "you are in the offline mode (--offline)\n")
+    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    assert kind == "closure_gap"
+
+
+def test_classify_cargo_select_version_is_gap():
+    """`failed to select a version` (a crate version absent from the cache) → gap."""
+    out = "error: failed to select a version for the requirement `bstr = \"^1.12\"`"
+    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    assert kind == "closure_gap"
+
+
+def test_classify_cargo_no_matching_package_is_gap():
+    """A missing dev-dependency (`no matching package named X found`) → gap."""
+    out = ("error: no matching package named `futures-timer` found\n"
+           "required by `rstest v0.23.0`\n  dependency `rstest = \"^0.23\"` of "
+           "package `nu-lsp v0.106.1`")
+    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    assert kind == "closure_gap"
+
+
+def test_classify_cargo_network_attempt_is_gap():
+    """A DNS/network attempt under --offline (rustup channel sync, a registry hit) is
+    proof the bytes weren't cached → gap (fail-closed)."""
+    out = ("info: syncing channel updates for 1.87.0-x86_64-unknown-linux-gnu\n"
+           "error: could not download file from "
+           "'https://static.rust-lang.org/dist/channel-rust-1.87.0.toml.sha256'\n"
+           "Caused by:\n  failed to lookup address information: "
+           "Temporary failure in name resolution")
+    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    assert kind == "closure_gap"
+
+
+def test_classify_cargo_compile_error_is_source_state():
+    """A rustc syntax error (`unexpected closing delimiter`, `could not compile
+    <crate>`) is a mid-migration SOURCE checkpoint — the deps ARE cached → NOT a
+    closure gap (must not block publish)."""
+    out = ("error: unexpected closing delimiter: `}`\n"
+           "306 | }\n    | ^ unexpected closing delimiter\n"
+           "error: could not compile `nu-command` (lib) due to 1 previous error\n"
+           "warning: build failed, waiting for other jobs to finish...")
+    kind, detail = boc.classify_cargo_offline_build_failure(
+        "r/x/base-offline:staging", out)
+    assert kind == "source_state"
+    assert "compile" in detail.lower()
+
+
+def test_classify_cargo_type_error_is_source_state():
+    """An `error[E0432] unresolved import` / type error is a compile failure, not a
+    missing-from-cache dependency → source_state."""
+    out = ("error[E0599]: no method named `frobnicate` found for struct `Foo`\n"
+           "error: could not compile `nu-protocol` (lib) due to 1 previous error")
+    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    assert kind == "source_state"
+
+
+# ---- cargo_mechanism dispatch (vendor default for ripgrep; raw-cache for nushell)
+
+def _cargo_dispatch_harness(monkeypatch, tmp_path, repo, yaml_text):
+    """Run build_closure for a cargo repo with ALL docker mocked; return which
+    assemble function fired + the gate classifier used + whether :latest was tagged.
+    """
+    (tmp_path / "quarantine_configs").mkdir(exist_ok=True)
+    (tmp_path / "quarantine_configs" / f"{repo}.yaml").write_text(yaml_text)
+    seen = {"assemble": None, "classifier": None, "tagged": False}
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda r: [f"{repo}/m01:latest", f"{repo}/m02:latest"])
+    monkeypatch.setattr(boc, "assemble_cargo_dockerfile",
+                        lambda *a, **k: seen.__setitem__("assemble", "vendor") or "DF")
+    monkeypatch.setattr(boc, "assemble_cargo_rawcache_dockerfile",
+                        lambda *a, **k: seen.__setitem__("assemble", "raw-cache") or "DF")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    def fake_gate(tag, m, ob, **k):
+        seen["classifier"] = k.get("classifier")
+        return "PASS"
+    monkeypatch.setattr(boc, "run_offline_gate", fake_gate)
+    monkeypatch.setattr(boc, "run_cargo_abaseline_gate", lambda tag, ob: None)
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            seen["tagged"] = True
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    boc.build_closure(repo, tmp_path, push=False, keep=True)
+    return seen
+
+
+_NU_CARGO_YAML = (
+    "ecosystem: [cargo]\n"
+    "closure:\n"
+    "  cache_paths:\n"
+    "    - /usr/local/cargo/registry/cache\n"
+    "  offline_build: 'cargo build --offline'\n"
+    "  toolchain: {rust: \"1.88.0\", install_online: true}\n"
+    "  cargo_mechanism: raw-cache\n")
+
+_RG_CARGO_YAML = (
+    "ecosystem: [cargo]\n"
+    "closure:\n"
+    "  cache_paths:\n"
+    "    - /usr/local/cargo/registry/cache\n"
+    "  offline_build: 'cargo build --offline'\n")
+
+
+def test_build_closure_cargo_rawcache_mechanism_selected(monkeypatch, tmp_path):
+    """closure.cargo_mechanism: raw-cache (nushell) → the raw-cache assembly fires,
+    the cargo classifier is wired into the gate, and :latest is tagged on all-PASS."""
+    seen = _cargo_dispatch_harness(monkeypatch, tmp_path, "nu", _NU_CARGO_YAML)
+    assert seen["assemble"] == "raw-cache"
+    assert seen["classifier"] is boc.classify_cargo_offline_build_failure
+    assert seen["tagged"] is True
+
+
+def test_build_closure_cargo_vendor_is_default(monkeypatch, tmp_path):
+    """No cargo_mechanism key (ripgrep) → the vendor assembly fires (unchanged)."""
+    seen = _cargo_dispatch_harness(monkeypatch, tmp_path, "rg", _RG_CARGO_YAML)
+    assert seen["assemble"] == "vendor"
+    # the cargo classifier is still wired (vendor gate also benefits from it)
+    assert seen["classifier"] is boc.classify_cargo_offline_build_failure
+
+
+def test_build_closure_cargo_unknown_mechanism_exits(monkeypatch, tmp_path):
+    """An unrecognised cargo_mechanism → fail-closed (no silent fallback)."""
+    bad = _RG_CARGO_YAML.replace(
+        "  offline_build: 'cargo build --offline'\n",
+        "  offline_build: 'cargo build --offline'\n  cargo_mechanism: bogus\n")
+    with pytest.raises(SystemExit):
+        _cargo_dispatch_harness(monkeypatch, tmp_path, "rg", bad)
+
+
 def test_resolve_config_path_case_insensitive(tmp_path):
     """--repo is lowercased for image tags, but the yaml file may be MixedCase."""
     (tmp_path / "quarantine_configs").mkdir()
