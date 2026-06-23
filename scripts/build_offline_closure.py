@@ -980,6 +980,263 @@ def run_cargo_abaseline_gate(staging_tag: str, offline_build: str) -> None:
     sys.exit(1)
 
 
+# --------------------------------------------------------------------------- #
+# Toolchain coverage gate: a build-time, DECLARATION-level check that every    #
+# toolchain version a milestone DECLARES (its rust-toolchain.toml channel /    #
+# go.mod `go` directive) is actually installed in the closure image. Read the  #
+# requirement from the MILESTONE IMAGE's real declaration file — NOT the yaml  #
+# config — so a version the config never listed is still caught. Closes a gap  #
+# where a milestone needing a rust/go we didn't pre-install would only fail    #
+# INDIRECTLY (and risk being mis-labelled source-state and silently published).#
+# (node/jdk are OUT OF SCOPE for now — only rust + go; a later extension could  #
+# add a node `engines`/`.nvmrc` and a jdk `maven.compiler.release` check here.) #
+# --------------------------------------------------------------------------- #
+
+def parse_rust_channel(toolchain_toml: str) -> str:
+    """Parse a milestone's `/testbed/rust-toolchain.toml` text → the pinned
+    `channel = "X"` value (bare, e.g. "1.86.0"); "" if absent/unparseable.
+
+    The pin is EXACT: rustup forces exactly that channel inside the workspace. The
+    `[toolchain]` table holds the assignment; comment lines (e.g. "latest stable
+    release is 1.72.0") must be ignored — only a real leading `channel = "..."`
+    assignment counts (mirrors `_probe_rust_channel`'s line filter). A non-numeric
+    channel ("stable"/"nightly"/"beta") is returned verbatim; the caller treats a
+    non-numeric channel as "just needs SOME toolchain" rather than an exact pin.
+    An empty string (no such file, or no channel line) means NO hard requirement.
+    """
+    for line in (toolchain_toml or "").splitlines():
+        s = line.strip()
+        # Only the real `channel = "..."` assignment; never a `# ...` comment that
+        # merely mentions a version. (Same guard as _probe_rust_channel.)
+        if s.startswith("channel") and "=" in s:
+            val = s.split("=", 1)[1].strip().strip('"').strip("'")
+            if val:
+                return val
+    return ""
+
+
+def parse_rustup_toolchain_list(rustup_list: str) -> list[str]:
+    """Parse `rustup toolchain list` output → the list of installed numeric channel
+    versions (e.g. ["1.86.0", "1.88.0"]).
+
+    Each line looks like `1.86.0-x86_64-unknown-linux-gnu (active, default)` or
+    `stable-x86_64-unknown-linux-gnu (active, default)`. We keep the leading token
+    up to the FIRST `-` and retain only the ones that start with a digit (a real
+    pinned version) — `stable`/`nightly`/`beta` toolchains are dropped from the
+    numeric inventory (they can't satisfy an EXACT numeric pin). The `(active…)` /
+    `(default)` suffix is ignored. Returned in input order, de-duplicated.
+    """
+    out = []
+    for line in (rustup_list or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # Drop the trailing "(active, default)" annotation, keep the toolchain id.
+        tok = s.split()[0]
+        # The channel is the leading segment before the target triple's first '-'.
+        ver = tok.split("-", 1)[0]
+        if ver[:1].isdigit() and ver not in out:
+            out.append(ver)
+    return out
+
+
+def parse_go_directive(go_mod: str) -> tuple[str, str]:
+    """Parse the `^go ` (minimum) and optional `^toolchain ` (exact) lines of a
+    milestone's `/testbed/go.mod` → (min_version, toolchain_version).
+
+    - `go 1.24.4` → a MINIMUM (with GOTOOLCHAIN=local, go uses the installed
+      toolchain and refuses if it is OLDER than the directive). May be 2-part
+      (`go 1.21`) or 3-part (`go 1.24.4`).
+    - `toolchain go1.24.5` → an EXACT toolchain the module names; the bare version
+      (`1.24.5`) is returned (the leading `go` is stripped).
+    Either is "" if its line is absent. The caller compares the IMAGE's `go version`
+    against the directive (>= the minimum).
+    """
+    min_ver, tc_ver = "", ""
+    for line in (go_mod or "").splitlines():
+        s = line.strip()
+        if s.startswith("go ") and not min_ver:
+            val = s[len("go "):].strip()
+            # strip any trailing comment (`go 1.21 // note`)
+            val = val.split()[0] if val.split() else ""
+            if val[:1].isdigit():
+                min_ver = val
+        elif s.startswith("toolchain ") and not tc_ver:
+            val = s[len("toolchain "):].strip()
+            val = val.split()[0] if val.split() else ""
+            # `toolchain go1.24.5` → strip the leading `go`
+            if val.startswith("go") and val[2:3].isdigit():
+                val = val[2:]
+            if val[:1].isdigit():
+                tc_ver = val
+    return (min_ver, tc_ver)
+
+
+def parse_go_version(go_version_out: str) -> str:
+    """`go version` stdout → the bare numeric version (e.g. "1.24.5"); "" if absent.
+
+    "go version go1.24.5 linux/amd64" → "1.24.5" (the leading `go` is stripped so
+    it compares cleanly against a go.mod directive's bare `1.24.4`).
+    """
+    for tok in (go_version_out or "").split():
+        if tok.startswith("go") and tok[2:3].isdigit():
+            return tok[2:]
+    return ""
+
+
+def _semver_tuple(v: str) -> tuple:
+    """A go-style version string → a numeric tuple for >= comparison. A 2-part
+    directive (`1.21`) is padded so `1.21` and `1.21.13` compare correctly
+    (`(1,21) <= (1,21,13)` because tuple compare treats the shorter as a prefix —
+    Python's `(1,21) < (1,21,13)` is True, which is exactly the >= semantics we
+    want: the image's 1.21.13 satisfies the directive's 1.21). Non-numeric segments
+    sort low. Used only for go (rust pins are EXACT string matches, no compare)."""
+    parts = []
+    for p in str(v).split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(-1)
+    return tuple(parts)
+
+
+def go_version_satisfies(image_version: str, directive: str) -> bool:
+    """True iff the IMAGE's installed go (`image_version`, bare e.g. "1.24.5")
+    is >= the go.mod `directive` (bare e.g. "1.24.4"). Empty directive → True (no
+    requirement). Empty image version → False (can't prove it satisfies)."""
+    if not directive:
+        return True
+    if not image_version:
+        return False
+    return _semver_tuple(image_version) >= _semver_tuple(directive)
+
+
+def _docker_cat(image: str, path: str) -> str:
+    """Read-only `docker run --rm <image> sh -c 'cat <path> 2>/dev/null'` → stdout
+    ("" on any failure / absent file). NEVER mutates the image."""
+    r = subprocess.run(
+        ["docker", "run", "--rm", image, "sh", "-c", f"cat {path} 2>/dev/null"],
+        capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _docker_sh(image: str, script: str) -> str:
+    """Read-only `docker run --rm <image> sh -c '<script>'` → stdout ("" on
+    failure). Used for `rustup toolchain list` / `go version` inventory probes.
+    NEVER mutates the image."""
+    r = subprocess.run(
+        ["docker", "run", "--rm", image, "sh", "-c", script],
+        capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def milestone_rust_requirement(milestone: str, _cat=_docker_cat) -> str:
+    """The rust channel a milestone DECLARES via /testbed/rust-toolchain.toml, read
+    from the milestone IMAGE (not the config). "" = no rust-toolchain.toml → no hard
+    requirement (the image default is used)."""
+    return parse_rust_channel(_cat(milestone, "/testbed/rust-toolchain.toml"))
+
+
+def milestone_go_requirement(milestone: str, _cat=_docker_cat) -> tuple[str, str]:
+    """The (go-min, toolchain-exact) a milestone DECLARES via /testbed/go.mod, read
+    from the milestone IMAGE (not the config). ("","") = no go directive."""
+    return parse_go_directive(_cat(milestone, "/testbed/go.mod"))
+
+
+def image_rust_toolchains(image_tag: str, _sh=_docker_sh) -> list[str]:
+    """The numeric rust channels INSTALLED in `image_tag` (rustup toolchain list)."""
+    return parse_rustup_toolchain_list(_sh(image_tag, "rustup toolchain list"))
+
+
+def image_go_version(image_tag: str, _sh=_docker_sh) -> str:
+    """The go version INSTALLED in `image_tag` (`go version` → bare e.g. 1.24.5)."""
+    return parse_go_version(_sh(image_tag, "go version"))
+
+
+def run_toolchain_coverage_gate(image_tag: str, milestones: list[str],
+                                ecosystems: list[str],
+                                _cat=_docker_cat, _sh=_docker_sh) -> None:
+    """TOOLCHAIN COVERAGE GATE (declaration-level, fail-fast).
+
+    Prove that every toolchain version each milestone DECLARES is actually installed
+    in the closure `image_tag`. Requirements are read from the MILESTONE IMAGES' real
+    declaration files (rust-toolchain.toml / go.mod), NOT the yaml config — the whole
+    point is to catch a requirement the config missed (which the CONFIG-driven
+    pre-install step would silently skip, leaving only the build gate to fail
+    INDIRECTLY, where it could be mis-labelled source-state and published).
+
+    Per milestone:
+      - rust (when `ecosystems` includes "cargo"): parse the EXACT pinned channel
+        from /testbed/rust-toolchain.toml. A numeric pin (e.g. "1.86.0") must appear
+        VERBATIM in `image_tag`'s `rustup toolchain list`. A non-numeric channel
+        ("stable"/"nightly"/"beta") is NOT an exact-version requirement, so we only
+        require the image to carry SOME toolchain (don't hard-fail on it). No
+        rust-toolchain.toml → no requirement.
+      - go (when `ecosystems` includes "go"): parse the `go X.Y[.Z]` directive
+        (MINIMUM) and optional `toolchain goX.Y.Z` (exact, also enforced as a
+        minimum — an exact toolchain newer than `go` is still satisfied by a >=
+        image). The image's `go version` must be >= the highest of those. No `go`
+        directive → no requirement.
+
+    Collect ALL shortfalls across ALL milestones FIRST, then if any, sys.exit(1) with
+    a report listing each `milestone → needs <ver>, image has <list>` (do NOT exit on
+    the first miss — one rebuild fixes all). Milestones/ecosystems with no toolchain
+    declaration are a no-op; a pip/maven/npm-only repo reads no rust/go requirement,
+    so the gate is correctly a no-op there.
+
+    Read-only: only `docker run --rm` cats/probes on the milestone + closure images.
+    Returns None on PASS.
+    """
+    ecos = {str(e).strip().lower() for e in (ecosystems or [])}
+    want_rust = "cargo" in ecos
+    want_go = "go" in ecos
+    if not (want_rust or want_go):
+        return  # pip/maven/npm-only: no rust/go declaration to read → no-op.
+
+    # Probe the closure image's inventory ONCE (it is the same for every milestone).
+    img_rust = image_rust_toolchains(image_tag, _sh=_sh) if want_rust else []
+    img_go = image_go_version(image_tag, _sh=_sh) if want_go else ""
+
+    shortfalls = []  # list of (milestone, kind, needs, has-description)
+    for m in milestones:
+        if want_rust:
+            chan = milestone_rust_requirement(m, _cat=_cat)
+            if chan:
+                # A numeric pin is an EXACT requirement; a non-numeric channel
+                # (stable/nightly/beta) only needs SOME toolchain present.
+                if chan[:1].isdigit():
+                    if chan not in img_rust:
+                        shortfalls.append(
+                            (m, "rust", chan,
+                             f"installed channels {img_rust or '[]'}"))
+                else:
+                    if not img_rust:
+                        shortfalls.append(
+                            (m, "rust", f"{chan} (non-numeric → any toolchain)",
+                             "NO rust toolchain installed"))
+        if want_go:
+            min_ver, tc_ver = milestone_go_requirement(m, _cat=_cat)
+            # Enforce the HIGHEST of the `go` minimum and the optional exact
+            # `toolchain` line (both are satisfied by a >= image).
+            need = max([v for v in (min_ver, tc_ver) if v],
+                       key=_semver_tuple, default="")
+            if need and not go_version_satisfies(img_go, need):
+                shortfalls.append(
+                    (m, "go", need,
+                     f"installed go {img_go or '<none>'}"))
+
+    if shortfalls:
+        lines = [f"Error: TOOLCHAIN COVERAGE GATE failed for {image_tag} — "
+                 f"{len(shortfalls)} milestone toolchain requirement(s) are NOT "
+                 f"installed in the closure image (a milestone DECLARES a "
+                 f"rust/go version the image does not carry; the CONFIG-driven "
+                 f"pre-install missed it). Rebuild after pre-installing:"]
+        for m, kind, needs, has in shortfalls:
+            lines.append(f"  - {m}: {kind} needs {needs} — {has}")
+        print("\n".join(lines), file=sys.stderr)
+        sys.exit(1)
+
+
 def _dist_name(req: str) -> str:
     for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", "@", " "):
         if sep in req:
@@ -2093,6 +2350,17 @@ def _build_go_npm_closure(repo_lower: str, project_root: Path,
             else:
                 print(f"offline gate [{i}/{len(milestones)}] {m}: PASS", flush=True)
 
+        # 2b) TOOLCHAIN COVERAGE GATE (declaration-level, fail-fast) — every go
+        #     version a milestone DECLARES (its go.mod `go` directive, read from the
+        #     milestone IMAGE) must be INSTALLED in the staging closure. (rust is not
+        #     part of this dual repo; the gate reads only the go side here.) Catches a
+        #     toolchain the CONFIG-driven pre-install missed BEFORE :latest is tagged.
+        print(f"toolchain coverage gate (milestone go.mod vs staging image) ...",
+              flush=True)
+        run_toolchain_coverage_gate(staging_tag, milestones, ["go", "npm"])
+        print(f"toolchain coverage gate: PASS (every declared go toolchain is "
+              f"installed in the closure)", flush=True)
+
         # 3) No closure gap (any gap exited above) → publish. Only now tag :latest.
         passed = len(milestones) - len(source_state)
         tr = subprocess.run(["docker", "tag", staging_tag, latest_tag])
@@ -2380,6 +2648,20 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             run_cargo_abaseline_gate(staging_tag, offline_build)
             print(f"cargo A-baseline offline gate: PASS (the agent's A-start state "
                   f"builds offline against the closure)", flush=True)
+
+        # 2c) TOOLCHAIN COVERAGE GATE (declaration-level, fail-fast) — every rust/go
+        #     version a milestone DECLARES (its rust-toolchain.toml channel / go.mod
+        #     `go` directive, read from the milestone IMAGE, not the config) must be
+        #     INSTALLED in the staging closure. This catches a toolchain the
+        #     CONFIG-driven pre-install missed BEFORE :latest is tagged — otherwise
+        #     such a gap only surfaces INDIRECTLY in the build gate, where it can be
+        #     mis-labelled source-state and silently published. No-op for
+        #     pip/maven/npm-only repos (no rust/go declaration to read).
+        print(f"toolchain coverage gate (milestone rust-toolchain.toml / go.mod vs "
+              f"staging image) ...", flush=True)
+        run_toolchain_coverage_gate(staging_tag, milestones, ecos)
+        print(f"toolchain coverage gate: PASS (every declared rust/go toolchain is "
+              f"installed in the closure)", flush=True)
 
         # 3) No closure gap (any gap would have exited above) → publish. Only now
         #    is :latest tagged. Source-state-only failures do not block.

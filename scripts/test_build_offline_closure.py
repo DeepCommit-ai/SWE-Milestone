@@ -2328,3 +2328,312 @@ def test_build_closure_dual_go_npm_source_state_still_tags(monkeypatch, tmp_path
     monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
     boc.build_closure("nav", tmp_path, push=False, keep=True)
     assert ("nav/base-offline:staging", "nav/base-offline:latest") in tagged
+
+
+# ---- toolchain coverage gate: parsing + comparison (mocked docker outputs) ----
+# Declaration-level fail-fast: every rust/go version a milestone DECLARES (read from
+# its rust-toolchain.toml channel / go.mod `go` directive, NOT the config) must be
+# installed in the closure image, else collect ALL shortfalls and sys.exit(1).
+
+# -- rust-toolchain.toml channel parsing --
+
+def test_parse_rust_channel_picks_assignment_skips_comments():
+    """The real `channel = "X"` line wins; comment lines mentioning other versions
+    (1.72.0) are ignored; the `[toolchain]` table header is tolerated."""
+    toml = ('# latest stable release is 1.72.0, the channel should be 1.70.0\n'
+            '[toolchain]\n'
+            'profile = "default"\n'
+            'channel = "1.86.0"\n')
+    assert boc.parse_rust_channel(toml) == "1.86.0"
+
+
+def test_parse_rust_channel_absent_is_empty():
+    """No channel line (or empty file) → "" (= no hard requirement)."""
+    assert boc.parse_rust_channel("") == ""
+    assert boc.parse_rust_channel("[toolchain]\nprofile = \"minimal\"\n") == ""
+
+
+def test_parse_rust_channel_non_numeric():
+    """A non-numeric channel (stable/nightly) is returned verbatim (the caller
+    treats it as 'needs SOME toolchain', not an exact pin)."""
+    assert boc.parse_rust_channel('[toolchain]\nchannel = "stable"\n') == "stable"
+    assert boc.parse_rust_channel('channel = "nightly"\n') == "nightly"
+
+
+def test_parse_rustup_toolchain_list_keeps_numeric_drops_stable():
+    """`rustup toolchain list` → only numeric channels, target-triple + (active,
+    default) suffix stripped; stable/nightly dropped from the numeric inventory."""
+    out = ("stable-x86_64-unknown-linux-gnu (active, default)\n"
+           "1.86.0-x86_64-unknown-linux-gnu\n"
+           "1.88.0-x86_64-unknown-linux-gnu (default)\n")
+    assert boc.parse_rustup_toolchain_list(out) == ["1.86.0", "1.88.0"]
+
+
+def test_parse_rustup_toolchain_list_active_only_numeric():
+    """A single active numeric channel (nushell milestone) parses to one entry."""
+    out = "1.86.0-x86_64-unknown-linux-gnu (active, default)\n"
+    assert boc.parse_rustup_toolchain_list(out) == ["1.86.0"]
+
+
+# -- go.mod directive parsing + semver compare --
+
+def test_parse_go_directive_min_two_and_three_part():
+    """`go 1.21` (2-part) and `go 1.24.4` (3-part) both parse as the minimum; a
+    trailing comment is stripped."""
+    assert boc.parse_go_directive("module x\n\ngo 1.21\n") == ("1.21", "")
+    assert boc.parse_go_directive("go 1.24.4 // note\n") == ("1.24.4", "")
+
+
+def test_parse_go_directive_toolchain_exact_line():
+    """An optional `toolchain go1.24.5` line is parsed as the exact toolchain (the
+    leading `go` stripped), alongside the `go` minimum."""
+    gomod = "module x\n\ngo 1.24.4\n\ntoolchain go1.24.5\n"
+    assert boc.parse_go_directive(gomod) == ("1.24.4", "1.24.5")
+
+
+def test_parse_go_directive_absent_is_empty():
+    assert boc.parse_go_directive("module x\nrequire foo v1.0.0\n") == ("", "")
+
+
+def test_parse_go_version_strips_leading_go():
+    assert boc.parse_go_version("go version go1.24.5 linux/amd64") == "1.24.5"
+    assert boc.parse_go_version("go version go1.21.13 linux/amd64") == "1.21.13"
+    assert boc.parse_go_version("") == ""
+
+
+def test_go_version_satisfies_minimum():
+    """Image >= directive (semver-ish on X.Y.Z). 2-part directive vs 3-part image."""
+    assert boc.go_version_satisfies("1.24.5", "1.24.4") is True   # newer patch
+    assert boc.go_version_satisfies("1.24.5", "1.24.5") is True   # equal
+    assert boc.go_version_satisfies("1.21.13", "1.21") is True    # 3-part >= 2-part
+    assert boc.go_version_satisfies("1.21.0", "1.24") is False    # older minor
+    assert boc.go_version_satisfies("1.21", "1.24.4") is False    # older
+    assert boc.go_version_satisfies("1.24.5", "") is True         # no requirement
+    assert boc.go_version_satisfies("", "1.24.4") is False        # unknown image
+
+
+# -- the gate itself (collect-all-then-exit) --
+
+def _cov_cat(channels=None, gomods=None):
+    """Fake `_docker_cat(image, path)`: serve a milestone's rust-toolchain.toml from
+    `channels[image]` and go.mod from `gomods[image]` (absent → "")."""
+    channels = channels or {}
+    gomods = gomods or {}
+    def _cat(image, path):
+        if path.endswith("rust-toolchain.toml"):
+            return channels.get(image, "")
+        if path.endswith("go.mod"):
+            return gomods.get(image, "")
+        return ""
+    return _cat
+
+
+def _cov_sh(rustup="", goversion=""):
+    """Fake `_docker_sh(image, script)`: serve the image inventory probes."""
+    def _sh(image, script):
+        if "rustup" in script:
+            return rustup
+        if "go version" in script:
+            return goversion
+        return ""
+    return _sh
+
+
+def test_coverage_gate_rust_pin_present_passes():
+    """Pinned channel present in the image's rustup list → PASS (no exit)."""
+    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    cat = _cov_cat(channels={m: '[toolchain]\nchannel = "1.86.0"\n' for m in ms})
+    sh = _cov_sh(rustup="1.86.0-x86_64-unknown-linux-gnu (active, default)\n")
+    # returns None (no raise)
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
+
+
+def test_coverage_gate_rust_pin_absent_exits():
+    """A milestone pins 1.92.0 but the image only has 1.86/1.87/1.88 → shortfall →
+    sys.exit(1)."""
+    ms = ["r/x/m00:latest"]
+    cat = _cov_cat(channels={"r/x/m00:latest": 'channel = "1.92.0"\n'})
+    sh = _cov_sh(rustup=("1.86.0-x86_64-unknown-linux-gnu (active)\n"
+                         "1.87.0-x86_64-unknown-linux-gnu\n"
+                         "1.88.0-x86_64-unknown-linux-gnu (default)\n"))
+    with pytest.raises(SystemExit) as e:
+        boc.run_toolchain_coverage_gate(
+            "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
+    assert e.value.code == 1
+
+
+def test_coverage_gate_rust_file_absent_passes():
+    """No rust-toolchain.toml in any milestone (ripgrep) → no requirement → PASS,
+    even if the image's rustup list has only `stable`."""
+    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    cat = _cov_cat(channels={})   # absent everywhere
+    sh = _cov_sh(rustup="stable-x86_64-unknown-linux-gnu (active, default)\n"
+                        "1.88.0-x86_64-unknown-linux-gnu\n")
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
+
+
+def test_coverage_gate_rust_nonnumeric_channel_only_needs_a_toolchain():
+    """A non-numeric channel ("stable") is NOT an exact pin: PASS as long as the
+    image has SOME toolchain; only an EMPTY rustup list is a shortfall."""
+    ms = ["r/x/m00:latest"]
+    cat = _cov_cat(channels={"r/x/m00:latest": 'channel = "stable"\n'})
+    # has a toolchain (even a numeric one) → pass
+    sh_ok = _cov_sh(rustup="1.88.0-x86_64-unknown-linux-gnu (active)\n")
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_ok) is None
+    # NO toolchain at all → shortfall
+    sh_bad = _cov_sh(rustup="")
+    with pytest.raises(SystemExit):
+        boc.run_toolchain_coverage_gate(
+            "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_bad)
+
+
+def test_coverage_gate_go_directive_satisfied_passes():
+    """go.mod `go 1.21` and image go1.21.13 → 1.21.13 >= 1.21 → PASS."""
+    ms = ["r/x/m00:latest"]
+    cat = _cov_cat(gomods={"r/x/m00:latest": "module x\n\ngo 1.21\n"})
+    sh = _cov_sh(goversion="go version go1.21.13 linux/amd64")
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh) is None
+
+
+def test_coverage_gate_go_directive_too_new_exits():
+    """go.mod `go 1.24` but image only go1.21.13 → 1.21.13 < 1.24 → shortfall →
+    sys.exit(1)."""
+    ms = ["r/x/m00:latest"]
+    cat = _cov_cat(gomods={"r/x/m00:latest": "go 1.24\n"})
+    sh = _cov_sh(goversion="go version go1.21.13 linux/amd64")
+    with pytest.raises(SystemExit) as e:
+        boc.run_toolchain_coverage_gate(
+            "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
+    assert e.value.code == 1
+
+
+def test_coverage_gate_go_toolchain_line_enforced():
+    """An exact `toolchain go1.24.5` line is enforced as a minimum: image go1.24.4
+    < 1.24.5 → shortfall."""
+    ms = ["r/x/m00:latest"]
+    cat = _cov_cat(gomods={"r/x/m00:latest": "go 1.24.4\n\ntoolchain go1.24.5\n"})
+    sh = _cov_sh(goversion="go version go1.24.4 linux/amd64")
+    with pytest.raises(SystemExit) as e:
+        boc.run_toolchain_coverage_gate(
+            "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
+    assert e.value.code == 1
+    # but image go1.24.5 satisfies BOTH the `go` min and the exact toolchain.
+    sh_ok = _cov_sh(goversion="go version go1.24.5 linux/amd64")
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh_ok) is None
+
+
+def test_coverage_gate_collects_all_shortfalls_then_exits():
+    """Multiple milestones each missing a toolchain: ALL are reported (do NOT exit on
+    the first miss) and then sys.exit(1) once — one rebuild fixes all."""
+    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    cat = _cov_cat(
+        channels={"r/x/m00:latest": 'channel = "1.90.0"\n',     # missing
+                  "r/x/m01:latest": 'channel = "1.86.0"\n',     # present
+                  "r/x/m02:latest": 'channel = "1.91.0"\n'})    # missing
+    sh = _cov_sh(rustup="1.86.0-x86_64-unknown-linux-gnu (active, default)\n")
+    captured = {}
+    import sys as _sys
+    def fake_exit(code=0):
+        raise SystemExit(code)
+    # capture the report printed to stderr
+    printed = []
+    real_print = print
+    import builtins
+    def fake_print(*a, **k):
+        if k.get("file") is _sys.stderr:
+            printed.append(" ".join(str(x) for x in a))
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(builtins, "print", fake_print)
+    monkey.setattr(boc.sys, "exit", fake_exit)
+    try:
+        with pytest.raises(SystemExit) as e:
+            boc.run_toolchain_coverage_gate(
+                "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
+    finally:
+        monkey.undo()
+    assert e.value.code == 1
+    report = "\n".join(printed)
+    # BOTH missing milestones named; the present one is NOT a shortfall.
+    assert "r/x/m00:latest" in report and "1.90.0" in report
+    assert "r/x/m02:latest" in report and "1.91.0" in report
+    assert "r/x/m01:latest" not in report
+
+
+def test_coverage_gate_noop_for_pip_maven_npm():
+    """A repo whose ecosystems include no rust/go (pip/maven/npm) → the gate reads no
+    declaration and is a no-op (never probes, never exits), even with milestones."""
+    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    probed = {"n": 0}
+    def _cat(image, path):
+        probed["n"] += 1
+        return ""
+    def _sh(image, script):
+        probed["n"] += 1
+        return ""
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["pip"], _cat=_cat, _sh=_sh) is None
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["maven"], _cat=_cat, _sh=_sh) is None
+    assert boc.run_toolchain_coverage_gate(
+        "r/x/base-offline:latest", ms, ["npm"], _cat=_cat, _sh=_sh) is None
+    assert probed["n"] == 0   # never shelled out for a non-rust/go repo
+
+
+def test_coverage_gate_wired_into_build_closure_before_tag(monkeypatch, tmp_path):
+    """build_closure calls run_toolchain_coverage_gate AFTER the offline gate and
+    BEFORE `docker tag :latest`, for the cargo (rust) path."""
+    (tmp_path / "quarantine_configs").mkdir(exist_ok=True)
+    (tmp_path / "quarantine_configs" / "rg.yaml").write_text(
+        "ecosystem: [cargo]\nclosure:\n  cache_paths: ['/c']\n"
+        "  offline_build: 'cargo build --offline'\n")
+    order = []
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda r: ["rg/m01:latest"])
+    monkeypatch.setattr(boc, "assemble_cargo_dockerfile", lambda *a, **k: "DF")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    monkeypatch.setattr(boc, "run_offline_gate",
+                        lambda *a, **k: order.append("offline_gate") or "PASS")
+    monkeypatch.setattr(boc, "run_cargo_abaseline_gate",
+                        lambda tag, ob: order.append("abaseline_gate"))
+    monkeypatch.setattr(
+        boc, "run_toolchain_coverage_gate",
+        lambda tag, ms, ecos, **k: order.append(("coverage_gate", tuple(ecos))))
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            order.append("tag")
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    boc.build_closure("rg", tmp_path, push=False, keep=True)
+    assert order == ["offline_gate", "abaseline_gate",
+                     ("coverage_gate", ("cargo",)), "tag"]
+
+
+def test_coverage_gate_wired_into_dual_go_npm_before_tag(monkeypatch, tmp_path):
+    """The dual go+npm path also runs the coverage gate (go side) before tagging."""
+    _write_navidrome_cfg(tmp_path)
+    order = []
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["nav/m01:latest"])
+    monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
+                        lambda ms, tg, _probe=None: "nav/m01:latest")
+    monkeypatch.setattr(boc, "assemble_go_npm_dockerfile", lambda *a, **k: "DF")
+    monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
+    monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
+    monkeypatch.setattr(boc, "run_offline_gate",
+                        lambda *a, **k: order.append("offline_gate") or "PASS")
+    monkeypatch.setattr(
+        boc, "run_toolchain_coverage_gate",
+        lambda tag, ms, ecos, **k: order.append(("coverage_gate", tuple(ecos))))
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            order.append("tag")
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+    boc.build_closure("nav", tmp_path, push=False, keep=True)
+    assert order == ["offline_gate", ("coverage_gate", ("go", "npm")), "tag"]
