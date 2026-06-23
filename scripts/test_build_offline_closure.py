@@ -153,6 +153,28 @@ def test_assemble_cargo_dockerfile_vendor_to_opt():
     assert "/opt/vendor\n" in df or "/opt/vendor " in df
 
 
+def test_assemble_cargo_dockerfile_installs_rust_toolchain_when_set():
+    """toolchain.rust set (nushell → 1.88.0) ⇒ a build-time online rustup install
+    in the FINAL stage, with `rustup default` so cargo uses it outside /testbed."""
+    df = boc.assemble_cargo_dockerfile(
+        "r/x", ["r/x/m00:latest"], toolchain={"rust": "1.88.0", "install_online": True})
+    assert "rustup toolchain install 1.88.0 --profile minimal" in df
+    assert "rustup default 1.88.0" in df
+    # the install must land in the FINAL stage (after `FROM ... AS final`), not the
+    # throwaway vendor_builder — otherwise the published image lacks the toolchain.
+    final_idx = df.index("FROM r/x/base:latest AS final")
+    assert df.index("rustup toolchain install 1.88.0") > final_idx
+
+
+def test_assemble_cargo_dockerfile_no_toolchain_no_rust_install():
+    """No toolchain key (ripgrep) ⇒ NO rustup-install line is emitted (unchanged).
+    Cover both the default (None) and an empty/`{}`/no-`rust` dict."""
+    for tc in (None, {}, {"install_online": True}):
+        df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest"], toolchain=tc)
+        assert "rustup toolchain install" not in df
+        assert "rustup default" not in df
+
+
 def test_resolve_config_path_case_insensitive(tmp_path):
     """--repo is lowercased for image tags, but the yaml file may be MixedCase."""
     (tmp_path / "quarantine_configs").mkdir()

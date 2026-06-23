@@ -114,7 +114,8 @@ def cargo_config_toml(vendor_dir: str) -> str:
             f'directory = "{vendor_dir}"\n')
 
 
-def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str]) -> str:
+def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
+                              toolchain: dict | None = None) -> str:
     """Multi-stage Dockerfile that vendors the UNION of every milestone's Cargo
     workspace into /opt/vendor, then bakes a $CARGO_HOME offline redirect.
 
@@ -127,6 +128,20 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str]) -> str:
     The config is written to $CARGO_HOME (/usr/local/cargo/config.toml), NEVER to
     /testbed/.cargo — the agent's `git clean -xfd` would wipe the latter and the
     offline redirect would silently vanish.
+
+    Optional `toolchain={"rust": "1.88.0", ...}`: when a rust version is given, the
+    FINAL stage installs it ONLINE at build time
+    (`rustup toolchain install <v> --profile minimal && rustup default <v>`).
+    nushell's milestones pin `channel="1.88.0"` in rust-toolchain.toml, but the
+    base/milestone images only ship 1.86 — the 1.88 toolchain CANNOT be COPY'd from
+    a milestone (none carries it) and must be fetched from static.rust-lang.org
+    during the (online) build. rustup's source is NOT an answer registry, so this
+    is safe and necessary. `rustup default` makes cargo use 1.88 for any path
+    outside /testbed too (rust-toolchain.toml only overrides inside the workspace).
+    `--profile minimal` is sufficient: `cargo build` needs only rustc + rust-std +
+    cargo, all of which minimal provides, so the milestone's `profile="default"`
+    directive triggers no extra (offline-failing) component download at gate time.
+    Repos with no toolchain key (ripgrep) emit no rust-install line — unchanged.
     """
     if not milestones:
         print("Error: assemble_cargo_dockerfile got no milestones", file=sys.stderr)
@@ -155,6 +170,17 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str]) -> str:
         f"RUN mkdir -p \"$CARGO_HOME\" && "
         f"printf '{fmt}' > {cargo_home_cfg}"
     )
+    # Optional ONLINE toolchain install in the final stage. Some repos (nushell)
+    # pin a rust channel (1.88.0) that the base/milestone images don't carry, so
+    # it must be fetched at build time (network is available then). `rustup
+    # default` ensures cargo uses it outside /testbed too. Emitted ONLY when a
+    # rust version is configured — ripgrep (no toolchain key) stays unchanged.
+    rust_ver = (toolchain or {}).get("rust")
+    if rust_ver:
+        lines.append(
+            f"RUN rustup toolchain install {rust_ver} --profile minimal && "
+            f"rustup default {rust_ver}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -803,7 +829,12 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
 
     try:
         if eco == "cargo":
-            df = assemble_cargo_dockerfile(repo_lower, milestones)
+            # closure.toolchain.rust (optional): some repos pin a rust channel
+            # (nushell → 1.88.0) the base image lacks; assemble_cargo_dockerfile
+            # then installs it ONLINE in the final stage. Absent → no rust-install
+            # line (ripgrep unchanged).
+            df = assemble_cargo_dockerfile(repo_lower, milestones,
+                                           toolchain=cfg.get("toolchain"))
             _docker_build(df, staging_tag, project_root)
         elif eco == "go":
             # Raw-cache rsync UNION of every milestone's go module cache, plus the
