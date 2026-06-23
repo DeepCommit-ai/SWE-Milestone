@@ -272,7 +272,6 @@ def test_run_offline_gate_create_fail_exits(monkeypatch):
 def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
     """The host tmp dir is rmtree'd even though the build failed."""
     made = {}
-    real_mkdtemp = boc.tempfile.mkdtemp if hasattr(boc, "tempfile") else None
     import tempfile as _t, shutil as _s
     def fake_mkdtemp(*a, **k):
         d = str(tmp_path / "gate")
@@ -292,3 +291,12 @@ def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest", "cargo build")
     assert made["d"] in removed
+
+
+def test_audit_staging_image_docker_failure_exits(monkeypatch):
+    """docker run non-zero return (daemon down, image gone) → fail-closed sys.exit(1)."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(1, "", "daemon down"))
+    with pytest.raises(SystemExit) as e:
+        boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+    assert e.value.code == 1

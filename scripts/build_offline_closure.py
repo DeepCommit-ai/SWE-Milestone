@@ -194,6 +194,10 @@ def audit_staging_image(staging_tag: str, forbid_globs: list[str]) -> None:
     cmd = ["docker", "run", "--rm", staging_tag, "sh", "-c",
            f"ls -d {quoted} 2>/dev/null; true"]
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"Error: audit docker run failed (exit {r.returncode}):\n"
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+        sys.exit(1)
     matched = (r.stdout or "").strip()
     if matched:
         print(f"Error: offline closure AUDIT failed for {staging_tag}: cache "
