@@ -77,6 +77,18 @@ def cargo_config_toml(vendor_dir: str) -> str:
             f'directory = "{vendor_dir}"\n')
 
 
+def offline_gate_cmd(staging_image: str, milestone: str, offline_build: str) -> list[str]:
+    # NOTE: /testbed inside the container should contain the B-source from `milestone`,
+    # NOT the A-baseline baked into `staging_image`. This function returns the command
+    # skeleton; the driver (Task 4.2/4.3) is responsible for injecting the milestone's
+    # /testbed — either via `docker create <milestone>` + `docker cp <cid>:/testbed` +
+    # `-v <host_path>:/testbed:ro`, or via `COPY --from=<milestone> /testbed /verify_testbed`
+    # at assembly time. Until injection is wired, the staging image's own /testbed
+    # (A-baseline) is used as a placeholder.
+    return ["docker", "run", "--rm", "--network", "none", staging_image,
+            "sh", "-c", f"cd /testbed && {offline_build}"]
+
+
 def _dist_name(req: str) -> str:
     for sep in ("==", ">=", "<=", "~=", "!=", ">", "<", "@", " "):
         if sep in req:

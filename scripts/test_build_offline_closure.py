@@ -98,3 +98,8 @@ def test_pip_union_drops_self_and_editable():
 def test_pip_multi_version_raises():
     with pytest.raises(SystemExit):
         boc.assert_single_version_or_explain(["foo==1.0", "foo==2.0"])
+
+def test_offline_gate_cmd_is_network_none():
+    cmd = boc.offline_gate_cmd("r/x/base-offline:staging-1", "r/x/m01:latest", "cargo build --offline")
+    assert "--network" in cmd and "none" in cmd
+    assert "cargo build --offline" in " ".join(cmd)
