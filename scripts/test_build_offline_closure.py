@@ -917,13 +917,57 @@ def test_run_offline_gate_npm_frozen_lockfile_is_source_state(monkeypatch):
     assert got == "SOURCE_STATE"
 
 
-def test_build_closure_npm_branch_dispatches_union_audit_gate(monkeypatch, tmp_path):
-    """End-to-end-ish (all docker mocked): the npm branch in build_closure unions the
-    yarn caches (render_union_dockerfile — NO toolchain, NO self@B rm), builds the
-    staging image, runs the generic audit (empty forbid → no-op) + per-milestone
-    offline gate with the npm classifier, then tags :latest. Asserts call ORDER, that
-    the built Dockerfile is the plain union (no rm/toolchain), and that the gate got
-    the npm classifier."""
+def test_assemble_npm_dockerfile_fetches_union_into_shared_cache():
+    """npm assembly ONLINE-fetches the union of declared deps (like pip/cargo): a
+    fetch_builder stage off base:latest COPYs ONLY each milestone's
+    package.json+yarn.lock and runs one `yarn install --cache-folder <shared>` per
+    milestone (prefer --frozen-lockfile, fall back to non-frozen), then the final
+    stage COPYs the warmed cache back. NOT a raw rsync union."""
+    ms = ["ew/m01:latest", "ew/m02:latest"]
+    df = boc.assemble_npm_dockerfile("ew", ms)
+    cache = "/usr/local/share/.cache/yarn/v6"         # the versioned dir yarn fills
+    cache_parent = "/usr/local/share/.cache/yarn"     # what --cache-folder must be
+    # two stages off base:latest
+    assert "FROM ew/base:latest AS fetch_builder" in df
+    assert "FROM ew/base:latest AS final" in df
+    # ONLY the two manifests are COPY'd per milestone (no whole /testbed)
+    assert "COPY --from=ew/m01:latest /testbed/package.json /testbed/yarn.lock /m0/" in df
+    assert "COPY --from=ew/m02:latest /testbed/package.json /testbed/yarn.lock /m1/" in df
+    assert "/testbed /m" not in df               # never the full /testbed tree
+    # one cache-warming RUN per milestone, all writing the SAME shared cache folder
+    assert sum(1 for ln in df.splitlines()
+               if ln.startswith("RUN cd /m") and "yarn install" in ln) == 2
+    # THE --cache-folder GOTCHA: --cache-folder is the PARENT of the versioned dir
+    # (yarn re-appends its own /v6), NOT the versioned dir itself — else the deps
+    # land in …/yarn/v6/v6/ where the offline gate never looks.
+    assert f"--cache-folder {cache_parent} " in df
+    assert f"--cache-folder {cache} " not in df       # NOT the doubled-v6 path
+    assert "cd /m0 && ( yarn install" in df
+    assert "cd /m1 && ( yarn install" in df
+    # prefer --frozen-lockfile, fall back to a plain non-frozen install
+    assert "--frozen-lockfile ||" in df
+    assert "--ignore-scripts" in df and "--non-interactive" in df
+    # the warmed cache is baked into the final stage (the VERSIONED dir yarn filled)
+    assert f"COPY --from=fetch_builder {cache} {cache}" in df
+    # NOT the old raw rsync union (this was the closure gap)
+    assert "rsync" not in df and "/milestone_" not in df
+    # ordering: fetch (warm) BEFORE final COPY of the cache
+    assert df.index("yarn install") < df.index("COPY --from=fetch_builder")
+
+
+def test_assemble_npm_dockerfile_no_milestones_exits():
+    with pytest.raises(SystemExit):
+        boc.assemble_npm_dockerfile("ew", [])
+
+
+def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_path):
+    """End-to-end-ish (all docker mocked): the npm branch in build_closure
+    ONLINE-fetches the union of declared deps (assemble_npm_dockerfile — NO
+    toolchain, NO self@B rm), builds the staging image, runs the generic audit
+    (empty forbid → no-op) + per-milestone offline gate with the npm classifier,
+    then tags :latest. Asserts call ORDER, that the built Dockerfile is the
+    fetch-assembly (per-milestone `yarn install --cache-folder`, not a raw rsync
+    union), and that the gate got the npm classifier."""
     (tmp_path / "quarantine_configs").mkdir()
     (tmp_path / "quarantine_configs" / "ew.yaml").write_text(
         "ecosystem: [npm]\n"
@@ -963,14 +1007,16 @@ def test_build_closure_npm_branch_dispatches_union_audit_gate(monkeypatch, tmp_p
         < kinds.index("tag")
     assert built["tag"] == "ew/base-offline:staging"
     assert ("tag", "ew/base-offline:staging", "ew/base-offline:latest") in events
-    # the staging Dockerfile is the PLAIN yarn-cache union: no self@B rm, no toolchain
-    assert "rsync -a /milestone_" in built["df"]
+    # the staging Dockerfile is the ONLINE declared-deps FETCH (per-milestone
+    # `yarn install --cache-folder <shared>`), NOT a raw rsync cache union, and has
+    # no self@B rm and no toolchain step.
+    assert "yarn install" in built["df"] and "--cache-folder" in built["df"]
     assert "/usr/local/share/.cache/yarn/v6" in built["df"]
+    assert "rsync" not in built["df"] and "/milestone_" not in built["df"]
     assert "rm -rf" not in built["df"]            # no self@B removal for element-web
     assert "GOTOOLCHAIN" not in built["df"] and "rustup" not in built["df"]
-    # it equals render_union_dockerfile exactly (no appended tail)
-    expected = boc.render_union_dockerfile(
-        "ew", ["ew/m01:latest", "ew/m02:latest"], ["/usr/local/share/.cache/yarn/v6"])
+    # it equals assemble_npm_dockerfile exactly (the fetch assembly)
+    expected = boc.assemble_npm_dockerfile("ew", ["ew/m01:latest", "ew/m02:latest"])
     assert built["df"] == expected
     # the generic audit got the (empty) forbid globs → clean no-op
     audit_ev = next(e for e in events if e[0] == "audit")

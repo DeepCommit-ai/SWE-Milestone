@@ -744,8 +744,9 @@ def assemble_pip_dockerfile(repo_lower: str, reqs_basename: str,
                             reqs_in_image: str = "/tmp/union_reqs.txt") -> str:
     """Multi-stage pip closure Dockerfile.
 
-    Unlike the cache-COPY ecosystems (cargo/go/maven/npm union a milestone's raw
-    cache), pip BUILDS its closure: a `wheel_builder` stage runs `pip download -r
+    Like the npm/cargo "fetch the union online" assemblies (and unlike the raw
+    cache-COPY ecosystems go/maven that union a milestone's raw cache), pip BUILDS
+    its closure: a `wheel_builder` stage runs `pip download -r
     <union reqs> -d /wheelhouse` ONLINE in the repo's OWN base image (so the wheel
     platform/python tags match the runtime exactly — no tag mismatch), and the
     `final` stage (same base) carries `/wheelhouse` + the reqs file forward. The
@@ -1003,6 +1004,103 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     return df + maven_rm_self_at_b_cmd(forbid_globs)
 
 
+# Where yarn-classic keeps its global package cache in the base/milestone images.
+# The base image already ships the A-version cache here; the fetch_builder stage
+# warms it forward with every milestone's declared deps, then the final stage
+# carries the union back in. (Mirrors closure.cache_paths in the npm config.)
+_YARN_CACHE_DIR = "/usr/local/share/.cache/yarn/v6"
+
+
+def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
+                            yarn_cache: str = _YARN_CACHE_DIR) -> str:
+    """npm/yarn-classic closure Dockerfile: ONLINE-fetch the UNION of every
+    milestone's *declared* deps into the yarn cache, then bake it — the robust
+    pattern pip (`pip download` the union freeze) and cargo (`cargo vendor` the
+    union of locks) already use, now for npm.
+
+    Why not raw-COPY the milestone caches (the old npm branch)?  Build-warmed yarn
+    caches are INCOMPLETE: a dep can be pinned by a milestone's `yarn.lock` yet
+    never land in that image's cache (element-web: `caniuse-lite@1.0.30001701` is
+    pinned by 4 milestones' lockfile but is in NO milestone's cache — the union of
+    the raw caches held only 30001699 + 30001704). So `yarn install --offline
+    --frozen-lockfile` fails at those milestones (same class as maven-bcprov /
+    go-zip — the milestone caches don't contain every lockfile-declared dep).
+
+    Fix: a `fetch_builder` stage (FROM <repo>/base:latest, so the base image's
+    EXISTING A-version yarn cache is the starting point — the union therefore spans
+    A→B) COPYs ONLY `package.json` + `yarn.lock` from each milestone into `/m<i>/`
+    (just the manifests, NOT the whole /testbed — keeps the build context small and
+    pulls no source), then runs one `yarn install` per milestone, all warming the
+    SAME shared cache. Each install ADDs that milestone's declared deps (incl.
+    caniuse-lite@1.0.30001701) to the shared cache. registry.yarnpkg.com is a
+    non-answer registry (it serves third-party npm packages, not element-web's own
+    app — which is not published to npm), so fetching from it at BUILD time is
+    safe; the closure is sealed offline at eval. The `final` stage (same base)
+    COPYs the warmed cache (`yarn_cache`, the versioned dir) back over its own.
+
+    THE --cache-folder GOTCHA (yarn-classic): `--cache-folder X` does NOT make yarn
+    write into X — yarn APPENDS its own cache-version segment (`/v6` for yarn 1.22)
+    and writes into `X/v6`. The base/milestone images' real cache is
+    `/usr/local/share/.cache/yarn/v6` (that trailing `v6` IS yarn's segment;
+    `yarn cache dir` reports exactly this), so to warm THAT dir the cache-folder
+    must be its PARENT — `/usr/local/share/.cache/yarn` — and yarn re-appends `/v6`.
+    Passing the versioned dir itself (`…/yarn/v6`) writes one level too deep, into
+    `…/yarn/v6/v6/`, which the offline gate's `yarn install` (reading
+    `…/yarn/v6`) never sees → a fetched-but-invisible cache and a false `Can't make
+    a request in offline mode ("…caniuse-lite-1.0.30001701.tgz")` gate failure (the
+    first integration run hit exactly this). So `--cache-folder` is the parent of
+    `yarn_cache`; the COPY target stays `yarn_cache` (the versioned dir yarn fills).
+
+    Per-milestone install flags:
+      - `--cache-folder <parent-of-yarn_cache>` so yarn's appended `/v6` lands on
+        the real shared cache (see the GOTCHA above); every milestone writes the
+        same dir — that is the whole point, the union accumulates.
+      - `--ignore-scripts` skips postinstall: we only need the cache POPULATED with
+        tarballs, not a built node_modules (no native builds, much faster, and
+        avoids a postinstall that wants tools the manifest-only dir lacks).
+      - `--non-interactive` so a prompt can never hang the build.
+      - PREFER `--frozen-lockfile` (fetch EXACTLY the lockfile-pinned versions); if
+        that errors because the milestone's lockfile is itself mid-change
+        (source-state: yarn.lock disagrees with package.json), FALL BACK to a plain
+        `yarn install` for the cache-warming — we only want the deps fetched, and a
+        non-frozen resolve still populates the cache. The fallback is a shell `||`
+        inside the RUN so one milestone's source-state lockfile never aborts the
+        whole build. `--frozen-lockfile` first keeps the common (clean) case exact.
+
+    No self@B removal: element-web's app source is not published to npm, so there
+    is no self@B tarball the cache could serve (cache_forbid_globs is empty → the
+    generic audit stays a clean no-op).
+    """
+    if not milestones:
+        print("Error: assemble_npm_dockerfile got no milestones", file=sys.stderr)
+        sys.exit(1)
+    # See THE --cache-folder GOTCHA: yarn appends its own version segment (/v6) to
+    # --cache-folder, so to fill the real cache dir (`yarn_cache`, ending in /v6) we
+    # pass its PARENT and let yarn re-append the segment. PurePosixPath keeps this
+    # correct regardless of a trailing slash.
+    from pathlib import PurePosixPath
+    cache_folder = str(PurePosixPath(yarn_cache).parent)
+    lines = [
+        "# syntax=docker/dockerfile:1",
+        f"FROM {repo_lower}/base:latest AS fetch_builder",
+    ]
+    # COPY only the two manifests from each milestone (small context, no source).
+    for i, m in enumerate(milestones):
+        lines.append(
+            f"COPY --from={m} /testbed/package.json /testbed/yarn.lock /m{i}/")
+    # One install per milestone, all warming the SAME shared cache. Prefer
+    # --frozen-lockfile; fall back to a non-frozen resolve if the lockfile is
+    # mid-change (source-state) — we only need the deps fetched into the cache.
+    for i in range(len(milestones)):
+        base = (f"yarn install --cache-folder {cache_folder} "
+                f"--ignore-scripts --non-interactive")
+        lines.append(
+            f"RUN cd /m{i} && ( {base} --frozen-lockfile || {base} )")
+    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"COPY --from=fetch_builder {yarn_cache} {yarn_cache}")
+    return "\n".join(lines) + "\n"
+
+
 # --------------------------------------------------------------------------- #
 # Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
 # tag/publish are Task 4.3 and are intentionally NOT done here.                #
@@ -1193,17 +1291,26 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                                            forbid_globs)
             _docker_build(df, staging_tag, project_root)
         elif eco == "npm":
-            # Raw-cache rsync UNION of every milestone's yarn cache
-            # (render_union_dockerfile). Like go/maven the union ADDS the milestone
-            # yarn caches on top of the base image's OWN yarn cache, so it spans A→B
-            # (no A-baseline gap like cargo's vendor-replace had). No toolchain step
-            # (yarn ships in the base) and NO self@B removal: element-web's app source
-            # is not published to npm, so there is no self@B tarball to strip
-            # (cache_forbid_globs is empty → the generic audit below is a clean
-            # no-op). The per-milestone B-source gate (yarn install --offline
+            # ONLINE-fetch the UNION of every milestone's DECLARED deps into the
+            # yarn cache, then bake it (assemble_npm_dockerfile) — the robust
+            # pattern pip (`pip download` the union freeze) and cargo (`cargo
+            # vendor` the union of locks) already use. The old raw-cache COPY was a
+            # closure gap: build-warmed yarn caches are INCOMPLETE — e.g.
+            # caniuse-lite@1.0.30001701 is pinned by 4 milestones' yarn.lock but is
+            # in NO milestone's cache, so `yarn install --offline --frozen-lockfile`
+            # failed at those milestones (same class as maven-bcprov / go-zip). The
+            # fetch_builder stage is FROM base:latest (whose A-version yarn cache is
+            # the starting point, so the union spans A→B), COPYs ONLY each
+            # milestone's package.json+yarn.lock, and runs one `yarn install
+            # --cache-folder <shared>` per milestone — each ADDs its declared deps
+            # (incl. caniuse-lite@30001701) to the shared cache. registry.yarnpkg.com
+            # serves third-party packages (element-web's app is not on npm), so the
+            # build-time fetch is safe; the closure is sealed offline at eval. No
+            # toolchain step (yarn ships in the base) and NO self@B removal
+            # (cache_forbid_globs empty → the generic audit below is a clean no-op).
+            # The per-milestone B-source gate (yarn install --offline
             # --frozen-lockfile) applies unchanged, with the npm/yarn classifier.
-            cache_paths = cfg["cache_paths"]
-            df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+            df = assemble_npm_dockerfile(repo_lower, milestones)
             _docker_build(df, staging_tag, project_root)
         elif eco == "pip":
             # pip is ASSEMBLED, not cache-COPY'd: collect each milestone's
