@@ -61,6 +61,7 @@ WHITELISTED_DOMAINS = [
     "static.crates.io",
     "index.crates.io",
     "rustup.rs",
+    "static.rust-lang.org",  # official rust toolchain binary source (rustc/cargo/std); safe — cannot serve a repo's @B crate (those ride crates.io, still denied under quarantine)
     # === Maven / Java ===
     "repo1.maven.org",
     "repo.maven.apache.org",
