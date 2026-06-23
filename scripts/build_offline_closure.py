@@ -34,15 +34,48 @@ def discover_milestone_images(repo_lower: str, _docker_images: str | None = None
             seen[name] = f"{prefix}{name}:latest" if tag == "latest" else f"{prefix}{name}:{tag}"
     return [seen[name] for name in sorted(seen)]
 
+def _resolve_config_path(repo_lower: str, project_root: Path) -> Path | None:
+    """Locate quarantine_configs/<repo>.yaml, tolerating filename case.
+
+    `--repo` is lowercased so it matches the docker image prefix
+    (burntsushi_ripgrep_…), but the policy file is checked into the repo with the
+    project's natural case (BurntSushi_ripgrep_….yaml). Try the exact name first,
+    then fall back to a case-insensitive directory scan so the driver finds the
+    file regardless of how the repo id was cased on the command line.
+    """
+    confs = Path(project_root) / "quarantine_configs"
+    exact = confs / f"{repo_lower}.yaml"
+    if exact.exists():
+        return exact
+    if not confs.is_dir():
+        return None
+    target = f"{repo_lower}.yaml".lower()
+    for p in sorted(confs.glob("*.yaml")):
+        if p.name.lower() == target:
+            return p
+    return None
+
 def load_closure_config(repo_lower: str, project_root: Path) -> dict:
-    conf = Path(project_root) / "quarantine_configs" / f"{repo_lower}.yaml"
-    if not conf.exists():
-        print(f"Error: no quarantine config {conf}", file=sys.stderr); sys.exit(1)
+    conf = _resolve_config_path(repo_lower, project_root)
+    if conf is None:
+        miss = Path(project_root) / "quarantine_configs" / f"{repo_lower}.yaml"
+        print(f"Error: no quarantine config {miss}", file=sys.stderr); sys.exit(1)
     data = yaml.safe_load(conf.read_text()) or {}
     closure = data.get("closure")
     if not closure or "cache_paths" not in closure or "offline_build" not in closure:
         print(f"Error: {conf}: closure block must have cache_paths and offline_build", file=sys.stderr); sys.exit(1)
     return closure
+
+def load_quarantine_yaml(repo_lower: str, project_root: Path) -> dict:
+    """Full quarantine_configs/<repo>.yaml as a dict (case-insensitive lookup).
+
+    Used by the driver to read the top-level `ecosystem` for assembly dispatch.
+    """
+    conf = _resolve_config_path(repo_lower, project_root)
+    if conf is None:
+        miss = Path(project_root) / "quarantine_configs" / f"{repo_lower}.yaml"
+        print(f"Error: no quarantine config {miss}", file=sys.stderr); sys.exit(1)
+    return yaml.safe_load(conf.read_text()) or {}
 
 def cargo_vendor_cmd(milestone_testbeds: list[str], vendor_dir: str) -> str:
     """Return a single `cargo vendor` command that syncs all milestone Cargo.toml workspaces
@@ -75,6 +108,50 @@ def cargo_config_toml(vendor_dir: str) -> str:
             'replace-with = "vendored-sources"\n'
             '[source.vendored-sources]\n'
             f'directory = "{vendor_dir}"\n')
+
+
+def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str]) -> str:
+    """Multi-stage Dockerfile that vendors the UNION of every milestone's Cargo
+    workspace into /opt/vendor, then bakes a $CARGO_HOME offline redirect.
+
+    `cargo vendor` needs a cwd with a workspace manifest, so the FIRST milestone
+    testbed (/tb/m0) is the cwd and the REST (m1..mN) are passed as `--sync`
+    targets — one invocation (a loop would clobber the vendor dir each call).
+    Path-deps (the repo's own workspace crates) carry no `source` line and are
+    auto-excluded by cargo vendor, so the answer is never baked in.
+
+    The config is written to $CARGO_HOME (/usr/local/cargo/config.toml), NEVER to
+    /testbed/.cargo — the agent's `git clean -xfd` would wipe the latter and the
+    offline redirect would silently vanish.
+    """
+    if not milestones:
+        print("Error: assemble_cargo_dockerfile got no milestones", file=sys.stderr)
+        sys.exit(1)
+    vendor_dir = "/opt/vendor"
+    cargo_home_cfg = "/usr/local/cargo/config.toml"
+    lines = [
+        "# syntax=docker/dockerfile:1",
+        f"FROM {repo_lower}/base:latest AS vendor_builder",
+    ]
+    for i, m in enumerate(milestones):
+        lines.append(f"COPY --from={m} /testbed /tb/m{i}")
+    # cwd = first milestone's workspace; --sync the manifests of the rest.
+    sync_manifests = [f"/tb/m{i}/Cargo.toml" for i in range(1, len(milestones))]
+    vendor = cargo_vendor_cmd(sync_manifests, vendor_dir)
+    lines.append(f"RUN cd /tb/m0 && {vendor}")
+    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"COPY --from=vendor_builder {vendor_dir} {vendor_dir}")
+    config = cargo_config_toml(vendor_dir)
+    # Emit the config via a SINGLE-physical-line RUN: literal newlines in the
+    # config would otherwise be read by the Dockerfile parser as new instructions
+    # ("unknown instruction: replace-with"). Encode them as \n and let printf's
+    # format string expand them at build time.
+    fmt = config.replace("\\", "\\\\").replace("'", "'\\''").replace("\n", "\\n")
+    lines.append(
+        f"RUN mkdir -p \"$CARGO_HOME\" && "
+        f"printf '{fmt}' > {cargo_home_cfg}"
+    )
+    return "\n".join(lines) + "\n"
 
 
 def offline_gate_cmd(staging_image: str, milestone: str, offline_build: str) -> list[str]:
@@ -135,3 +212,108 @@ def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths:
     for cp in cache_paths:
         lines.append(f"COPY --from=builder /staging{cp} {cp}")
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
+# tag/publish are Task 4.3 and are intentionally NOT done here.                #
+# --------------------------------------------------------------------------- #
+
+def _ecosystem_of(repo_lower: str, project_root: Path) -> str:
+    """Top-level `ecosystem` from the quarantine yaml, as a single lowercase id.
+
+    Accepts a scalar or a one-element list (the configs use `ecosystem: [cargo]`).
+    Multi-ecosystem repos are out of scope for the closure builder.
+    """
+    data = load_quarantine_yaml(repo_lower, project_root)
+    eco = data.get("ecosystem")
+    if isinstance(eco, list):
+        eco = [str(e).strip().lower() for e in eco if str(e).strip()]
+        if len(eco) != 1:
+            print(f"Error: {repo_lower}: expected exactly one ecosystem, got {eco}",
+                  file=sys.stderr); sys.exit(1)
+        return eco[0]
+    if isinstance(eco, str) and eco.strip():
+        return eco.strip().lower()
+    print(f"Error: {repo_lower}: quarantine config has no `ecosystem`", file=sys.stderr)
+    sys.exit(1)
+
+
+def _docker_build(dockerfile: str, tag: str, project_root: Path) -> None:
+    """Real `docker build -f <tmp Dockerfile> -t <tag> <project_root>`.
+
+    The Dockerfile pulls everything via `COPY --from=<image>`, so the build
+    context is irrelevant — project_root is used only because it must be a valid
+    directory. Streams output; exits nonzero on build failure.
+    """
+    import tempfile, os
+    fd, path = tempfile.mkstemp(prefix="closure.", suffix=".Dockerfile")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(dockerfile)
+        print(f"--- Dockerfile ({tag}) ---\n{dockerfile}--- docker build ---", flush=True)
+        r = subprocess.run(
+            ["docker", "build", "-f", path, "-t", tag, str(project_root)])
+        if r.returncode != 0:
+            print(f"Error: docker build failed for {tag} (exit {r.returncode})",
+                  file=sys.stderr)
+            sys.exit(r.returncode)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def build_closure(repo_lower: str, project_root: Path, push: bool = False,
+                  keep: bool = False) -> None:
+    """Build <repo_lower>/base-offline:staging — the self-contained offline
+    closure image — and stop. (Audit/offline-gate/tag = Task 4.3.)
+
+    `push`/`keep` are accepted for forward-compat with 4.3 wiring but only `keep`
+    has an effect here (it is a no-op for now: staging is always left in place;
+    4.3 owns cleanup). `push` is unused until publish lands in 4.3.
+    """
+    cfg = load_closure_config(repo_lower, project_root)
+    eco = _ecosystem_of(repo_lower, project_root)
+    milestones = discover_milestone_images(repo_lower)
+    if not milestones:
+        print(f"Error: no milestone images for {repo_lower} (run pull_images.sh)",
+              file=sys.stderr)
+        sys.exit(1)
+    staging_tag = f"{repo_lower}/base-offline:staging"
+
+    if eco == "cargo":
+        df = assemble_cargo_dockerfile(repo_lower, milestones)
+        _docker_build(df, staging_tag, project_root)
+    elif eco in ("go", "maven", "npm"):
+        # Raw-cache rsync union path — render_union_dockerfile exists, but the
+        # driver wiring (+ build) is Task 4.4. Don't half-build it here.
+        raise NotImplementedError(f"ecosystem {eco}: task 4.4")
+    elif eco == "pip":
+        raise NotImplementedError(f"ecosystem {eco}: task 4.5 (freeze-union-download)")
+    else:
+        print(f"Error: {repo_lower}: unsupported ecosystem {eco!r}", file=sys.stderr)
+        sys.exit(1)
+
+    # Task 4.2 stops at staging. cfg/push are consumed by Task 4.3.
+    _ = (cfg, push, keep)
+    print(f"staging built: {staging_tag}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Build <repo>/base-offline:staging (offline dependency closure).")
+    ap.add_argument("--repo", required=True,
+                    help="repo id, e.g. burntsushi_ripgrep_14.1.1_15.0.0")
+    ap.add_argument("--push", action="store_true",
+                    help="(Task 4.3) push the published image")
+    ap.add_argument("--keep-staging", action="store_true",
+                    help="keep the staging image (default: kept; cleanup is Task 4.3)")
+    args = ap.parse_args(argv)
+    root = Path(__file__).resolve().parent.parent
+    build_closure(args.repo.lower(), root, args.push, args.keep_staging)
+
+
+if __name__ == "__main__":
+    main()

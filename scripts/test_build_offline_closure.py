@@ -103,3 +103,63 @@ def test_offline_gate_cmd_is_network_none():
     cmd = boc.offline_gate_cmd("r/x/base-offline:staging-1", "r/x/m01:latest", "cargo build --offline")
     assert "--network" in cmd and "none" in cmd
     assert "cargo build --offline" in " ".join(cmd)
+
+
+# ---- Task 4.2: cargo-vendor assembly ---------------------------------------
+
+def test_assemble_cargo_dockerfile_structure():
+    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    df = boc.assemble_cargo_dockerfile("r/x", ms)
+    # two-stage build off base:latest
+    assert "FROM r/x/base:latest AS vendor_builder" in df
+    assert "FROM r/x/base:latest AS final" in df
+    # one COPY --from per milestone, into /tb/m<i>
+    for i, m in enumerate(ms):
+        assert f"COPY --from={m} /testbed /tb/m{i}" in df
+    # cwd is the FIRST milestone testbed, vendor syncs the rest
+    assert "cd /tb/m0 &&" in df
+    assert "cargo vendor" in df
+    assert df.count("--sync") == len(ms) - 1   # m0 is cwd, not --sync'd
+    assert "--sync /tb/m1/Cargo.toml" in df
+    assert "--sync /tb/m2/Cargo.toml" in df
+    assert "--sync /tb/m0/Cargo.toml" not in df
+    # final stage copies the vendor dir out of the builder
+    assert "COPY --from=vendor_builder /opt/vendor /opt/vendor" in df
+    # config written to $CARGO_HOME, never /testbed/.cargo
+    assert "/usr/local/cargo/config.toml" in df
+    assert "/testbed/.cargo" not in df
+    assert 'directory = "/opt/vendor"' in df
+
+
+def test_assemble_cargo_dockerfile_single_milestone():
+    """One milestone: it is the cwd, so there are zero --sync flags."""
+    df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest"])
+    assert "cd /tb/m0 &&" in df
+    assert "cargo vendor" in df
+    assert "--sync" not in df
+    assert "COPY --from=r/x/m00:latest /testbed /tb/m0" in df
+
+
+def test_assemble_cargo_dockerfile_vendor_to_opt():
+    """Vendor dir is /opt/vendor (image path), never under /testbed."""
+    df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest", "r/x/m01:latest"])
+    assert "/opt/vendor" in df
+    # the cargo vendor invocation must target /opt/vendor as its positional arg
+    assert "/opt/vendor\n" in df or "/opt/vendor " in df
+
+
+def test_resolve_config_path_case_insensitive(tmp_path):
+    """--repo is lowercased for image tags, but the yaml file may be MixedCase."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "BurntSushi_ripgrep_14.1.1_15.0.0.yaml").write_text(
+        "ecosystem: [cargo]\nclosure:\n  cache_paths: ['/c']\n  offline_build: 'cargo build --offline'\n")
+    p = boc._resolve_config_path("burntsushi_ripgrep_14.1.1_15.0.0", tmp_path)
+    assert p is not None and p.name == "BurntSushi_ripgrep_14.1.1_15.0.0.yaml"
+
+
+def test_load_closure_config_case_insensitive(tmp_path):
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "BurntSushi_X.yaml").write_text(
+        "ecosystem: [cargo]\nclosure:\n  cache_paths: ['/c']\n  offline_build: 'cargo build --offline'\n")
+    cfg = boc.load_closure_config("burntsushi_x", tmp_path)
+    assert cfg["cache_paths"] == ["/c"]
