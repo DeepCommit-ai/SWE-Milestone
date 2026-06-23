@@ -982,25 +982,153 @@ def maven_rm_self_at_b_cmd(forbid_globs: list[str]) -> str:
     return f"RUN rm -rf {targets} 2>/dev/null; true\n"
 
 
+# Where the base/milestone images keep the maven local repository. The agent runs
+# `mvn -o` against this via maven.repo.local (the config's maven_repo_local), so the
+# closure must populate exactly this dir. (Mirrors closure.cache_paths in the dubbo
+# config, whose single entry is this path.)
+_M2_REPO_DIR = "/root/.m2/repository"
+
+# Lint plugins that abort a reactor build BEFORE dependency resolution finishes.
+# We skip them during the build-time online fetch so a spotless/checkstyle/rat
+# format violation in a mid-migration milestone never stops the deps from being
+# downloaded (we only want the .m2 warmed; formatting is irrelevant here). These
+# mirror the lint-skips in the config's offline_build gate.
+_MVN_FETCH_LINT_SKIPS = (
+    "-Dspotless.check.skip=true -Dspotless.apply.skip=true "
+    "-Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true"
+)
+
+
+def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str:
+    """Render the per-milestone ONLINE declared-deps fetch RUN body (no `RUN `
+    prefix), warming `m2_repo` from the reactor rooted at `testbed_dir`.
+
+    The fetch runs TWO maven goals against the milestone's FULL multi-module
+    reactor (dubbo is multi-module; `mvn` needs every module's pom to build the
+    reactor model), both writing into the SHARED `-Dmaven.repo.local=<m2_repo>`:
+
+      1. `dependency:go-offline` — a cheap broad first pass that resolves the
+         compile+runtime dependency graph AND the build/reporting PLUGINS,
+         downloading them (and their poms) into the local repo. It is RESOLUTION-ONLY
+         (never compiles), so it can't be tripped by a mid-migration source state,
+         but it has TWO known limitations: it does not pull TEST-scope-only deps, and
+         for version-managed/ranged deps it can resolve a DIFFERENT (often older)
+         version than the build actually uses, and may fetch only the `.pom` (not the
+         `.jar`). So it is necessary (plugins!) but NOT sufficient.
+      2. `test-compile` (ONLINE) on the SAME reactor — THE workhorse. The
+         per-milestone offline GATE is `mvn -o test-compile` on this very testbed, so
+         running `test-compile` ONLINE here downloads EXACTLY the artifacts (right
+         versions, the `.jar` not just the `.pom`, INCLUDING all test-scope deps)
+         that the offline gate will later demand — the tightest possible match.
+         `go-offline`/`dependency:resolve` proved insufficient: for m006's reactor
+         `go-offline` fetched only the bcprov-ext-jdk18on POM (no jar), and for
+         m001.1's dubbo-cluster it resolved opentelemetry-sdk-testing 1.49.0 while
+         test-compile needs 1.50.0 — only the online `test-compile` pulls the correct
+         jar+version. `-fae` (fail-at-end) makes the reactor keep building (and thus
+         keep DOWNLOADING each module's deps) past a module whose mid-migration
+         source won't compile, so one un-buildable module never starves the rest of
+         the cache; `-DskipTests` skips test EXECUTION (we only need test-SOURCES
+         compiled, which still resolves+downloads the test-scope deps).
+
+    Both goals are `-o`-free (this is the ONLINE build stage — repo1.maven.org /
+    Maven Central is a non-answer registry that serves third-party artifacts, safe to
+    fetch from at BUILD time; the closure is sealed offline at eval). Each goal is
+    `|| true`-guarded so a milestone whose reactor can't fully build (a mid-migration
+    source-state checkpoint, a JDK-gated module) still contributes every dep it COULD
+    download to the shared cache, and one milestone's source state never aborts the
+    whole multi-milestone fetch. The lint plugins are skipped (see
+    `_MVN_FETCH_LINT_SKIPS`) so a spotless/rat format violation can't abort the
+    reactor before resolution. `-q` keeps the log readable.
+
+    Note the online `test-compile`/`go-offline` may itself pull the reactor's OWN
+    3.3.6 artifacts (from Central, or install reactor modules) into the shared repo —
+    the self@B rm in the final stage (run AFTER all fetches) deletes them, so the
+    published closure never serves the answer.
+    """
+    goals = (
+        # (1) cheap broad pass: plugins + compile/runtime graph (resolution-only).
+        f"mvn -q dependency:go-offline {_MVN_FETCH_LINT_SKIPS} "
+        f"-Dmaven.repo.local={m2_repo} || true ; "
+        # (2) the workhorse: ONLINE test-compile downloads EXACTLY what the offline
+        # `mvn -o test-compile` gate needs (right versions, jars, test-scope deps).
+        # -fae so a non-compiling module doesn't starve the rest; -DskipTests skips
+        # test EXECUTION but still compiles test-sources (→ resolves test-scope deps).
+        f"mvn -q -fae test-compile -DskipTests {_MVN_FETCH_LINT_SKIPS} "
+        f"-Dmaven.repo.local={m2_repo} || true"
+    )
+    return f"cd {testbed_dir} && ( {goals} )"
+
+
 def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
                               cache_paths: list[str],
                               forbid_globs: list[str]) -> str:
-    """Maven closure Dockerfile: raw-cache rsync UNION of every milestone's `.m2`
-    repository (`render_union_dockerfile`) PLUS a critical self@B removal in the
-    final stage.
+    """Maven closure Dockerfile: ONLINE-fetch the UNION of every milestone's
+    *declared* deps into the local `.m2`, then bake it — the robust pattern pip
+    (`pip download` the union freeze), cargo (`cargo vendor` the union of locks), and
+    npm (`yarn install` the union of lockfiles) already use, now for maven.
 
-    Like go/pip, the union ADDS the milestone `.m2` deps on top of the base image's
-    own A-version `.m2`, so the cache spans A→B (no A-baseline gap like cargo's
-    vendor-replace had). The one maven-specific step is removing the repo's OWN
-    target-version artifacts: the milestone `.m2` caches contain dubbo's
-    `org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/*.jar` + `*-sources.jar` (the answer the
-    agents copied from Maven Central). `render_union_dockerfile`'s last stage is
-    `FROM <repo>/base:latest AS final`; we append the self@B rm (derived from the
-    config's `cache_forbid_globs`) AFTER the cache COPY so the published image cannot
-    serve the answer offline and the subsequent `audit_staging_image` (running the
-    same globs) finds nothing.
+    Why not raw-COPY the milestone `.m2` caches (the old maven branch)?  Build-warmed
+    `.m2` caches are INCOMPLETE: a dep can be DECLARED by a milestone's pom yet never
+    land in that image's cache because no milestone's build path actually downloaded
+    it (dubbo m006 declares `org.bouncycastle:bcprov-ext-jdk18on:1.78.1`, but it is in
+    NO milestone's `.m2`, so `mvn -o test-compile` fail-closes at m006 — the SAME
+    class as the npm caniuse-lite / go-zip gaps). The raw-cache union can only carry
+    what some milestone happened to cache; it cannot supply a declared-but-uncached
+    dep.
+
+    Fix: a `fetch_builder` stage (FROM <repo>/base:latest, so the base image's
+    EXISTING A-version `.m2` is the starting point — the union therefore spans A→B)
+    COPYs each milestone's FULL `/testbed` into `/tb/m<i>/` (the WHOLE reactor source,
+    not just one pom: dubbo is multi-module and `mvn` needs every module's pom to
+    build the reactor model — heavier than npm's manifest-only COPY but necessary),
+    then runs `dependency:go-offline` + `dependency:resolve -DincludeScope=test` per
+    milestone (see `maven_online_fetch_cmd`), all warming the SAME shared
+    `-Dmaven.repo.local=<m2_repo>`. Each fetch ADDs that milestone's declared deps
+    (incl. the test-scope-only ones `go-offline` misses, e.g. bcprov-ext-jdk18on) to
+    the shared cache. repo1.maven.org / Maven Central is a non-answer registry (it
+    serves third-party artifacts, not dubbo's own published app — and the agent never
+    fetches from it at eval), so the build-time fetch is safe; the closure is sealed
+    offline at eval.
+
+    The `final` stage (same base) COPYs the warmed `.m2` (`m2_repo`) back over its
+    own, then REMOVES self@B: the online fetch (or a milestone's pre-warmed cache)
+    can pull dubbo's OWN target-version artifacts
+    (`org/apache/dubbo/<mod>/3.3.6*` — the answer agents copied from Central) into the
+    cache, so we delete them in the final stage AFTER the COPY. The rm targets are
+    EXACTLY the config's `cache_forbid_globs` (passed as `forbid_globs`), so the
+    subsequent generic `audit_staging_image` (running the same globs) finds nothing.
+    The rm MUST come after the fetch+COPY (remove what the fetch may have pulled).
+
+    `cache_paths` (the config's single `.m2` repository path) selects the warm/COPY
+    target; if it names a different/extra path the first entry is the maven repo and
+    is used as `m2_repo` (defensive — dubbo's config has exactly one).
     """
-    df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+    if not milestones:
+        print("Error: assemble_maven_dockerfile got no milestones", file=sys.stderr)
+        sys.exit(1)
+    # The maven local repository to warm + bake. The config's cache_paths carries it
+    # (a single entry for dubbo); fall back to the canonical default if unset so the
+    # assembly is always well-formed.
+    m2_repo = (cache_paths or [_M2_REPO_DIR])[0]
+    lines = [
+        "# syntax=docker/dockerfile:1",
+        f"FROM {repo_lower}/base:latest AS fetch_builder",
+    ]
+    # COPY each milestone's FULL /testbed (the whole reactor — every module pom is
+    # needed to build the multi-module model).
+    for i, m in enumerate(milestones):
+        lines.append(f"COPY --from={m} /testbed /tb/m{i}")
+    # One ONLINE declared-deps fetch per milestone, all warming the SAME shared
+    # local repo (m2_repo). go-offline (compile+runtime+plugins) AND resolve
+    # -DincludeScope=test (the test-scope deps go-offline misses, e.g. bcprov).
+    for i in range(len(milestones)):
+        lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo)}")
+    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"COPY --from=fetch_builder {m2_repo} {m2_repo}")
+    # self@B removal AFTER the fetch+COPY: the online fetch may have pulled dubbo's
+    # OWN 3.3.6 artifacts into the cache; delete exactly the cache_forbid_globs so
+    # the closure never serves the answer and the generic audit (same globs) passes.
+    df = "\n".join(lines) + "\n"
     return df + maven_rm_self_at_b_cmd(forbid_globs)
 
 
@@ -1276,16 +1404,29 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             df = assemble_go_dockerfile(repo_lower, milestones, cache_paths, target_go)
             _docker_build(df, staging_tag, project_root)
         elif eco == "maven":
-            # Raw-cache rsync UNION of every milestone's `.m2` repository
-            # (render_union_dockerfile), then REMOVE self@B in the final stage: the
-            # milestone `.m2` caches carry dubbo's OWN target-version artifacts
-            # (org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/*.jar + *-sources.jar — the
-            # answer agents copied from Maven Central). The rm targets are EXACTLY
-            # the config's cache_forbid_globs, so the generic audit below (same
-            # globs) then matches nothing. Like go/pip the union ADDS the milestone
-            # `.m2` to the base image's A-version `.m2`, so it spans A→B (no
-            # A-baseline gap like cargo's vendor-replace had); the generic
-            # per-milestone B-source gate (mvn -o test-compile) applies unchanged.
+            # ONLINE-fetch the UNION of every milestone's DECLARED deps into the
+            # local `.m2`, then bake it (assemble_maven_dockerfile) — the robust
+            # pattern pip (`pip download` the union freeze), cargo (`cargo vendor`
+            # the union of locks), and npm (`yarn install` the union of lockfiles)
+            # already use. The old raw-cache COPY was a closure gap: build-warmed
+            # `.m2` caches are INCOMPLETE — e.g. org.bouncycastle:bcprov-ext-jdk18on:
+            # 1.78.1 is DECLARED by m006's reactor but is in NO milestone's `.m2`, so
+            # `mvn -o test-compile` fail-closed at m006 (same class as the npm
+            # caniuse-lite / go-zip gaps). The fetch_builder stage is FROM base:latest
+            # (whose A-version `.m2` is the starting point, so the union spans A→B),
+            # COPYs each milestone's FULL /testbed (the multi-module reactor needs
+            # every module pom), and runs `dependency:go-offline` +
+            # `dependency:resolve -DincludeScope=test` per milestone — each ADDs its
+            # declared deps (incl. the test-scope ones go-offline misses, e.g.
+            # bcprov-ext-jdk18on) to the shared maven.repo.local. repo1.maven.org /
+            # Maven Central serves third-party artifacts (dubbo's own app is fetched
+            # by no one at eval), so the build-time fetch is safe; the closure is
+            # sealed offline at eval. The final stage COPYs the warmed `.m2` forward
+            # then REMOVES self@B (the online fetch can pull dubbo's OWN 3.3.6
+            # artifacts — the answer): the rm targets are EXACTLY the config's
+            # cache_forbid_globs, run AFTER the fetch+COPY, so the generic audit below
+            # (same globs) matches nothing. The per-milestone B-source gate (mvn -o
+            # test-compile) applies unchanged, with the maven classifier.
             cache_paths = cfg["cache_paths"]
             df = assemble_maven_dockerfile(repo_lower, milestones, cache_paths,
                                            forbid_globs)

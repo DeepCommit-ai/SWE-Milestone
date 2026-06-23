@@ -552,36 +552,79 @@ def test_maven_rm_self_at_b_cmd_empty_is_noop():
     assert boc.maven_rm_self_at_b_cmd(None) == "RUN true\n"
 
 
-def test_assemble_maven_dockerfile_union_plus_self_at_b_rm():
-    """The maven branch unions the milestone `.m2` (render_union_dockerfile) AND
-    appends the self@B rm (the forbid globs) to the final stage, AFTER the cache
-    COPY — equals the rendered union + the rm tail (no other mutation)."""
+def test_maven_online_fetch_cmd_goes_offline_and_test_scope():
+    """The per-milestone fetch body runs BOTH a broad `dependency:go-offline`
+    (plugins + compile/runtime graph) AND an ONLINE `test-compile` (the tightest
+    match to the offline `mvn -o test-compile` gate — it downloads the exact
+    versions/jars incl. test-scope deps that go-offline alone misses, e.g.
+    bcprov-ext-jdk18on jar and otel-sdk-testing 1.50.0) into the SHARED
+    maven.repo.local, cd'd into the milestone's reactor, each `|| true`-guarded, lint
+    plugins skipped, and ONLINE (no `-o`)."""
+    body = boc.maven_online_fetch_cmd("/tb/m3", "/root/.m2/repository")
+    assert body.startswith("cd /tb/m3 && (")
+    # the cheap broad first pass: plugins + compile/runtime graph
+    assert "mvn -q dependency:go-offline" in body
+    # the workhorse: ONLINE test-compile downloads exactly what the gate needs,
+    # incl. all test-scope deps; -fae so a non-compiling module doesn't starve the
+    # cache, -DskipTests so only test-SOURCES compile (still resolves test deps).
+    assert "mvn -q -fae test-compile -DskipTests" in body
+    # both write into the SHARED local repo
+    assert body.count("-Dmaven.repo.local=/root/.m2/repository") == 2
+    # ONLINE fetch stage — must NOT pass -o (that would defeat the whole point)
+    assert " -o " not in f" {body} "
+    # each goal guarded so one milestone's source-state never aborts the build
+    assert body.count("|| true") == 2
+    # lint plugins skipped so a spotless/rat violation can't abort the reactor
+    for skip in ("-Dspotless.check.skip=true", "-Dcheckstyle.skip=true",
+                 "-Drat.skip=true"):
+        assert skip in body
+
+
+def test_assemble_maven_dockerfile_online_fetch_union_plus_self_at_b_rm():
+    """The maven branch ONLINE-fetches the union of each milestone's declared deps
+    (go-offline + resolve test-scope) into the shared `.m2`, then COPYs it forward
+    and rm's self@B last — like the npm/pip/cargo 'fetch the union online' pattern,
+    NOT the old raw-cache rsync union."""
     ms = ["r/x/m01:latest", "r/x/m02:latest"]
     caches = ["/root/.m2/repository"]
     df = boc.assemble_maven_dockerfile("r/x", ms, caches, _DUBBO_FORBID)
-    # base of the assembly is the raw-cache union (final stage + rsync of the cache)
+    # two stages: an online fetch_builder (FROM base) + a final (FROM base)
+    assert "FROM r/x/base:latest AS fetch_builder" in df
     assert "FROM r/x/base:latest AS final" in df
-    assert "rsync -a /milestone_" in df
-    assert "/root/.m2/repository" in df
-    # the cache is COPY'd into the final stage, then self@B is rm'd from it
-    assert "COPY --from=builder /staging/root/.m2/repository /root/.m2/repository" in df
+    # NO raw-cache rsync union anymore (that was the incomplete approach)
+    assert "rsync -a /milestone_" not in df
+    # the FULL /testbed of every milestone is COPY'd (reactor needs all module poms)
+    assert "COPY --from=r/x/m01:latest /testbed /tb/m0" in df
+    assert "COPY --from=r/x/m02:latest /testbed /tb/m1" in df
+    # one online fetch RUN per milestone, each warming the shared local repo
+    assert "RUN cd /tb/m0 && ( mvn -q dependency:go-offline" in df
+    assert "RUN cd /tb/m1 && ( mvn -q dependency:go-offline" in df
+    assert df.count("mvn -q -fae test-compile -DskipTests") == len(ms)
+    # the warmed cache is COPY'd into the final stage, then self@B is rm'd from it
+    assert "COPY --from=fetch_builder /root/.m2/repository /root/.m2/repository" in df
     assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in df
-    # ordering: the cache COPY into final MUST precede the rm (rm what was COPY'd)
-    assert df.index("COPY --from=builder /staging/root/.m2/repository") < \
+    # ordering: every milestone fetch BEFORE the final COPY BEFORE the self@B rm
+    assert df.index("RUN cd /tb/m1 && (") < \
+        df.index("COPY --from=fetch_builder /root/.m2/repository") < \
         df.index("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
-    # equals the rendered union + the appended rm tail (no other mutation)
-    union = boc.render_union_dockerfile("r/x", ms, caches)
-    assert df == union + boc.maven_rm_self_at_b_cmd(_DUBBO_FORBID)
 
 
-def test_assemble_maven_dockerfile_rm_after_copy_so_audit_clean():
-    """The rm of self@B must be the LAST instruction (after the final-stage cache
-    COPY), so what the generic audit later greps for has already been deleted."""
+def test_assemble_maven_dockerfile_rm_after_fetch_and_copy_so_audit_clean():
+    """The rm of self@B must be the LAST instruction (after the online fetch and the
+    final-stage cache COPY), so what the generic audit later greps for — including
+    any 3.3.6 jar the online fetch may have pulled — has already been deleted."""
     df = boc.assemble_maven_dockerfile(
         "r/x", ["r/x/m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
     # the self@B rm is the final instruction in the Dockerfile
     last = [ln for ln in df.strip().splitlines() if ln.strip()][-1]
     assert last.startswith("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
+
+
+def test_assemble_maven_dockerfile_empty_milestones_errors():
+    """No milestones → fail-closed (can't build a closure with nothing to fetch)."""
+    with pytest.raises(SystemExit):
+        boc.assemble_maven_dockerfile("r/x", [], ["/root/.m2/repository"],
+                                      _DUBBO_FORBID)
 
 
 def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_path):
@@ -627,8 +670,11 @@ def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_p
         < kinds.index("tag")
     assert built["tag"] == "dub/base-offline:staging"
     assert ("tag", "dub/base-offline:staging", "dub/base-offline:latest") in events
-    # the staging Dockerfile unions the `.m2` and rm's self@B (the forbid globs)
-    assert "rsync -a /milestone_" in built["df"]
+    # the staging Dockerfile ONLINE-fetches each milestone's declared deps (go-offline
+    # + resolve test-scope) into the shared `.m2` and rm's self@B (the forbid globs)
+    assert "rsync -a /milestone_" not in built["df"]
+    assert "RUN cd /tb/m0 && ( mvn -q dependency:go-offline" in built["df"]
+    assert "mvn -q -fae test-compile -DskipTests" in built["df"]
     assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in built["df"]
     # the generic audit got the SAME forbid globs the rm deleted (post-rm: clean)
     audit_ev = next(e for e in events if e[0] == "audit")
