@@ -518,6 +518,262 @@ def test_assemble_go_dockerfile_appends_clean_replace_toolchain():
         "ENV GOTOOLCHAIN=local\n")
 
 
+# ---- Task 4.4: maven ecosystem assembly + self@B removal ----------------------
+
+# The dubbo cache_forbid_globs (top-level in the quarantine yaml). These ARE the
+# self@B patterns: the milestone `.m2` caches hold dubbo's own
+# org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/* jars — the answer — and these globs both
+# audit AND (now) drive the rm. The rm targets MUST be byte-identical to them so
+# the post-rm audit (same globs) matches nothing.
+_DUBBO_FORBID = [
+    "/root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*",
+    "/root/.m2/repository/org/apache/dubbo/*/3.[4-9]*",
+]
+
+
+def test_maven_rm_self_at_b_cmd_targets_match_forbid_globs():
+    """The self@B rm RUN must delete EXACTLY the config's cache_forbid_globs (so the
+    generic audit, which runs the same globs, then finds nothing)."""
+    line = boc.maven_rm_self_at_b_cmd(_DUBBO_FORBID)
+    assert line.startswith("RUN rm -rf ")
+    # every forbid glob appears verbatim as an rm target
+    for g in _DUBBO_FORBID:
+        assert g in line
+    # rm'd targets == forbid globs, in order (no extra/missing pattern → audit clean)
+    rm_targets = line[len("RUN rm -rf "):].split(" 2>/dev/null", 1)[0].split()
+    assert rm_targets == _DUBBO_FORBID
+    # errors suppressed + exit 0 so an unmatched glob (e.g. the 3.[4-9]* one) is fine
+    assert "2>/dev/null; true" in line
+
+
+def test_maven_rm_self_at_b_cmd_empty_is_noop():
+    """No forbid globs → a harmless `RUN true` (well-formed, audit also a no-op)."""
+    assert boc.maven_rm_self_at_b_cmd([]) == "RUN true\n"
+    assert boc.maven_rm_self_at_b_cmd(None) == "RUN true\n"
+
+
+def test_assemble_maven_dockerfile_union_plus_self_at_b_rm():
+    """The maven branch unions the milestone `.m2` (render_union_dockerfile) AND
+    appends the self@B rm (the forbid globs) to the final stage, AFTER the cache
+    COPY — equals the rendered union + the rm tail (no other mutation)."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    caches = ["/root/.m2/repository"]
+    df = boc.assemble_maven_dockerfile("r/x", ms, caches, _DUBBO_FORBID)
+    # base of the assembly is the raw-cache union (final stage + rsync of the cache)
+    assert "FROM r/x/base:latest AS final" in df
+    assert "rsync -a /milestone_" in df
+    assert "/root/.m2/repository" in df
+    # the cache is COPY'd into the final stage, then self@B is rm'd from it
+    assert "COPY --from=builder /staging/root/.m2/repository /root/.m2/repository" in df
+    assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in df
+    # ordering: the cache COPY into final MUST precede the rm (rm what was COPY'd)
+    assert df.index("COPY --from=builder /staging/root/.m2/repository") < \
+        df.index("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
+    # equals the rendered union + the appended rm tail (no other mutation)
+    union = boc.render_union_dockerfile("r/x", ms, caches)
+    assert df == union + boc.maven_rm_self_at_b_cmd(_DUBBO_FORBID)
+
+
+def test_assemble_maven_dockerfile_rm_after_copy_so_audit_clean():
+    """The rm of self@B must be the LAST instruction (after the final-stage cache
+    COPY), so what the generic audit later greps for has already been deleted."""
+    df = boc.assemble_maven_dockerfile(
+        "r/x", ["r/x/m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
+    # the self@B rm is the final instruction in the Dockerfile
+    last = [ln for ln in df.strip().splitlines() if ln.strip()][-1]
+    assert last.startswith("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
+
+
+def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_path):
+    """End-to-end-ish (all docker mocked): the maven branch in build_closure unions
+    the `.m2`, builds the staging image WITH the self@B rm (forbid globs), runs the
+    generic audit + per-milestone offline gate, then tags :latest. Asserts call
+    ORDER and that the built Dockerfile carries the self@B rm."""
+    (tmp_path / "quarantine_configs").mkdir()
+    (tmp_path / "quarantine_configs" / "dub.yaml").write_text(
+        "ecosystem: [maven]\n"
+        "cache_forbid_globs:\n"
+        "  - /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*\n"
+        "  - /root/.m2/repository/org/apache/dubbo/*/3.[4-9]*\n"
+        "closure:\n"
+        "  cache_paths:\n"
+        "    - /root/.m2/repository\n"
+        "  offline_build: 'git clean -xfd && mvn -o test-compile'\n")
+
+    events = []
+    monkeypatch.setattr(boc, "discover_milestone_images",
+                        lambda repo: ["dub/m01:latest", "dub/m02:latest"])
+    built = {}
+    def fake_build(df, tag, root):
+        events.append(("build", tag))
+        built["df"] = df
+        built["tag"] = tag
+    monkeypatch.setattr(boc, "_docker_build", fake_build)
+    monkeypatch.setattr(boc, "audit_staging_image",
+                        lambda tag, globs: events.append(("audit", tag, tuple(globs))))
+    monkeypatch.setattr(boc, "run_offline_gate",
+                        lambda tag, m, ob, **k: events.append(("gate", m)) or "PASS")
+    def fake_sub_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "tag"]:
+            events.append(("tag", cmd[2], cmd[3]))
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
+
+    boc.build_closure("dub", tmp_path, push=False, keep=True)
+
+    kinds = [e[0] for e in events]
+    # build BEFORE audit BEFORE (per-milestone) gate BEFORE tag
+    assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
+        < kinds.index("tag")
+    assert built["tag"] == "dub/base-offline:staging"
+    assert ("tag", "dub/base-offline:staging", "dub/base-offline:latest") in events
+    # the staging Dockerfile unions the `.m2` and rm's self@B (the forbid globs)
+    assert "rsync -a /milestone_" in built["df"]
+    assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in built["df"]
+    # the generic audit got the SAME forbid globs the rm deleted (post-rm: clean)
+    audit_ev = next(e for e in events if e[0] == "audit")
+    assert audit_ev[2] == (
+        "/root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*",
+        "/root/.m2/repository/org/apache/dubbo/*/3.[4-9]*")
+    # one offline gate per milestone (B-source mvn -o test-compile)
+    assert [e[1] for e in events if e[0] == "gate"] == ["dub/m01:latest", "dub/m02:latest"]
+
+
+# ---- maven offline-build failure classifier (self@B vs real closure gap) ------
+# A maven offline build that cannot resolve a dependency emits
+# `Could not resolve dependencies ... Cannot access <repo> in offline mode and the
+# artifact <g>:<a>:<type>:<ver> has not been downloaded from it before`. The go
+# classifier doesn't recognise these strings, so maven needs its own: an unresolved
+# artifact that IS the repo's own self@B (org.apache.dubbo:*:3.3.6-SNAPSHOT — the
+# sibling reactor modules we deliberately removed) is EXPECTED (the agent builds
+# them from the reactor) → source_state; an unresolved THIRD-PARTY artifact is a
+# real closure gap → BLOCK. The self@B patterns are derived from the SAME
+# cache_forbid_globs that drove the rm.
+
+_MVN_OFFLINE_SELF = (
+    "[ERROR] Failed to execute goal on project dubbo: Could not resolve "
+    "dependencies for project org.apache.dubbo:dubbo:jar:3.3.6-SNAPSHOT\n"
+    "[ERROR] dependency: org.apache.dubbo:dubbo-spring6-security:jar:3.3.6-SNAPSHOT "
+    "(compile?)\n"
+    "[ERROR] \tCannot access apache.snapshots (https://repository.apache.org/"
+    "snapshots) in offline mode and the artifact "
+    "org.apache.dubbo:dubbo-spring6-security:jar:3.3.6-SNAPSHOT has not been "
+    "downloaded from it before.\n")
+
+_MVN_OFFLINE_THIRDPARTY = (
+    "[ERROR] Failed to execute goal on project dubbo-common: Could not resolve "
+    "dependencies for project org.apache.dubbo:dubbo-common:jar:3.3.6-SNAPSHOT\n"
+    "[ERROR] \tCannot access central (https://repo.maven.apache.org/maven2) in "
+    "offline mode and the artifact io.smallrye.reactive:mutiny:jar:2.9.0 has not "
+    "been downloaded from it before.\n")
+
+
+def test_maven_coord_self_at_b_matches_dubbo_snapshot():
+    """org.apache.dubbo:*:3.3.6-SNAPSHOT is self@B (matches the forbid globs)."""
+    assert boc._maven_coord_is_self_at_b(
+        "org.apache.dubbo:dubbo-spring6-security:jar:3.3.6-SNAPSHOT", _DUBBO_FORBID)
+    # a 3.4.x major bump is also self@B (second forbid glob /3.[4-9]*)
+    assert boc._maven_coord_is_self_at_b(
+        "org.apache.dubbo:dubbo-common:jar:3.4.0", _DUBBO_FORBID)
+
+
+def test_maven_coord_third_party_is_not_self_at_b():
+    """A non-dubbo artifact (mutiny) is NOT self@B → a real gap if unresolved."""
+    assert not boc._maven_coord_is_self_at_b(
+        "io.smallrye.reactive:mutiny:jar:2.9.0", _DUBBO_FORBID)
+    # the A-baseline dubbo (3.3.3-SNAPSHOT) is NOT forbidden → not self@B
+    assert not boc._maven_coord_is_self_at_b(
+        "org.apache.dubbo:dubbo-common:jar:3.3.3-SNAPSHOT", _DUBBO_FORBID)
+
+
+def test_classify_maven_self_at_b_unresolved_is_source_state():
+    """An offline build that can't resolve a self@B sibling (dubbo-spring6-security
+    :3.3.6-SNAPSHOT — removed on purpose) is SOURCE-STATE, not a closure gap: at
+    eval the agent builds the sibling from the reactor; we excluded the answer jar
+    by design. No docker probe needed (the classifier is pure-text for maven)."""
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    kind, detail = classify("r/x/base-offline:staging", _MVN_OFFLINE_SELF)
+    assert kind == "source_state"
+    assert "dubbo-spring6-security" in detail or "self@B" in detail
+
+
+def test_classify_maven_third_party_unresolved_is_closure_gap():
+    """An offline build that can't resolve a THIRD-PARTY artifact (mutiny:2.9.0) is
+    a REAL closure gap → must BLOCK. This is the fail-OPEN the go classifier would
+    have missed (it doesn't recognise maven's 'Cannot access ... offline' string)."""
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    kind, detail = classify("r/x/base-offline:staging", _MVN_OFFLINE_THIRDPARTY)
+    assert kind == "closure_gap"
+    assert "mutiny" in detail
+
+
+def test_classify_maven_mixed_self_and_third_party_is_gap():
+    """If BOTH a self@B and a third-party artifact are unresolved, the third-party
+    one wins → closure_gap (fail-closed: any real missing dep blocks)."""
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    kind, _ = classify("r/x/base-offline:staging",
+                       _MVN_OFFLINE_SELF + _MVN_OFFLINE_THIRDPARTY)
+    assert kind == "closure_gap"
+
+
+def test_classify_maven_spotless_failure_is_source_state():
+    """A spotless/checkstyle/rat LINT failure (no dependency-resolution string) is
+    SOURCE-STATE — it is not a missing dependency, so it must not BLOCK."""
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    kind, _ = classify(
+        "r/x/base-offline:staging",
+        "[ERROR] The following files had format violations:\n"
+        "[ERROR] Run 'mvn spotless:apply' to fix these violations.\n")
+    assert kind == "source_state"
+
+
+def test_classify_maven_compile_error_is_source_state():
+    """A pure java compile error (no 'Could not resolve dependencies') is
+    SOURCE-STATE (a mid-migration checkpoint), never a closure gap."""
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    kind, _ = classify(
+        "r/x/base-offline:staging",
+        "[ERROR] /testbed/foo/Bar.java:[12,9] cannot find symbol\n"
+        "[ERROR]   symbol:   method baz()\n")
+    assert kind == "source_state"
+
+
+def test_run_offline_gate_uses_injected_classifier(monkeypatch):
+    """run_offline_gate must accept a custom `classifier` (maven path) and use it
+    instead of the default go classifier. A maven 'Cannot access offline' for a
+    third-party artifact → the injected classifier says closure_gap → sys.exit."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(1, _MVN_OFFLINE_THIRDPARTY)   # the offline build fails
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    with pytest.raises(SystemExit) as e:
+        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                             "git clean -xfd && mvn -o test-compile",
+                             classifier=classify)
+    assert e.value.code == 1
+
+
+def test_run_offline_gate_maven_self_at_b_is_source_state(monkeypatch):
+    """With the maven classifier injected, a self@B-only unresolved (sibling reactor
+    module) → SOURCE_STATE (does not block), returned as the sentinel."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(1, _MVN_OFFLINE_SELF)
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
+    got = boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                               "git clean -xfd && mvn -o test-compile",
+                               classifier=classify)
+    assert got == "SOURCE_STATE"
+
+
 def test_pick_go_toolchain_milestone_last_when_correct():
     """Last milestone (B-end) has the target go → it is picked (and probed)."""
     ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]

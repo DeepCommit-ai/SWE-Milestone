@@ -348,8 +348,131 @@ def classify_offline_build_failure(staging_tag: str, output: str) -> tuple[str, 
             f"(go.mod/source inconsistency, not a gap): {tokens[:8]}")
 
 
+# Maven offline-resolution failure signatures. When `mvn -o` cannot supply a
+# dependency it prints, per artifact:
+#   Cannot access <repo> (<url>) in offline mode and the artifact
+#   <group>:<artifact>:<type>[:<classifier>]:<version> has not been downloaded ...
+# and/or a summary `Could not (resolve dependencies for|find artifact) ... <coords>`.
+# We pull the GAV(+classifier) coordinate out of each and then decide self@B vs gap.
+import fnmatch as _fnmatch
+_MVN_UNRESOLVED_COORD_RES = [
+    # The authoritative per-artifact line under `Could not resolve dependencies`.
+    _re.compile(r"the artifact\s+([\w.\-]+:[\w.\-]+:[\w.\-]+(?::[\w.\-]+)?:[\w.\-]+)"
+                r"\s+has not been downloaded", _re.IGNORECASE),
+    # `Could not find artifact <coords> in <repo>` (offline or cached-miss variant).
+    _re.compile(r"Could not find artifact\s+([\w.\-]+:[\w.\-]+:[\w.\-]+(?::[\w.\-]+)?:[\w.\-]+)"),
+    # The `dependency: <g>:<a>:<type>:<ver> (scope?)` line maven prints in the 3.9+
+    # resolution-failure summary.
+    _re.compile(r"^\s*(?:\[ERROR\]\s*)?dependency:\s+"
+                r"([\w.\-]+:[\w.\-]+:[\w.\-]+(?::[\w.\-]+)?:[\w.\-]+)", _re.MULTILINE),
+]
+
+
+def _forbid_glob_to_group_version(glob: str) -> tuple[str, str] | None:
+    """Map a cache_forbid_glob path to a (group-glob, version-glob) coordinate
+    matcher.
+
+    The maven forbid globs are filesystem paths under the local repo, e.g.
+    `/root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*`. The layout is
+    `<repo>/<group-as-dirs>/<artifact>/<version>/...`, so the path tail after
+    `repository/` is `<group/dirs>/<artifactId-glob>/<version-glob>`. We turn the
+    group dirs into a dotted group glob (`org.apache.dubbo`) and keep the trailing
+    segment as the version glob (`3.3.[4-9]*`). Returns None if the glob doesn't
+    contain the `.m2` `repository/` anchor (can't be mapped to a coordinate).
+    """
+    marker = "/repository/"
+    i = glob.find(marker)
+    if i < 0:
+        return None
+    rel = glob[i + len(marker):].strip("/")
+    parts = rel.split("/")
+    if len(parts) < 3:
+        return None
+    version_glob = parts[-1]
+    # parts[:-2] are the group dirs; parts[-2] is the artifactId glob (unused for the
+    # self@B decision — group + version uniquely identify the repo's own artifacts).
+    group_glob = ".".join(parts[:-2])
+    return (group_glob, version_glob)
+
+
+def _maven_coord_is_self_at_b(coord: str, self_at_b_globs: list[str]) -> bool:
+    """True iff a maven coordinate `<group>:<artifact>:<type>[:<classifier>]:<ver>`
+    is one of the repo's OWN target-version (self@B) artifacts — i.e. its group and
+    version match one of the cache_forbid_globs (the SAME patterns that drove the
+    self@B rm). Such an artifact was deliberately removed from the closure; an
+    offline build that can't resolve it is EXPECTED (at eval the agent builds the
+    sibling reactor module from source), so it is source-state, not a closure gap.
+
+    Matching is on group+version via fnmatch so the glob's character class
+    (`3.3.[4-9]*`) is honoured; the artifactId segment is not constrained (the glob
+    uses `*` there). A coordinate whose group/version matches NO forbid pattern is a
+    third-party (or A-baseline) dependency — a real gap if unresolved.
+    """
+    bits = coord.split(":")
+    if len(bits) < 4:
+        return False
+    group = bits[0]
+    version = bits[-1]
+    for g in self_at_b_globs or []:
+        gv = _forbid_glob_to_group_version(g)
+        if gv is None:
+            continue
+        group_glob, version_glob = gv
+        if _fnmatch.fnmatch(group, group_glob) and _fnmatch.fnmatch(version, version_glob):
+            return True
+    return False
+
+
+def classify_maven_offline_build_failure(self_at_b_globs: list[str]):
+    """Return a maven-aware offline-build failure classifier
+    `(staging_tag, output) -> (kind, detail)` for use with `run_offline_gate`.
+
+    The go classifier doesn't recognise maven's offline-resolution strings, so a
+    maven `Cannot access ... in offline mode` would fall through to its
+    "no missing-module token" → source_state branch (fail-OPEN, masking a real gap).
+    This classifier instead extracts every unresolved maven coordinate and splits
+    them by self@B:
+      - If ANY unresolved artifact is a THIRD-PARTY dep (not matching the
+        cache_forbid_globs) → "closure_gap": the closure is genuinely missing a
+        needed artifact → BLOCK.
+      - If unresolved artifacts exist but they are ALL self@B (the repo's own
+        target-version sibling modules we removed on purpose, e.g.
+        org.apache.dubbo:*:3.3.6-SNAPSHOT) → "source_state": expected (the agent
+        builds these from the reactor at eval time); the closure is not at fault.
+      - If NO unresolved-artifact coordinate is found at all (a spotless/checkstyle/
+        rat lint failure, or a pure java compile error) → "source_state": a lint or
+        compile failure is not a missing dependency.
+
+    `staging_tag` is accepted for signature-compatibility with the go classifier but
+    unused — the maven decision is pure-text (the self@B set is known from config),
+    no in-image cache probe is needed.
+    """
+    def _classify(staging_tag: str, output: str) -> tuple[str, str]:
+        coords = []
+        for rx in _MVN_UNRESOLVED_COORD_RES:
+            for m in rx.finditer(output or ""):
+                c = m.group(1).strip()
+                if c and c not in coords:
+                    coords.append(c)
+        if not coords:
+            # No unresolved-artifact line → lint (spotless/checkstyle/rat) or a pure
+            # compile error. Neither is a missing dependency.
+            return ("source_state",
+                    "no unresolved-artifact coordinate (lint/spotless or compile error)")
+        third_party = [c for c in coords
+                       if not _maven_coord_is_self_at_b(c, self_at_b_globs)]
+        if third_party:
+            return ("closure_gap",
+                    f"unresolved THIRD-PARTY artifact(s) missing from closure: "
+                    f"{third_party[:8]}")
+        return ("source_state",
+                f"unresolved artifact(s) are ALL self@B (own reactor modules, "
+                f"removed by design; agent builds them from source): {coords[:8]}")
+    return _classify
+
+
 def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
-                     goproxy_off: bool = False) -> str:
+                     goproxy_off: bool = False, classifier=None) -> str:
     """Per-milestone OFFLINE GATE: prove the closure is sufficient to build the
     milestone's B-source with no network.
 
@@ -364,6 +487,13 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
     `^<module@version>:` pattern (fail-OPEN). With GOPROXY=off, missing modules
     deterministically produce `module lookup disabled by GOPROXY=off`, which is a
     recognized closure-gap token.
+
+    `classifier` is the `(staging_tag, output) -> (kind, detail)` callable used to
+    label a non-zero build as "closure_gap" (BLOCK) vs "source_state" (record, do
+    not block). Defaults to the go classifier `classify_offline_build_failure`;
+    maven passes `classify_maven_offline_build_failure(forbid_globs)` (the go
+    classifier doesn't recognise maven's `Cannot access ... in offline mode`
+    strings and would fail-OPEN on a real maven dependency gap).
 
     Outcome:
       - build exit 0 → return "PASS".
@@ -411,7 +541,8 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
             return "PASS"
         out = ((run.stdout or "") + (run.stderr or "")).strip()
         tail = "\n".join(out.splitlines()[-40:])
-        kind, detail = classify_offline_build_failure(staging_tag, out)
+        classify = classifier or classify_offline_build_failure
+        kind, detail = classify(staging_tag, out)
         if kind == "closure_gap":
             print(f"Error: OFFLINE GATE failed for milestone {milestone} "
                   f"(offline build exit {run.returncode}) — closure is "
@@ -749,6 +880,56 @@ def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
     return df + tail
 
 
+def maven_rm_self_at_b_cmd(forbid_globs: list[str]) -> str:
+    """Render the FINAL-stage `RUN` that deletes the repo's OWN target-version
+    artifacts (self@B) from the unioned `.m2`, derived from the config's
+    `cache_forbid_globs`.
+
+    The maven self-exclusion problem: a milestone's `/root/.m2/repository` holds
+    dubbo's own B-version jars+`-sources.jar`
+    (`org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/*` — the cheat answer the agents copied
+    from Maven Central). The raw-cache union (`render_union_dockerfile`) carries them
+    into the closure, so we delete them in the FINAL stage AFTER the cache COPY.
+
+    The rm targets are EXACTLY the config's `cache_forbid_globs` — the same patterns
+    the generic `audit_staging_image` runs afterwards. Deleting precisely what the
+    audit forbids guarantees the audit then matches NOTHING and passes (if the rm
+    globs and the forbid globs ever diverged, the audit would fire on the leftover).
+    Each glob is `rm -rf`'d; `2>/dev/null; true` keeps the layer exit 0 even when a
+    glob matches nothing (the second forbid glob, `…/3.[4-9]*`, currently matches no
+    cached artifact — that is the normal, passing case).
+    """
+    globs = list(forbid_globs or [])
+    if not globs:
+        # Nothing forbidden ⇒ nothing to delete. A no-op `true` keeps the assembly
+        # well-formed (and the audit, also a no-op, stays clean by construction).
+        return "RUN true\n"
+    targets = " ".join(globs)
+    return f"RUN rm -rf {targets} 2>/dev/null; true\n"
+
+
+def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
+                              cache_paths: list[str],
+                              forbid_globs: list[str]) -> str:
+    """Maven closure Dockerfile: raw-cache rsync UNION of every milestone's `.m2`
+    repository (`render_union_dockerfile`) PLUS a critical self@B removal in the
+    final stage.
+
+    Like go/pip, the union ADDS the milestone `.m2` deps on top of the base image's
+    own A-version `.m2`, so the cache spans A→B (no A-baseline gap like cargo's
+    vendor-replace had). The one maven-specific step is removing the repo's OWN
+    target-version artifacts: the milestone `.m2` caches contain dubbo's
+    `org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/*.jar` + `*-sources.jar` (the answer the
+    agents copied from Maven Central). `render_union_dockerfile`'s last stage is
+    `FROM <repo>/base:latest AS final`; we append the self@B rm (derived from the
+    config's `cache_forbid_globs`) AFTER the cache COPY so the published image cannot
+    serve the answer offline and the subsequent `audit_staging_image` (running the
+    same globs) finds nothing.
+    """
+    df = render_union_dockerfile(repo_lower, milestones, cache_paths)
+    return df + maven_rm_self_at_b_cmd(forbid_globs)
+
+
 # --------------------------------------------------------------------------- #
 # Driver (Task 4.2): through the staging build only. Audit + offline-gate +    #
 # tag/publish are Task 4.3 and are intentionally NOT done here.                #
@@ -923,9 +1104,24 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                 sys.exit(1)
             df = assemble_go_dockerfile(repo_lower, milestones, cache_paths, target_go)
             _docker_build(df, staging_tag, project_root)
-        elif eco in ("maven", "npm"):
+        elif eco == "maven":
+            # Raw-cache rsync UNION of every milestone's `.m2` repository
+            # (render_union_dockerfile), then REMOVE self@B in the final stage: the
+            # milestone `.m2` caches carry dubbo's OWN target-version artifacts
+            # (org/apache/dubbo/<mod>/3.3.6-SNAPSHOT/*.jar + *-sources.jar — the
+            # answer agents copied from Maven Central). The rm targets are EXACTLY
+            # the config's cache_forbid_globs, so the generic audit below (same
+            # globs) then matches nothing. Like go/pip the union ADDS the milestone
+            # `.m2` to the base image's A-version `.m2`, so it spans A→B (no
+            # A-baseline gap like cargo's vendor-replace had); the generic
+            # per-milestone B-source gate (mvn -o test-compile) applies unchanged.
+            cache_paths = cfg["cache_paths"]
+            df = assemble_maven_dockerfile(repo_lower, milestones, cache_paths,
+                                           forbid_globs)
+            _docker_build(df, staging_tag, project_root)
+        elif eco == "npm":
             # Raw-cache rsync union path — render_union_dockerfile exists, but the
-            # driver wiring (+ build) is a later task. Don't half-build it here.
+            # npm driver wiring (+ build) is a later task. Don't half-build it here.
             raise NotImplementedError(f"ecosystem {eco}: task 4.4")
         elif eco == "pip":
             # pip is ASSEMBLED, not cache-COPY'd: collect each milestone's
@@ -957,11 +1153,21 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         # deterministic "module lookup disabled by GOPROXY=off" classifier token
         # (without it, dial-tcp errors escape the pattern and cause fail-OPEN).
         gate_goproxy_off = (eco == "go")
+        # Maven needs a maven-aware failure classifier: the default (go) classifier
+        # doesn't recognise maven's `Cannot access ... in offline mode` strings and
+        # would fail-OPEN on a real maven gap. The maven classifier treats an
+        # unresolved self@B sibling (org.apache.dubbo:*:3.3.6-SNAPSHOT — removed by
+        # design; the agent builds it from the reactor) as source_state and any
+        # unresolved THIRD-PARTY artifact as a real closure gap → BLOCK. The self@B
+        # patterns are the SAME cache_forbid_globs that drove the rm.
+        gate_classifier = (classify_maven_offline_build_failure(forbid_globs)
+                           if eco == "maven" else None)
         source_state = []
         for i, m in enumerate(milestones, 1):
             print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
             result = run_offline_gate(staging_tag, m, offline_build,
-                                     goproxy_off=gate_goproxy_off)
+                                     goproxy_off=gate_goproxy_off,
+                                     classifier=gate_classifier)
             if result == "SOURCE_STATE":
                 source_state.append(m)
                 print(f"offline gate [{i}/{len(milestones)}] {m}: SOURCE-STATE "

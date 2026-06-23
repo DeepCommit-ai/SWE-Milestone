@@ -39,4 +39,12 @@ verify_fetch_urls:
 closure:
   cache_paths:
     - /root/.m2/repository
-  offline_build: "git clean -xfd && mvn -o test-compile"
+  # Offline closure gate: compile the milestone B-source against the unioned `.m2`
+  # with no network. The lint plugins (spotless/checkstyle/rat) are NOT part of the
+  # dependency closure — a mid-migration milestone checkpoint legitimately carries
+  # un-formatted/lint-dirty source, and an early spotless ABORT would mask the
+  # dependency-resolution signal the gate actually checks. We skip them so a real
+  # `Cannot access ... in offline mode` surfaces (the maven classifier then BLOCKS
+  # on a third-party gap, treats an unresolved self@B sibling — removed by design —
+  # as source-state). `git clean -xfd` resets any built sibling state first.
+  offline_build: "git clean -xfd && mvn -o test-compile -Dspotless.check.skip=true -Dspotless.apply.skip=true -Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true"
