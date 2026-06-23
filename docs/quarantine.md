@@ -200,26 +200,24 @@ insufficient — see "Why … not enough"):
 
 ### Building the closure (pip example)
 
-Use the committed, fail-closed builder `scripts/build_quarantine_wheelhouse.py`. Run
-it in the **clean base image** (so the freeze list is authoritative and the
-editable self-install is excluded):
+Use the unified offline-closure builder `scripts/build_offline_closure.py`. It
+runs **inside** the repo's networked base image (so the freeze list is
+authoritative and the editable self-install is excluded), bakes the result
+directly into `base-offline:latest` at `/wheelhouse`, and runs a **fail-closed
+post-audit** (`audit_wheelhouse_self_exclusion`): if any forbidden artifact (the
+repo's own package, any version/alias) reaches the wheelhouse the build exits
+non-zero.
 
 ```bash
-docker run --rm -v /path/wheelhouse:/wh <repo>/base:latest \
-  python3 /path/to/scripts/build_quarantine_wheelhouse.py \
-    --out /wh --forbid scikit-learn scikit_learn sklearn
+# Build pip closure into base-offline image (B-aware — union of all milestone envs)
+python scripts/build_offline_closure.py --repo scikit-learn_scikit-learn_1.5.2_1.6.0
 ```
 
 The clean image reports scikit-learn as `-e /testbed` (editable, dev version),
-**not** a PyPI pin — so it is absent from the `==`-pinned closure by construction.
-The builder additionally runs a **fail-closed post-audit**: if any forbidden
-artifact (the repo's own package, any version/alias) reaches the wheelhouse it is
-deleted and the build exits non-zero.
-
-This is enforced a second time at trial startup: the `wheelhouse_forbid` list in
-`quarantine_configs/<repo>.yaml` makes `run_all.py` refuse to launch
-(`_assert_wheelhouse_excludes`) if the wheelhouse contains a forbidden artifact —
-so a tampered/un-audited wheelhouse is caught even if the builder was bypassed.
+**not** a PyPI pin — so it is absent from the `==`-pinned closure by
+construction. Self-exclusion is audited at build time by
+`audit_wheelhouse_self_exclusion` (driven by `wheelhouse_forbid` in the repo's
+`quarantine_configs/<repo>.yaml`).
 
 ## The base-offline image (B-aware closure for cargo/go/maven/npm)
 

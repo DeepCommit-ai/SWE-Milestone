@@ -24,13 +24,13 @@ deny_cidrs:
   - 151.101.0.0/16     # Fastly (fronts PyPI/pythonhosted)
   - 146.75.0.0/16      # Fastly
 
-# Offline pip dependency closure. Built by scripts/build_quarantine_wheelhouse.py
-# in the clean base image. The host base lives in EVOCLAW_WHEELHOUSE_DIR
-# (set once in .env_private) so this committed file carries no host path.
-pip_wheelhouse: ${EVOCLAW_WHEELHOUSE_DIR}/sk_wheelhouse
+# Offline pip dependency closure. Baked into base-offline:latest at /wheelhouse
+# by scripts/build_offline_closure.py (B-aware closure builder). The wheelhouse
+# is self-contained in the image — no host path required.
+# (pip_wheelhouse: host-path key removed; wheelhouse is in-image)
 
-# Fail closed at startup if the wheelhouse ships the repo's own package (any
-# version/alias) — guarantees the offline index can't serve the answer.
+# Fail closed at BUILD TIME if the wheelhouse ships the repo's own package (any
+# version/alias) — audited by scripts/build_offline_closure.py audit_wheelhouse_self_exclusion.
 wheelhouse_forbid:
   - scikit-learn
   - scikit_learn

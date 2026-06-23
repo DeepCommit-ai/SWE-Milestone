@@ -20,6 +20,15 @@ class TestLoadQuarantineEnv:
     def test_absent_config_returns_empty(self, tmp_path):
         assert load_quarantine_env("norepo", tmp_path) == {}
 
+    def test_load_quarantine_env_pip_sets_offline_flag(self, tmp_path):
+        (tmp_path / "quarantine_configs").mkdir()
+        (tmp_path / "quarantine_configs" / "sk.yaml").write_text(
+            "ecosystem: [pip]\nclosure: {ecosystem: pip}\n"
+        )
+        env = load_quarantine_env("sk", tmp_path)
+        assert env.get("EVOCLAW_PIP_OFFLINE") == "1"
+        assert "EVOCLAW_PIP_WHEELHOUSE" not in env   # no longer a host path
+
     def test_deny_fields(self, tmp_path):
         _write_config(tmp_path, "r1", """
 deny_domains: [crates.io, static.crates.io]

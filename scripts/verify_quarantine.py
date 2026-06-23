@@ -109,7 +109,7 @@ def main() -> int:
             "EVOCLAW_GO_OFFLINE": "GOPROXY=off",
             "EVOCLAW_MAVEN_OFFLINE": "MAVEN_ARGS=-o",
             "EVOCLAW_NPM_OFFLINE": "npm_config_offline=true",
-            "EVOCLAW_PIP_WHEELHOUSE": "PIP_NO_INDEX=1",
+            "EVOCLAW_PIP_OFFLINE": "PIP_NO_INDEX=1",
         }
         r = subprocess.run(["docker", "exec", container, "env"],
                            capture_output=True, text=True)
