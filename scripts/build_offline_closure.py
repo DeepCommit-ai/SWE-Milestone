@@ -3,9 +3,8 @@ self-contained <repo>/base-offline:latest. See
 docs/superpowers/specs/2026-06-23-offline-closure-builder-design.md."""
 import argparse, subprocess, sys, yaml
 from pathlib import Path
-from typing import Optional
 
-def discover_milestone_images(repo_lower: str, _docker_images: Optional[str] = None) -> list:
+def discover_milestone_images(repo_lower: str, _docker_images: str | None = None) -> list[str]:
     if _docker_images is None:
         _docker_images = subprocess.run(
             ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
@@ -22,15 +21,8 @@ def discover_milestone_images(repo_lower: str, _docker_images: Optional[str] = N
             continue
         # 去重:优先 latest
         if name not in seen or tag == "latest":
-            seen[name] = f"{prefix}{name}:{tag if tag=='latest' else tag}"
-    # 同 milestone 若有 latest 用 latest
-    out = []
-    for name in sorted(seen):
-        out.append(f"{prefix}{name}:latest" if _has_latest(_docker_images, prefix, name) else seen[name])
-    return out
-
-def _has_latest(images: str, prefix: str, name: str) -> bool:
-    return f"{prefix}{name}:latest" in images
+            seen[name] = f"{prefix}{name}:latest" if tag == "latest" else f"{prefix}{name}:{tag}"
+    return [seen[name] for name in sorted(seen)]
 
 def load_closure_config(repo_lower: str, project_root: Path) -> dict:
     conf = Path(project_root) / "quarantine_configs" / f"{repo_lower}.yaml"
