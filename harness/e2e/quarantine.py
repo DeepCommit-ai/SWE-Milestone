@@ -117,15 +117,14 @@ def image_for_repo(repo_name: str, project_root: Path) -> str:
     `GOPROXY=off` errors on legitimate new deps (the base:latest cache only has
     the A-version closure). Non-quarantine repos use base:latest as before.
 
-    pip is the exception: scikit ships its closure as a mounted host wheelhouse
-    (pip_wheelhouse), not baked into the image, so a pip-only policy keeps
-    base:latest. Detected by absence of a baked-image offline switch.
+    This applies to ALL quarantine ecosystems including pip: the closure builder
+    now bakes the pip wheelhouse directly into base-offline:latest (instead of
+    relying on a host-mounted wheelhouse), making the image fully self-contained
+    and portable across machines.
     """
     lower = repo_name.lower()
     q = load_quarantine_config(repo_name, project_root)
-    if q is not None and any(
-        q.get(k) for k in ("cargo_offline", "go_offline", "maven_offline", "npm_offline")
-    ):
+    if q is not None:                       # any quarantine ecosystem (incl pip) uses the offline-closure image
         return f"{lower}/base-offline:latest"
     return f"{lower}/base:latest"
 

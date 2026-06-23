@@ -178,10 +178,14 @@ class TestImageForRepo:
         _write_config(tmp_path, "gz", "ecosystem: [go]\ngo_offline: true\n")
         assert image_for_repo("gz", tmp_path) == "gz/base-offline:latest"
 
-    def test_pip_only_keeps_base(self, tmp_path):
-        # scikit ships its closure as a host wheelhouse, not a baked image.
+    def test_pip_only_uses_offline(self, tmp_path):
+        # pip closure is now baked into base-offline:latest (no longer host-mounted).
         _write_config(tmp_path, "sk", "ecosystem: [pip]\npip_wheelhouse: /wh\n")
-        assert image_for_repo("sk", tmp_path) == "sk/base:latest"
+        assert image_for_repo("sk", tmp_path) == "sk/base-offline:latest"
+
+    def test_image_for_repo_pip_uses_base_offline(self, tmp_path):
+        _write_config(tmp_path, "scikit-learn_x", "ecosystem: [pip]\npip_wheelhouse: /x\n")
+        assert image_for_repo("scikit-learn_x", tmp_path).endswith("/base-offline:latest")
 
 
 class TestCidrOverlap:
