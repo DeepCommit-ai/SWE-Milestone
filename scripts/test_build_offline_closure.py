@@ -18,3 +18,12 @@ def test_load_closure_config_returns_block(tmp_path):
     cfg = boc.load_closure_config("foo", tmp_path)
     assert cfg["cache_paths"] == ["/c"]
     assert cfg["offline_build"] == "cargo build --offline"
+
+def test_discover_excludes_base_and_dedups():
+    fake = ("burntsushi_ripgrep_14.1.1_15.0.0/base:latest\n"
+            "burntsushi_ripgrep_14.1.1_15.0.0/base-offline:latest\n"
+            "burntsushi_ripgrep_14.1.1_15.0.0/m01:latest\n"
+            "burntsushi_ripgrep_14.1.1_15.0.0/m01:v0.9\n"
+            "other_repo/m01:latest\n")
+    got = boc.discover_milestone_images("burntsushi_ripgrep_14.1.1_15.0.0", _docker_images=fake)
+    assert got == ["burntsushi_ripgrep_14.1.1_15.0.0/m01:latest"]
