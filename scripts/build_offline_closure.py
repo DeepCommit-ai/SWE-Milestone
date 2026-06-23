@@ -121,7 +121,13 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
 
     `cargo vendor` needs a cwd with a workspace manifest, so the FIRST milestone
     testbed (/tb/m0) is the cwd and the REST (m1..mN) are passed as `--sync`
-    targets — one invocation (a loop would clobber the vendor dir each call).
+    targets — one invocation (a loop would clobber the vendor dir each call). The
+    base image's OWN /testbed/Cargo.toml (the A-baseline this stage is FROM) is also
+    --sync'd, so the vendor spans A→B: with `--versioned-dirs` the result holds BOTH
+    the A and B version of every crate (e.g. bstr-1.10.0 AND bstr-1.12.0). This is
+    REQUIRED because the agent starts from the A-baseline /testbed and the
+    $CARGO_HOME redirect points ALL crates.io at /opt/vendor — a B-only vendor would
+    fail the agent's first `cargo build` (`failed to select a version`).
     Path-deps (the repo's own workspace crates) carry no `source` line and are
     auto-excluded by cargo vendor, so the answer is never baked in.
 
@@ -154,8 +160,24 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     ]
     for i, m in enumerate(milestones):
         lines.append(f"COPY --from={m} /testbed /tb/m{i}")
-    # cwd = first milestone's workspace; --sync the manifests of the rest.
+    # cwd = first milestone's workspace; --sync the manifests of the rest, PLUS the
+    # base image's OWN /testbed/Cargo.toml — the A-baseline.
+    #
+    # CLOSURE GAP (glm-5.2 validation): an agent doing the A→B task STARTS from the
+    # A-baseline (`<repo>/base:latest`'s /testbed, whose Cargo.lock pins the OLD
+    # versions, e.g. bstr 1.10.0). The milestone testbeds pin only B-versions
+    # (bstr 1.12.0), so a vendor of milestones alone leaves /opt/vendor without the
+    # A-version crates; the $CARGO_HOME redirect routes ALL crates.io to /opt/vendor,
+    # and the agent's first `cargo build` fails `failed to select a version for the
+    # requirement bstr = ...`. The vendor must span A→B. This stage is
+    # `FROM <repo>/base:latest`, so /testbed IS the A-baseline (already present, no
+    # COPY needed); `cargo vendor --versioned-dirs` keeps multiple versions of a
+    # crate in separate <name>-<ver>/ dirs, so the result contains BOTH the A and B
+    # versions. cwd stays /tb/m0 (a real workspace); /testbed/Cargo.toml is one more
+    # --sync. (go/pip ADD milestone caches on top of the base cache so they keep the
+    # A-versions; only cargo REPLACES via the vendor redirect, hence this fix.)
     sync_manifests = [f"/tb/m{i}/Cargo.toml" for i in range(1, len(milestones))]
+    sync_manifests.append("/testbed/Cargo.toml")
     vendor = cargo_vendor_cmd(sync_manifests, vendor_dir)
     lines.append(f"RUN cd /tb/m0 && {vendor}")
     lines.append(f"FROM {repo_lower}/base:latest AS final")
@@ -404,6 +426,58 @@ def run_offline_gate(staging_tag: str, milestone: str, offline_build: str,
         return "SOURCE_STATE"
     finally:
         shutil.rmtree(hosttmp, ignore_errors=True)
+
+
+# Signatures cargo emits when the vendored sources cannot satisfy a Cargo.lock
+# requirement — i.e. a real CLOSURE GAP (the vendor is missing a version the
+# A-baseline pins). These are the exact strings glm-5.2 validation hit when the
+# vendor held only B-version crates and the agent started from the A-baseline.
+_CARGO_CLOSURE_GAP_SIGS = (
+    "failed to select a version",
+    "not found in vendored sources",
+)
+
+
+def run_cargo_abaseline_gate(staging_tag: str, offline_build: str) -> None:
+    """cargo A-BASELINE OFFLINE GATE: prove the closure also builds the exact state
+    the AGENT STARTS FROM — the A-baseline /testbed — fully offline (fail-closed).
+
+    The per-milestone gate (run_offline_gate) injects each milestone's B-source
+    /testbed, so it ONLY exercises the B-version crates. But an A→B agent begins at
+    `<repo>/base:latest`'s /testbed (the A Cargo.lock, e.g. bstr 1.10.0), and the
+    $CARGO_HOME redirect routes ALL crates.io at /opt/vendor. If the vendor lacks
+    the A-version crates, the agent's very first `cargo build` dies with `failed to
+    select a version` / `not found in vendored sources` — a closure gap the
+    milestone-only gate cannot see. This gate closes that hole.
+
+    The staging image's OWN /testbed IS the A-baseline (it is `FROM
+    <repo>/base:latest`), so NO injection is needed — unlike run_offline_gate we do
+    NOT docker-create/cp a milestone. We simply
+    `docker run --rm --network none <staging> sh -c 'cd /testbed && <offline_build>'`.
+
+    Outcome: EXIT 0 → return (gate passed). Non-zero → the A-baseline is a clean,
+    compilable state, so a build failure here is a REAL CLOSURE GAP (never a
+    source-state problem the way a mid-migration B-milestone can be) → fail-closed
+    (sys.exit 1). The closure-gap signatures above are called out explicitly in the
+    error so the cause (missing vendored A-version) is unambiguous.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", staging_tag,
+         "sh", "-c", f"cd /testbed && {offline_build}"],
+        capture_output=True, text=True)
+    if r.returncode == 0:
+        return
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    tail = "\n".join(out.splitlines()[-40:])
+    sig = next((s for s in _CARGO_CLOSURE_GAP_SIGS if s in out), None)
+    diag = (f" [closure gap: cargo could not satisfy the A-baseline Cargo.lock from "
+            f"the vendor — matched {sig!r}; the vendor must span A→B]" if sig else
+            " [A-baseline is a clean compilable state, so this offline-build failure "
+            "is a closure gap, not a source-state issue]")
+    print(f"Error: cargo A-BASELINE OFFLINE GATE failed for {staging_tag} "
+          f"(offline build exit {r.returncode}) — the closure cannot build the state "
+          f"the agent STARTS from{diag}:\n{tail}", file=sys.stderr)
+    sys.exit(1)
 
 
 def _dist_name(req: str) -> str:
@@ -894,6 +968,22 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                       f"(not a closure gap; recorded)", flush=True)
             else:
                 print(f"offline gate [{i}/{len(milestones)}] {m}: PASS", flush=True)
+
+        # 2b) cargo A-BASELINE OFFLINE GATE — the per-milestone gates above only
+        #     exercise the B-version crates (each injects a milestone B-source
+        #     /testbed). But the AGENT STARTS from the A-baseline /testbed and the
+        #     $CARGO_HOME redirect points ALL crates.io at /opt/vendor, so the
+        #     vendor must also satisfy the A Cargo.lock. The staging image's OWN
+        #     /testbed IS the A-baseline (it is FROM <repo>/base:latest), so no
+        #     injection is needed — build it offline in place. A failure here is a
+        #     real CLOSURE GAP (the A-baseline is a clean compilable state) →
+        #     fail-closed inside run_cargo_abaseline_gate before :latest is tagged.
+        if eco == "cargo":
+            print(f"cargo A-baseline offline gate (staging /testbed, --network none) "
+                  f"...", flush=True)
+            run_cargo_abaseline_gate(staging_tag, offline_build)
+            print(f"cargo A-baseline offline gate: PASS (the agent's A-start state "
+                  f"builds offline against the closure)", flush=True)
 
         # 3) No closure gap (any gap would have exited above) → publish. Only now
         #    is :latest tagged. Source-state-only failures do not block.

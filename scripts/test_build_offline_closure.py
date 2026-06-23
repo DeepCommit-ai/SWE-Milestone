@@ -121,13 +121,18 @@ def test_assemble_cargo_dockerfile_structure():
     # one COPY --from per milestone, into /tb/m<i>
     for i, m in enumerate(ms):
         assert f"COPY --from={m} /testbed /tb/m{i}" in df
-    # cwd is the FIRST milestone testbed, vendor syncs the rest
+    # cwd is the FIRST milestone testbed, vendor syncs the rest PLUS the base
+    # A-baseline manifest (/testbed/Cargo.toml, present in the FROM-base stage) so
+    # the vendor spans A→B and the agent's A-start `cargo build` resolves.
     assert "cd /tb/m0 &&" in df
     assert "cargo vendor" in df
-    assert df.count("--sync") == len(ms) - 1   # m0 is cwd, not --sync'd
+    # m0 is cwd (not --sync'd); m1..mN are --sync'd; the base A-baseline is one more.
+    assert df.count("--sync") == (len(ms) - 1) + 1
     assert "--sync /tb/m1/Cargo.toml" in df
     assert "--sync /tb/m2/Cargo.toml" in df
     assert "--sync /tb/m0/Cargo.toml" not in df
+    # the base image's own /testbed (the A-baseline) is synced alongside milestones.
+    assert "--sync /testbed/Cargo.toml" in df
     # final stage copies the vendor dir out of the builder
     assert "COPY --from=vendor_builder /opt/vendor /opt/vendor" in df
     # config written to $CARGO_HOME, never /testbed/.cargo
@@ -137,12 +142,33 @@ def test_assemble_cargo_dockerfile_structure():
 
 
 def test_assemble_cargo_dockerfile_single_milestone():
-    """One milestone: it is the cwd, so there are zero --sync flags."""
+    """One milestone: it is the cwd, so the only --sync is the base A-baseline
+    manifest (/testbed/Cargo.toml) — the milestone itself is m0/cwd, not --sync'd."""
     df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest"])
     assert "cd /tb/m0 &&" in df
     assert "cargo vendor" in df
-    assert "--sync" not in df
+    # exactly one --sync: the base A-baseline manifest (vendor must span A→B).
+    assert df.count("--sync") == 1
+    assert "--sync /testbed/Cargo.toml" in df
     assert "COPY --from=r/x/m00:latest /testbed /tb/m0" in df
+
+
+def test_assemble_cargo_dockerfile_syncs_base_a_baseline():
+    """Closure gap fix: the vendor MUST span A→B. The vendor_builder stage is
+    `FROM <repo>/base:latest`, so its OWN /testbed is the A-baseline (A Cargo.lock,
+    e.g. bstr 1.10.0). Assert the base A-baseline manifest (/testbed/Cargo.toml) is
+    in the --sync set alongside the milestone (B) testbeds, so `cargo vendor
+    --versioned-dirs` holds BOTH the A and B versions of each crate. Without this,
+    an agent starting from the A-baseline fails its first `cargo build` (the vendor
+    only has B-version crates)."""
+    for ms in (["r/x/m00:latest"],
+               ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]):
+        df = boc.assemble_cargo_dockerfile("r/x", ms)
+        # The base stage's own /testbed (A-baseline) is synced — NOT a /tb/m* copy.
+        assert "--sync /testbed/Cargo.toml" in df
+        # cwd stays the first milestone workspace; the A-baseline is just one more
+        # --sync (cargo vendor needs a workspace manifest as cwd, m0 provides it).
+        assert "cd /tb/m0 &&" in df
 
 
 def test_assemble_cargo_dockerfile_vendor_to_opt():
@@ -365,6 +391,60 @@ def test_run_offline_gate_create_fail_exits(monkeypatch):
     with pytest.raises(SystemExit):
         boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
                              "cargo build --offline")
+
+
+# ---- cargo A-baseline offline gate (agent-start closure-gap guard) ------------
+
+def test_cargo_abaseline_gate_pass_no_injection(monkeypatch):
+    """EXIT 0 → returns (None) and runs against the STAGING image's OWN /testbed
+    (the A-baseline) with --network none — NO docker-create/cp injection."""
+    calls = []
+    def fake_run(cmd, *a, **k):
+        calls.append(cmd)
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    assert boc.run_cargo_abaseline_gate(
+        "r/x/base-offline:staging", "cargo build --offline") is None
+    # exactly one docker run; no create/cp (the staging /testbed IS the A-baseline).
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[:2] == ["docker", "run"]
+    assert "--network" in cmd and "none" in cmd
+    assert "r/x/base-offline:staging" in cmd
+    joined = " ".join(cmd)
+    assert "cd /testbed && cargo build --offline" in joined
+    assert "docker create" not in joined and "docker cp" not in joined
+
+
+def test_cargo_abaseline_gate_select_version_is_gap(monkeypatch):
+    """`failed to select a version` (vendor lacks the A-version a Cargo.lock pins)
+    → real CLOSURE GAP → sys.exit(1). This is the exact glm-5.2 failure."""
+    GAP = ("error: failed to select a version for the requirement `bstr = \"^1.10\"`\n"
+           "candidate versions found which didn't match: 1.12.0\n")
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(101, "", GAP))
+    with pytest.raises(SystemExit) as e:
+        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+    assert e.value.code == 1
+
+
+def test_cargo_abaseline_gate_not_in_vendored_is_gap(monkeypatch):
+    """`not found in vendored sources` is also treated as a closure gap → exit 1."""
+    GAP = "error: the crate `bstr v1.10.0` was not found in vendored sources\n"
+    monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(101, GAP, ""))
+    with pytest.raises(SystemExit) as e:
+        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+    assert e.value.code == 1
+
+
+def test_cargo_abaseline_gate_any_nonzero_is_gap(monkeypatch):
+    """The A-baseline is a clean compilable state, so ANY non-zero offline build is
+    fail-closed (a real gap), even without a recognised vendored-source signature —
+    unlike the per-milestone gate, there is no source-state escape hatch here."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(101, "", "error: some other build failure\n"))
+    with pytest.raises(SystemExit) as e:
+        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+    assert e.value.code == 1
 
 
 def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
