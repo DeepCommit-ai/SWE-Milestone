@@ -41,3 +41,19 @@ closure:
   cache_paths:
     - /usr/local/cargo/registry/cache
   offline_build: "cargo build --offline"
+  # extra_vendor_crates: crate specs that appear in the golden Cargo.lock of
+  # milestone testbeds but are NOT pulled in by `cargo vendor` of those testbeds
+  # (because the testbed src doesn't declare them yet — the SRS task asks the
+  # agent to add them).  A synthetic workspace containing these exact deps is
+  # included as --sync in the vendor step so they land in /opt/vendor before the
+  # agent needs them at eval time.
+  #
+  # arbitrary 1.4.2 + derive_arbitrary 1.4.2: FR5 of maintenance_fixes_1_sub-01
+  # adds `arbitrary` as a dev-dep (or optional feature dep) to
+  # crates/globset/Cargo.toml.  The golden Cargo.lock already pins 1.4.2 (no
+  # source line → local path dep).  cargo vendor of the current testbed src
+  # (0.4.15, no arbitrary) never fetches it, so cargo test --offline after the
+  # agent implements FR5 fails with "not found in vendored sources".
+  extra_vendor_crates:
+    - "arbitrary = \"=1.4.2\""
+    - "derive_arbitrary = \"=1.4.2\""

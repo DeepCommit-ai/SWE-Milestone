@@ -115,7 +115,8 @@ def cargo_config_toml(vendor_dir: str) -> str:
 
 
 def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
-                              toolchain: dict | None = None) -> str:
+                              toolchain: dict | None = None,
+                              extra_vendor_crates: list[str] | None = None) -> str:
     """Multi-stage Dockerfile that vendors the UNION of every milestone's Cargo
     workspace into /opt/vendor, then bakes a $CARGO_HOME offline redirect.
 
@@ -148,6 +149,18 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     cargo, all of which minimal provides, so the milestone's `profile="default"`
     directive triggers no extra (offline-failing) component download at gate time.
     Repos with no toolchain key (ripgrep) emit no rust-install line — unchanged.
+
+    Optional `extra_vendor_crates`: a list of TOML dependency spec strings (e.g.
+    ["arbitrary = \\"=1.4.2\\"", "derive_arbitrary = \\"=1.4.2\\""]).  When present, a
+    synthetic workspace `/tmp/extra_vendor/Cargo.toml` is created BEFORE the
+    `cargo vendor` step and included as an extra `--sync` target.  This pulls the
+    pinned crates into /opt/vendor even if no milestone testbed declares them yet
+    (use case: an SRS task asks the agent to ADD a new dependency, so the current
+    testbed src doesn't reference it, but the golden Cargo.lock already pins the
+    version the agent will need at eval time).  The synthetic workspace is a
+    plain package (not a workspace root) so it gets its own fresh Cargo.lock
+    resolved from the live registry — the exact version spec in each entry (e.g.
+    `= "=1.4.2"`) ensures cargo resolves to exactly that pinned version.
     """
     if not milestones:
         print("Error: assemble_cargo_dockerfile got no milestones", file=sys.stderr)
@@ -178,6 +191,37 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     # A-versions; only cargo REPLACES via the vendor redirect, hence this fix.)
     sync_manifests = [f"/tb/m{i}/Cargo.toml" for i in range(1, len(milestones))]
     sync_manifests.append("/testbed/Cargo.toml")
+    # extra_vendor_crates: create a synthetic workspace that pins the requested
+    # crates so they land in /opt/vendor even if the current testbed src doesn't
+    # declare them yet.  Resolves ONLINE (network is available at build time), so
+    # the exact `= "=X.Y.Z"` version spec guarantees the pinned version is fetched.
+    extra_vendor_manifest = "/tmp/extra_vendor/Cargo.toml"
+    if extra_vendor_crates:
+        dep_lines = "\n".join(spec for spec in extra_vendor_crates)
+        raw_toml = (
+            '[package]\n'
+            'name = "extra-vendor-seed"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            '\n'
+            '[lib]\n'
+            'name = "extra_vendor_seed"\n'
+            '\n'
+            '[dependencies]\n'
+            + dep_lines + '\n'
+        )
+        # Encode for printf (same technique as cargo_config_toml above):
+        # escape backslashes, single-quotes, and encode real newlines as \n.
+        fmt_toml = (raw_toml
+                    .replace("\\", "\\\\")
+                    .replace("'", "'\\''")
+                    .replace("\n", "\\n"))
+        lines.append(
+            f"RUN mkdir -p /tmp/extra_vendor/src && "
+            f"touch /tmp/extra_vendor/src/lib.rs && "
+            f"printf '{fmt_toml}' > {extra_vendor_manifest}"
+        )
+        sync_manifests.append(extra_vendor_manifest)
     vendor = cargo_vendor_cmd(sync_manifests, vendor_dir)
     lines.append(f"RUN cd /tb/m0 && {vendor}")
     lines.append(f"FROM {repo_lower}/base:latest AS final")
@@ -2153,7 +2197,8 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                     repo_lower, milestones, toolchain=cfg.get("toolchain"))
             elif mechanism == "vendor":
                 df = assemble_cargo_dockerfile(repo_lower, milestones,
-                                               toolchain=cfg.get("toolchain"))
+                                               toolchain=cfg.get("toolchain"),
+                                               extra_vendor_crates=cfg.get("extra_vendor_crates"))
             else:
                 print(f"Error: {repo_lower}: unknown closure.cargo_mechanism "
                       f"{mechanism!r} (want 'vendor' or 'raw-cache')",
