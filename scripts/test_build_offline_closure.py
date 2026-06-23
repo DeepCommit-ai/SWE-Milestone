@@ -5,6 +5,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_offline_closure as boc
 
+
+def _R(returncode=0, stdout="", stderr=""):
+    """A stand-in for subprocess.CompletedProcess in monkeypatched tests."""
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
 def test_load_closure_config_missing_exits(tmp_path):
     (tmp_path / "quarantine_configs").mkdir()
     (tmp_path / "quarantine_configs" / "foo.yaml").write_text("ecosystem: [pip]\n")
@@ -163,3 +168,127 @@ def test_load_closure_config_case_insensitive(tmp_path):
         "ecosystem: [cargo]\nclosure:\n  cache_paths: ['/c']\n  offline_build: 'cargo build --offline'\n")
     cfg = boc.load_closure_config("burntsushi_x", tmp_path)
     assert cfg["cache_paths"] == ["/c"]
+
+
+# ---- Task 4.2 freebie: cargo_vendor_cmd single-milestone has no double space --
+
+def test_cargo_vendor_cmd_no_double_space_single():
+    """Empty --sync list (single milestone) must not leave a `--versioned-dirs  /opt`
+    double space."""
+    cmd = boc.cargo_vendor_cmd([], "/opt/vendor")
+    assert "  " not in cmd
+    assert cmd == "cargo vendor --versioned-dirs /opt/vendor"
+
+
+# ---- Task 4.3: in-image audit --------------------------------------------------
+
+def test_audit_staging_image_empty_globs_is_noop(monkeypatch):
+    """No forbid globs → no docker run, just return."""
+    called = []
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: called.append(a) or _R(0, ""))
+    boc.audit_staging_image("r/x/base-offline:staging", [])
+    assert called == []   # never shelled out
+
+
+def test_audit_staging_image_clean_passes(monkeypatch):
+    """Globs present but empty stdout (nothing matched) → return, no exit."""
+    captured = {}
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _R(0, "")   # empty stdout = clean
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+    # ran `docker run ... ls -d <glob>` against the staging image
+    assert captured["cmd"][:3] == ["docker", "run", "--rm"]
+    assert "r/x/base-offline:staging" in captured["cmd"]
+    joined = " ".join(captured["cmd"])
+    assert "ls -d" in joined and "/c/grep-*.crate" in joined
+
+
+def test_audit_staging_image_match_exits(monkeypatch):
+    """Non-empty stdout (a glob matched → self@B leaked) → sys.exit(1)."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda *a, **k: _R(0, "/c/grep-1.0.crate\n"))
+    with pytest.raises(SystemExit) as e:
+        boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+    assert e.value.code == 1
+
+
+# ---- Task 4.3: per-milestone offline gate -------------------------------------
+
+def test_run_offline_gate_create_cp_run_sequence(monkeypatch):
+    """Happy path builds the create→cp→rm→run sequence; exit-0 build → no raise."""
+    calls = []
+    def fake_run(cmd, *a, **k):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "deadbeefcid\n")
+        return _R(0, "")   # cp, rm, run all succeed
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                         "cargo build --offline")
+    kinds = [c[:2] for c in calls]
+    assert ["docker", "create"] in kinds
+    assert ["docker", "cp"] in kinds
+    assert ["docker", "rm"] in kinds
+    assert ["docker", "run"] in kinds
+    # docker create targets the MILESTONE (B-source), not the staging image
+    create = next(c for c in calls if c[:2] == ["docker", "create"])
+    assert create[2] == "r/x/m01:latest"
+    # the offline build runs against the STAGING image with --network none
+    run = next(c for c in calls if c[:2] == ["docker", "run"])
+    assert "--network" in run and "none" in run
+    assert "r/x/base-offline:staging" in run
+    assert "cargo build --offline" in " ".join(run)
+    # and bind-mounts the copied milestone /testbed over /testbed
+    assert any(isinstance(x, str) and x.endswith("/testbed:/testbed") for x in run)
+
+
+def test_run_offline_gate_build_fail_exits(monkeypatch):
+    """Offline build exit != 0 → sys.exit(1) (closure insufficient, never skip)."""
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(101, "error: failed to load source for dependency\n")
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit) as e:
+        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                             "cargo build --offline")
+    assert e.value.code == 1
+
+
+def test_run_offline_gate_create_fail_exits(monkeypatch):
+    """`docker create` failure is fail-closed too."""
+    monkeypatch.setattr(boc.subprocess, "run",
+                        lambda cmd, *a, **k: _R(1, "", "no such image"))
+    with pytest.raises(SystemExit):
+        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+                             "cargo build --offline")
+
+
+def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
+    """The host tmp dir is rmtree'd even though the build failed."""
+    made = {}
+    real_mkdtemp = boc.tempfile.mkdtemp if hasattr(boc, "tempfile") else None
+    import tempfile as _t, shutil as _s
+    def fake_mkdtemp(*a, **k):
+        d = str(tmp_path / "gate")
+        Path(d).mkdir()
+        made["d"] = d
+        return d
+    removed = []
+    monkeypatch.setattr(_t, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(_s, "rmtree", lambda d, **k: removed.append(d))
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "create"]:
+            return _R(0, "cid\n")
+        if cmd[:2] == ["docker", "run"]:
+            return _R(1, "boom")
+        return _R(0, "")
+    monkeypatch.setattr(boc.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest", "cargo build")
+    assert made["d"] in removed

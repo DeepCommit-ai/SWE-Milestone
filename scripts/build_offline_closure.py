@@ -91,7 +91,11 @@ def cargo_vendor_cmd(milestone_testbeds: list[str], vendor_dir: str) -> str:
     prefixes — `nu-ansi-term`, `num-traits`, etc. are legitimate third-party crates.
     """
     syncs = " ".join(f"--sync {t}" for t in milestone_testbeds)
-    return f"cargo vendor --versioned-dirs {syncs} {vendor_dir}"
+    parts = ["cargo vendor --versioned-dirs"]
+    if syncs:
+        parts.append(syncs)
+    parts.append(vendor_dir)
+    return " ".join(parts)
 
 
 def cargo_config_toml(vendor_dir: str) -> str:
@@ -164,6 +168,89 @@ def offline_gate_cmd(staging_image: str, milestone: str, offline_build: str) -> 
     # (A-baseline) is used as a placeholder.
     return ["docker", "run", "--rm", "--network", "none", staging_image,
             "sh", "-c", f"cd /testbed && {offline_build}"]
+
+
+def audit_staging_image(staging_tag: str, forbid_globs: list[str]) -> None:
+    """In-image self-exclusion AUDIT: run the cache_forbid_globs INSIDE the
+    staging image and fail-closed if any glob matches (self@B leaked).
+
+    The closure cache lives IN the image (vendored/copied), not on the host, so
+    the host-dir `assert_no_self_packages` (Task 2.1) is NOT the mechanism here.
+    We `ls -d` the globs inside the container; a non-empty stdout means at least
+    one forbidden self@B artifact made it into the closure → refuse (sys.exit 1).
+
+    cargo/ripgrep note: with `cargo vendor` the registry/cache the globs target is
+    never populated and workspace self-crates are auto-excluded by construction
+    (proven in 4.2). Running the globs anyway is defense-in-depth, so an empty
+    forbid_globs list (or all-clean match) is the normal, passing case.
+    """
+    globs = list(forbid_globs or [])
+    if not globs:
+        return
+    # `ls -d <glob1> <glob2> ... 2>/dev/null; true` — unmatched globs print
+    # nothing (errors suppressed), matched paths go to stdout; `true` keeps the
+    # shell exit 0 so a non-match is not mistaken for a docker failure.
+    quoted = " ".join(f"'{g}'" for g in globs)
+    cmd = ["docker", "run", "--rm", staging_tag, "sh", "-c",
+           f"ls -d {quoted} 2>/dev/null; true"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    matched = (r.stdout or "").strip()
+    if matched:
+        print(f"Error: offline closure AUDIT failed for {staging_tag}: cache "
+              f"contains forbidden self@B artifact(s) — refusing (would leak the "
+              f"answer):\n{matched}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run_offline_gate(staging_tag: str, milestone: str, offline_build: str) -> None:
+    """Per-milestone OFFLINE GATE: prove the closure is sufficient to build the
+    milestone's B-source with no network.
+
+    The milestone's own `/testbed` (the B-source) must be injected — NOT the
+    A-baseline baked into the staging image. We materialise it on the host via an
+    ephemeral `docker create`/`cp`/`rm`, bind-mount it over `/testbed`, and run
+    `cd /testbed && <offline_build>` with `--network none`. A non-zero build means
+    the closure is INSUFFICIENT for this milestone → fail-closed (sys.exit 1), do
+    NOT skip the milestone.
+    """
+    import tempfile, shutil
+    hosttmp = tempfile.mkdtemp(prefix="offline_gate.")
+    try:
+        # Ephemeral container, solely to copy the milestone's B-source /testbed out.
+        cr = subprocess.run(["docker", "create", milestone],
+                            capture_output=True, text=True)
+        if cr.returncode != 0:
+            print(f"Error: offline gate could not `docker create {milestone}`:\n"
+                  f"{(cr.stderr or cr.stdout).strip()}", file=sys.stderr)
+            sys.exit(1)
+        cid = cr.stdout.strip()
+        try:
+            cp = subprocess.run(
+                ["docker", "cp", f"{cid}:/testbed", f"{hosttmp}/testbed"],
+                capture_output=True, text=True)
+            if cp.returncode != 0:
+                print(f"Error: offline gate could not cp /testbed from {milestone}:\n"
+                      f"{(cp.stderr or cp.stdout).strip()}", file=sys.stderr)
+                sys.exit(1)
+        finally:
+            subprocess.run(["docker", "rm", cid],
+                          capture_output=True, text=True)
+        # Bind-mount the milestone's /testbed over the image's baseline and build
+        # fully offline.
+        run = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none",
+             "-v", f"{hosttmp}/testbed:/testbed", staging_tag,
+             "sh", "-c", f"cd /testbed && {offline_build}"],
+            capture_output=True, text=True)
+        if run.returncode != 0:
+            out = ((run.stdout or "") + (run.stderr or "")).strip()
+            tail = "\n".join(out.splitlines()[-40:])
+            print(f"Error: OFFLINE GATE failed for milestone {milestone} "
+                  f"(offline build exit {run.returncode}) — closure is "
+                  f"INSUFFICIENT:\n{tail}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        shutil.rmtree(hosttmp, ignore_errors=True)
 
 
 def _dist_name(req: str) -> str:
@@ -267,38 +354,77 @@ def _docker_build(dockerfile: str, tag: str, project_root: Path) -> None:
 
 def build_closure(repo_lower: str, project_root: Path, push: bool = False,
                   keep: bool = False) -> None:
-    """Build <repo_lower>/base-offline:staging — the self-contained offline
-    closure image — and stop. (Audit/offline-gate/tag = Task 4.3.)
+    """Build, AUDIT, GATE, and tag the offline dependency closure for a repo.
 
-    `push`/`keep` are accepted for forward-compat with 4.3 wiring but only `keep`
-    has an effect here (it is a no-op for now: staging is always left in place;
-    4.3 owns cleanup). `push` is unused until publish lands in 4.3.
+    Pipeline: assemble + `docker build` <repo_lower>/base-offline:staging → run
+    the in-image self-exclusion AUDIT (cache_forbid_globs) → run the per-milestone
+    OFFLINE GATE (each milestone's B-source /testbed must build offline against the
+    closure) → on ALL-green, `docker tag` it <repo_lower>/base-offline:latest (and
+    `docker push` if `push`). Any audit/gate/build failure is fail-closed: :latest
+    is NEVER tagged and the process exits nonzero.
+
+    The staging image is removed in a `finally` unless `keep` is set; the published
+    :latest tag always stays.
     """
     cfg = load_closure_config(repo_lower, project_root)
     eco = _ecosystem_of(repo_lower, project_root)
+    # cache_forbid_globs is a TOP-LEVEL key in the quarantine yaml (not inside the
+    # `closure` block), so read it from the full config. Default [] (audit no-op).
+    forbid_globs = load_quarantine_yaml(repo_lower, project_root).get(
+        "cache_forbid_globs") or []
+    offline_build = cfg["offline_build"]
     milestones = discover_milestone_images(repo_lower)
     if not milestones:
         print(f"Error: no milestone images for {repo_lower} (run pull_images.sh)",
               file=sys.stderr)
         sys.exit(1)
     staging_tag = f"{repo_lower}/base-offline:staging"
+    latest_tag = f"{repo_lower}/base-offline:latest"
 
-    if eco == "cargo":
-        df = assemble_cargo_dockerfile(repo_lower, milestones)
-        _docker_build(df, staging_tag, project_root)
-    elif eco in ("go", "maven", "npm"):
-        # Raw-cache rsync union path — render_union_dockerfile exists, but the
-        # driver wiring (+ build) is Task 4.4. Don't half-build it here.
-        raise NotImplementedError(f"ecosystem {eco}: task 4.4")
-    elif eco == "pip":
-        raise NotImplementedError(f"ecosystem {eco}: task 4.5 (freeze-union-download)")
-    else:
-        print(f"Error: {repo_lower}: unsupported ecosystem {eco!r}", file=sys.stderr)
-        sys.exit(1)
+    try:
+        if eco == "cargo":
+            df = assemble_cargo_dockerfile(repo_lower, milestones)
+            _docker_build(df, staging_tag, project_root)
+        elif eco in ("go", "maven", "npm"):
+            # Raw-cache rsync union path — render_union_dockerfile exists, but the
+            # driver wiring (+ build) is Task 4.4. Don't half-build it here.
+            raise NotImplementedError(f"ecosystem {eco}: task 4.4")
+        elif eco == "pip":
+            raise NotImplementedError(f"ecosystem {eco}: task 4.5 (freeze-union-download)")
+        else:
+            print(f"Error: {repo_lower}: unsupported ecosystem {eco!r}", file=sys.stderr)
+            sys.exit(1)
 
-    # Task 4.2 stops at staging. cfg/push are consumed by Task 4.3.
-    _ = (cfg, push, keep)
-    print(f"staging built: {staging_tag}")
+        # 1) In-image self-exclusion AUDIT (defense-in-depth; fail-closed).
+        audit_staging_image(staging_tag, forbid_globs)
+        print(f"audit clean: {staging_tag} (forbid_globs={len(forbid_globs)})",
+              flush=True)
+
+        # 2) Per-milestone OFFLINE GATE — each milestone's B-source /testbed must
+        #    build offline against the closure (fail-closed; never skip).
+        for i, m in enumerate(milestones, 1):
+            print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
+            run_offline_gate(staging_tag, m, offline_build)
+            print(f"offline gate [{i}/{len(milestones)}] {m}: PASS", flush=True)
+
+        # 3) All green → publish. Only now is :latest tagged.
+        tr = subprocess.run(["docker", "tag", staging_tag, latest_tag])
+        if tr.returncode != 0:
+            print(f"Error: docker tag {staging_tag} -> {latest_tag} failed",
+                  file=sys.stderr)
+            sys.exit(tr.returncode)
+        if push:
+            pr = subprocess.run(["docker", "push", latest_tag])
+            if pr.returncode != 0:
+                print(f"Error: docker push {latest_tag} failed", file=sys.stderr)
+                sys.exit(pr.returncode)
+        print(f"SUCCESS: {latest_tag} published "
+              f"({len(milestones)} milestone gate(s) passed"
+              f"{', pushed' if push else ''}).")
+    finally:
+        if not keep:
+            subprocess.run(["docker", "rmi", "-f", staging_tag],
+                          capture_output=True, text=True)
 
 
 def main(argv=None):
