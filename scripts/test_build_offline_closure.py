@@ -73,3 +73,15 @@ def test_render_union_dockerfile_empty_cache_paths():
 def test_render_union_dockerfile_rsync_mkpath_and_trailing_slash():
     df = boc.render_union_dockerfile("r/x", ["r/x/m01:latest"], ["/usr/local/cargo/registry/cache"])
     assert "mkdir -p /staging/usr/local/cargo/registry/cache && rsync -a /milestone_0_0/usr/local/cargo/registry/cache/ /staging/usr/local/cargo/registry/cache/" in df
+
+def test_cargo_vendor_sync_one_shot():
+    cmd = boc.cargo_vendor_cmd(["/tb1/Cargo.toml", "/tb2/Cargo.toml"], "/opt/vendor")
+    assert cmd.startswith("cargo vendor --versioned-dirs")
+    assert cmd.count("--sync") == 2     # one call, multiple --sync (not a loop)
+    assert cmd.rstrip().endswith("/opt/vendor")
+
+def test_cargo_config_points_to_vendor():
+    cfg = boc.cargo_config_toml("/opt/vendor")
+    assert '[source.crates-io]' in cfg
+    assert 'replace-with = "vendored-sources"' in cfg
+    assert 'directory = "/opt/vendor"' in cfg

@@ -44,6 +44,39 @@ def load_closure_config(repo_lower: str, project_root: Path) -> dict:
         print(f"Error: {conf}: closure block must have cache_paths and offline_build", file=sys.stderr); sys.exit(1)
     return closure
 
+def cargo_vendor_cmd(milestone_testbeds: list[str], vendor_dir: str) -> str:
+    """Return a single `cargo vendor` command that syncs all milestone Cargo.toml workspaces
+    into vendor_dir in one shot.
+
+    IMPORTANT: must be ONE invocation with multiple --sync flags. Running `cargo vendor` in a
+    loop to the same dir REPLACES the vendor dir on each call (drops prior crates) — empirically
+    confirmed EXIT=101 on cargo build --offline after loop approach.
+
+    Self-exclusion note: workspace path-deps (no `source` line in vendor metadata) are
+    auto-excluded by `cargo vendor`. Downstream self-exclusion audits must inspect the
+    `source` line in each vendored crate's .cargo-checksum.json/Cargo.toml, NOT name
+    prefixes — `nu-ansi-term`, `num-traits`, etc. are legitimate third-party crates.
+    """
+    syncs = " ".join(f"--sync {t}" for t in milestone_testbeds)
+    return f"cargo vendor --versioned-dirs {syncs} {vendor_dir}"
+
+
+def cargo_config_toml(vendor_dir: str) -> str:
+    """Return the content to write to $CARGO_HOME/config.toml (i.e. /usr/local/cargo/config.toml).
+
+    DESTINATION REQUIREMENT: this content MUST be written to $CARGO_HOME/config.toml
+    (/usr/local/cargo/config.toml), NEVER to /testbed/.cargo/config.toml.
+    The agent's `git clean -xfd` inside /testbed wipes .cargo/ → the offline redirect
+    silently disappears and cargo falls back to the network, defeating the closure.
+    The driver (a later task) is responsible for placing the file at the correct path;
+    this function only produces the content string.
+    """
+    return ('[source.crates-io]\n'
+            'replace-with = "vendored-sources"\n'
+            '[source.vendored-sources]\n'
+            f'directory = "{vendor_dir}"\n')
+
+
 def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
     lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
              "RUN command -v rsync || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)"]
