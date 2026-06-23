@@ -161,9 +161,48 @@ class TestAgentQuarantineEnvVars:
         assert self._env_dict({"EVOCLAW_NPM_OFFLINE": "1"}) == {
             "npm_config_offline": "true"}
 
-    def test_pip_wheelhouse_unchanged(self):
+    def test_pip_wheelhouse_alone_no_longer_triggers(self):
+        # EVOCLAW_PIP_WHEELHOUSE is the old trigger; it must no longer set pip env.
         env = self._env_dict({"EVOCLAW_PIP_WHEELHOUSE": "/wh"})
+        assert env == {}
+
+    def test_pip_offline_uses_in_image_wheelhouse(self):
+        # New trigger: EVOCLAW_PIP_OFFLINE=1 → pip reads in-image /wheelhouse.
+        env = self._env_dict({"EVOCLAW_PIP_OFFLINE": "1"})
         assert env == {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": "/wheelhouse"}
+
+    def test_pip_offline_mounts_returns_empty(self):
+        # get_quarantine_mounts must return [] — wheelhouse is baked into the image.
+        import os
+
+        from harness.e2e.agents.base import AgentFramework
+
+        class _F(AgentFramework):
+            FRAMEWORK_NAME = "test"
+
+            def get_container_mounts(self):
+                return []
+
+            def get_container_init_script(self, agent_name):
+                return ""
+
+            def build_run_command(self, model, session_id, prompt_path):
+                return ""
+
+            def build_resume_command(self, model, session_id, message_path):
+                return ""
+
+        saved = {k: os.environ.pop(k) for k in list(os.environ)
+                 if k.startswith("EVOCLAW_")}
+        try:
+            os.environ["EVOCLAW_PIP_OFFLINE"] = "1"
+            os.environ["EVOCLAW_PIP_WHEELHOUSE"] = "/any/host/path"
+            mounts = _F().get_quarantine_mounts()
+        finally:
+            for k in ("EVOCLAW_PIP_OFFLINE", "EVOCLAW_PIP_WHEELHOUSE"):
+                os.environ.pop(k, None)
+            os.environ.update(saved)
+        assert mounts == []
 
 
 class TestImageForRepo:
