@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import signal
 import sys
@@ -1129,6 +1130,20 @@ class E2ETrialRunner:
         resume_subprocess_retry_limit = int(getattr(config, "resume_subprocess_retry_limit", 0) or 0)
         recovery_wait_seconds = int(getattr(config, "recovery_wait_seconds", 60) or 0)
 
+        # Graceful HTTP-529 server-overload backoff config. Server overload is a
+        # TRANSIENT condition distinct from a genuine quota rate-limit: instead of
+        # a long sleep we exponentially back off (base → cap) and only give up,
+        # gracefully and resumably, once we've spent `giveup` continuous wall-clock
+        # seconds backing off without any successful agent turn in between.
+        overload_backoff_base = int(getattr(config, "overload_backoff_base_seconds", 20) or 20)
+        overload_backoff_cap = int(getattr(config, "overload_backoff_cap_seconds", 300) or 300)
+        overload_giveup_seconds = int(getattr(config, "overload_giveup_seconds", 3600) or 3600)
+        # Accumulated continuous-overload wall-clock seconds; reset to 0 on any
+        # successful agent turn so isolated overloads don't accumulate over hours.
+        overload_backoff_total = 0
+        # Current backoff step (the un-jittered delay to use on the NEXT overload).
+        overload_backoff_step = overload_backoff_base
+
         while not dag.is_done() and no_progress_count < max_no_progress_attempts:
             if first_run:
                 if resume_session_first:
@@ -1269,6 +1284,13 @@ class E2ETrialRunner:
                     f"Agent recover {recover_count} completed" + (" ✓" if success else " ✗ (failed)")
                 )
 
+            if success:
+                # A successful agent turn means the endpoint is healthy again;
+                # forget any accumulated continuous-overload time so isolated 529s
+                # spread across hours never add up to a spurious give-up.
+                overload_backoff_total = 0
+                overload_backoff_step = overload_backoff_base
+
             if not success:
                 # Check for fatal configuration errors - no point retrying
                 if self.agent_runner._last_fatal_error:
@@ -1317,6 +1339,49 @@ class E2ETrialRunner:
                         self.agent_runner.invalidate_persistent_session(reason="invalid_session")
                     except Exception as e:
                         logger.warning(f"Failed to invalidate persistent session: {e}")
+                # Transient server overload (HTTP 529): fast exponential backoff
+                # instead of a long rate-limit sleep. Only when there is NO parsed
+                # real reset time — a genuine quota with a parsed reset falls
+                # through to the rate-limit long-sleep below (CRITICAL #2).
+                if self.agent_runner._last_overload and not self.agent_runner._rate_limit_reset_seconds:
+                    # Give up gracefully once we've spent the whole continuous-overload
+                    # budget backing off without a single successful turn in between.
+                    if overload_backoff_total >= overload_giveup_seconds:
+                        logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        orchestrator_logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        _set_last_run_summary("endpoint_unavailable")
+                        return False
+                    # Exponential step capped at the cap, with ±20% jitter so two
+                    # concurrent repos hitting 529 don't re-synchronize their retries.
+                    base_delay = min(overload_backoff_step, overload_backoff_cap)
+                    delay = max(1, int(base_delay * random.uniform(0.8, 1.2)))
+                    logger.warning(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)...",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    orchestrator_logger.info(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    # Backoff waits must not count as "no progress" (mirror rate-limit).
+                    no_progress_count = max(0, no_progress_count - 1)
+                    # Best-effort credential refresh, but never skip the backoff.
+                    if self.agent_runner.refresh_container_credentials():
+                        logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                        orchestrator_logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                    time.sleep(delay)
+                    overload_backoff_total += delay
+                    overload_backoff_step = min(overload_backoff_step * 2, overload_backoff_cap)
+                    # Session is still valid - resume it (overload is external, not a session problem).
+                    continue
                 # Check if this was a rate limit - sleep until reset
                 if self.agent_runner._last_rate_limit:
                     reset_secs = self.agent_runner._rate_limit_reset_seconds
