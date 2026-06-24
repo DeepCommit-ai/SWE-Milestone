@@ -2312,7 +2312,7 @@ def _build_pip_closure(repo_lower: str, project_root: Path, milestones: list[str
 # missing module deterministic and forbid any toolchain auto-download. EXIT 0 =
 # pass.
 _GO_NPM_OFFLINE_GATE = ("cd /testbed/ui && npm ci --offline && npm run build && "
-                        "cd /testbed && GOPROXY=off go build ./...")
+                        "cd /testbed && GOPROXY=off go build -tags=netgo ./...")
 
 
 def _build_go_npm_closure(repo_lower: str, project_root: Path,
