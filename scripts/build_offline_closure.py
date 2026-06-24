@@ -1804,6 +1804,18 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
         lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo)}")
     lines.append(f"FROM {repo_lower}/base:latest AS final")
     lines.append(f"COPY --from=fetch_builder {m2_repo} {m2_repo}")
+    # maven-build-cache-extension offline marker fix: the jar IS in the closure `.m2`,
+    # but its `_remote.repositories` reads `…-1.2.0.jar>central=` (empty RHS) → `mvn -o`
+    # refuses it ("Cannot access central in offline mode … has not been downloaded").
+    # The extension is declared in dubbo's `.mvn/extensions.xml`, so an interactive
+    # `mvn -o` build the agent runs needs it. Deleting `_remote.repositories` makes
+    # maven treat the local jar as locally-installed — the standard offline fix.
+    # Scoped to THIS one known artifact (a blanket sweep could mask a genuinely
+    # missing jar by silencing maven's offline guard for it); tolerant if absent.
+    lines.append(
+        "RUN find "
+        f"{m2_repo}/org/apache/maven/extensions/maven-build-cache-extension "
+        "-name _remote.repositories -delete 2>/dev/null || true")
     # self@B removal AFTER the fetch+COPY: the online fetch may have pulled dubbo's
     # OWN 3.3.6 artifacts into the cache; delete exactly the cache_forbid_globs so
     # the closure never serves the answer and the generic audit (same globs) passes.
@@ -2088,11 +2100,25 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     # the toolchain, then COPY the warmed npm _cacache. The `rm -rf` MUST precede the
     # toolchain COPY (overlay would mix go1.24.4/go1.24.5 stdlib → `go build` fails);
     # the go_fetch / npm_fetch COPYs pull from the stages defined at the top.
+    # Two environment-correctness fixes baked into the final stage (the benchmark
+    # agent runs as a non-root `fakeroot` uid in GID 0, while the eval runs as root —
+    # so upstream's root-only perms silently diverge the agent from the eval):
+    #   (1) /tmp/taglib ships 700/uid-1001 in base (an upstream bug for a PUBLIC C
+    #       library); fakeroot can't traverse it → can't `go build ./adapters/taglib`
+    #       (CGO `#cgo pkg-config: taglib`) → can't verify its CGO changes. `a+rX`
+    #       opens read + dir-traverse only (NOT write — correct for a public lib),
+    #       tolerant if the path is absent.
+    #   (2) the npm closure lands at /root/.npm/_cacache but /root is 700/root, so
+    #       fakeroot can't traverse into it → `npm ci --offline` would EACCES. Open
+    #       /root for traverse (755) + the npm cache for read (a+rX); safe — opens
+    #       traverse/read only, nothing agent-relevant under /root in this benchmark.
     tail = (f"COPY --from=go_fetch {go_modcache} {go_modcache}\n"
             "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
             "ENV GOTOOLCHAIN=local\n"
-            f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n")
+            f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n"
+            "RUN chmod -R a+rX /tmp/taglib 2>/dev/null || true\n"
+            "RUN chmod 755 /root && chmod -R a+rX /root/.npm 2>/dev/null || true\n")
     return syntax + go_fetch_stage + npm_stage + union_body + tail
 
 

@@ -44,5 +44,5 @@ closure:
   # then build the UI, then build-scope the Go backend with GOPROXY=off +
   # GOTOOLCHAIN=local (the build-scoped `go build ./...` gate, like go-zero — not a
   # whole-graph `go mod download`).
-  offline_build: "cd /testbed/ui && npm ci --offline && npm run build && cd /testbed && GOPROXY=off go build ./..."
+  offline_build: "cd /testbed/ui && npm ci --offline && npm run build && cd /testbed && GOPROXY=off go build -tags=netgo ./..."
   toolchain: {go: "1.24.5", gotoolchain_local: true}

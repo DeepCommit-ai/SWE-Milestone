@@ -1007,6 +1007,31 @@ def test_assemble_maven_dockerfile_rm_after_fetch_and_copy_so_audit_clean():
     assert last.startswith("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
 
 
+def test_assemble_maven_dockerfile_deletes_build_cache_ext_offline_marker():
+    """Environment-correctness: the final stage must delete the
+    maven-build-cache-extension `_remote.repositories` (which ships an empty-central
+    marker `…-1.2.0.jar>central=` → `mvn -o` refuses the LOCALLY-PRESENT jar). The
+    delete is scoped to THIS one artifact (a blanket sweep could mask a real missing
+    jar), absent-tolerant, and lands AFTER the `.m2` COPY but BEFORE the self@B rm
+    (so the self@B rm stays the last instruction)."""
+    df = boc.assemble_maven_dockerfile(
+        "r/x", ["r/x/m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
+    delete = ("RUN find /root/.m2/repository/org/apache/maven/extensions/"
+              "maven-build-cache-extension -name _remote.repositories -delete "
+              "2>/dev/null || true")
+    assert delete in df
+    # scoped to maven-build-cache-extension only (no repo-wide find that could
+    # silence a genuinely-missing jar's offline guard)
+    assert "-name _remote.repositories -delete" in df
+    assert df.count("_remote.repositories") == 1
+    # ordering: after the cache COPY, before the (still-last) self@B rm
+    assert df.index("COPY --from=fetch_builder /root/.m2/repository") \
+        < df.index(delete) \
+        < df.index("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
+    last = [ln for ln in df.strip().splitlines() if ln.strip()][-1]
+    assert last.startswith("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
+
+
 def test_assemble_maven_dockerfile_empty_milestones_errors():
     """No milestones → fail-closed (can't build a closure with nothing to fetch)."""
     with pytest.raises(SystemExit):
@@ -2071,6 +2096,40 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     # NO self@B removal for navidrome (no rm -rf of any cache dir)
     assert "rm -rf /root/.npm" not in df
     assert "rm -rf /go/pkg/mod" not in df
+
+
+def test_assemble_go_npm_dockerfile_bakes_agent_readable_perms():
+    """Environment-correctness: the final stage must open the two paths the non-root
+    `fakeroot` agent needs but upstream ships root-only — /tmp/taglib (700/uid-1001,
+    a public CGO C lib the agent must `go build` against) and /root/.npm (npm closure
+    under a 700 /root). Both via `a+rX` (read+traverse, NOT write) and tolerant of
+    an absent path, baked AFTER the closures are COPY'd in."""
+    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    caches = ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"]
+    df = boc.assemble_go_npm_dockerfile(
+        "r/x", ms, caches, "1.24.5", _probe=_go_probe_124())
+    # taglib: world read + dir-traverse only (a+rX, NOT 777/write), absent-tolerant
+    assert "RUN chmod -R a+rX /tmp/taglib 2>/dev/null || true" in df
+    assert "chmod -R 777 /tmp/taglib" not in df
+    # npm cache: open /root for traverse (755) + the cache for read (a+rX)
+    assert ("RUN chmod 755 /root && chmod -R a+rX /root/.npm "
+            "2>/dev/null || true") in df
+    # the chmods come AFTER the closures are in place (taglib needs nothing copied,
+    # but the npm-cache chmod must follow the _cacache COPY)
+    assert df.index("COPY --from=npm_fetch /root/.npm/_cacache") \
+        < df.index("chmod -R a+rX /root/.npm")
+
+
+def test_navidrome_config_offline_build_has_netgo_tag():
+    """Environment-correctness: navidrome's `main.go` references `buildtags.NETGO`,
+    defined ONLY under `-tags=netgo`, and the real eval builds with it. The closure
+    gate's offline_build must match (else a spurious `undefined: buildtags.NETGO`
+    misleads). Read the SHIPPED config to assert the go build carries `-tags=netgo`."""
+    cfg = (Path(__file__).resolve().parent.parent / "quarantine_configs"
+           / "navidrome_navidrome_v0.57.0_v0.58.0.yaml").read_text()
+    assert "go build -tags=netgo ./..." in cfg
+    # guard against a regression to the plain `go build ./...` (no tags)
+    assert "GOPROXY=off go build ./..." not in cfg
 
 
 def test_assemble_go_npm_dockerfile_no_milestones_exits():
