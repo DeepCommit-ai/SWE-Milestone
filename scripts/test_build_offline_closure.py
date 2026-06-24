@@ -2249,7 +2249,10 @@ def test_go_npm_offline_gate_constant_shape():
     run build → GOPROXY=off go build ./... (build-scoped, like go-zero)."""
     g = boc._GO_NPM_OFFLINE_GATE
     assert "cd /testbed/ui && npm ci --offline && npm run build" in g
-    assert "cd /testbed && GOPROXY=off go build ./..." in g
+    # -tags=netgo aligns with eval + the quarantine yaml (main.go references
+    # buildtags.NETGO, only defined under that tag) — avoids a spurious
+    # `undefined: buildtags.NETGO` source_state misclassification on every milestone.
+    assert "cd /testbed && GOPROXY=off go build -tags=netgo ./..." in g
     # build-scoped go build, NOT a whole-graph `go mod download`
     assert "go mod download" not in g
 
@@ -2268,7 +2271,7 @@ def _write_navidrome_cfg(tmp_path):
         "    - /go/pkg/mod/cache/download\n"
         "    - /root/.npm/_cacache\n"
         "  offline_build: 'cd /testbed/ui && npm ci --offline && npm run build && "
-        "cd /testbed && GOPROXY=off go build ./...'\n"
+        "cd /testbed && GOPROXY=off go build -tags=netgo ./...'\n"
         "  toolchain: {go: \"1.24.5\", gotoolchain_local: true}\n")
 
 
