@@ -117,6 +117,12 @@ class ClaudeCodeFramework(AgentFramework):
         self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
         self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
         self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
+        # Auto-compaction window: run_all.py sets EVOCLAW_AUTO_COMPACT_WINDOW
+        # from the trial config `auto_compact_window`. Passed through to the
+        # container as the native CLAUDE_CODE_AUTO_COMPACT_WINDOW so claude-code
+        # compacts context at this token budget. Native agent behaviour — does
+        # not alter the model ID or request payload sent to the provider.
+        self._auto_compact_window = os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW")
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
@@ -211,6 +217,15 @@ class ClaudeCodeFramework(AgentFramework):
         if self._reasoning_effort and self._reasoning_effort in self.EFFORT_MAP:
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_EFFORT_LEVEL={self.EFFORT_MAP[self._reasoning_effort]}",
+            ])
+        # Auto-compaction window (native claude-code env var). Set from trial
+        # config `auto_compact_window` via run_all.py's EVOCLAW_AUTO_COMPACT_WINDOW.
+        # claude-code triggers context compaction at this token budget; the value
+        # is capped at the model's context window (may be 200K for a third-party
+        # model whose ID claude-code can't pattern-match).
+        if self._auto_compact_window:
+            env_vars.extend([
+                "-e", f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={self._auto_compact_window}",
             ])
         # Quarantine mode: force pip to the offline wheelhouse (shared base
         # helper so gemini-cli & co. get the same treatment).

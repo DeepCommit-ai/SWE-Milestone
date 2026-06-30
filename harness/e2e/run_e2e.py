@@ -2253,6 +2253,11 @@ Example:
         "prompt_version": args.prompt_version,
         "timeout_seconds": args.timeout,
         "reasoning_effort": effective_reasoning_effort,
+        # Native claude-code context-compaction window in tokens. Set from the
+        # trial config `auto_compact_window` (propagated via the
+        # EVOCLAW_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
+        # display it. None when the config doesn't set it.
+        "auto_compact_window": os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,

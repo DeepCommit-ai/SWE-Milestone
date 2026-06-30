@@ -21,6 +21,7 @@ agent: claude-code            # claude-code | codex | gemini-cli | openhands
 model: <the endpoint's exact model id>
 timeout: 18000
 # reasoning_effort: high      # optional: low | medium | high | xhigh | max
+# auto_compact_window: 200000 # claude-code only: compact at 200K (omit = no compaction, ~1M); see note
 # default_haiku_model: <model># claude-code only: pin all model slots (see Step 5)
 ```
 
@@ -32,6 +33,18 @@ python scripts/run_all.py --config trial_configs/<agent>_<model>.yaml
 
 That's it for any endpoint that speaks the agent's native protocol. The sections
 below are the details and the two exceptions (new domain, pricing).
+
+> **`auto_compact_window` (claude-code only).** Sets the native
+> `CLAUDE_CODE_AUTO_COMPACT_WINDOW` so claude-code compacts its own context
+> instead of running to the endpoint's limit (native agent behaviour, keeps
+> parity). It's capped at the model's context window, which is **200K** for a
+> third-party id claude-code can't pattern-match (e.g. `glm-5.2`). So only two
+> settings are supported:
+>
+> - **unset** → no compaction (context runs to the endpoint's ~1M ceiling).
+> - **`200000`** → compact at 200K. The monitor header shows `compact=200K`.
+>
+> Any value above 200K is capped to 200K, so don't bother — `200000` is the max.
 
 ---
 

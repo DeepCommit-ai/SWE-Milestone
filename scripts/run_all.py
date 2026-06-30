@@ -349,6 +349,18 @@ def main():
     if default_haiku_model:
         os.environ["UNIFIED_DEFAULT_HAIKU_MODEL"] = default_haiku_model
 
+    # Auto-compaction window: a single yaml flag (auto_compact_window: 300000)
+    # makes claude-code trigger native context compaction at that token budget
+    # instead of the model's pattern-matched default. Propagated to the agent
+    # container as CLAUDE_CODE_AUTO_COMPACT_WINDOW (ClaudeCodeFramework reads
+    # EVOCLAW_AUTO_COMPACT_WINDOW). Compaction is built-in agent behaviour, not
+    # a custom optimization — preserves benchmark parity. claude-code caps the
+    # value at the model's context window; for pattern-unknown third-party
+    # models that ceiling may fall back to 200K.
+    auto_compact_window = cfg.get("auto_compact_window", None)
+    if auto_compact_window:
+        os.environ["EVOCLAW_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+
     # Validate
     if not data_root.exists():
         print(f"Error: data_root not found: {data_root}", file=sys.stderr)

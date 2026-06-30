@@ -1364,6 +1364,17 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = "",
             if ctx:
                 ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
                 parts.append(f"\033[35mcontext={ctx_label}\033[0m")
+            # Context auto-compaction window (trial config `auto_compact_window`).
+            # claude-code compacts at min(this, model window); for a
+            # pattern-unknown third-party model the window is 200K, so any value
+            # >= 200K compacts at ~200K. Show configured→effective when they
+            # differ so the 200K cap is visible at a glance.
+            acw = trial_cfg.get("auto_compact_window")
+            if acw:
+                acw = int(acw)
+                eff = min(acw, ctx) if ctx else acw
+                lbl = f"{acw // 1000}K" if eff == acw else f"{acw // 1000}K→{eff // 1000}K"
+                parts.append(f"\033[35mcompact={lbl}\033[0m")
             print(f"  {' | '.join(parts)}")
     print()
     print(sep_top)
@@ -1599,6 +1610,11 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                     "model": meta.get("model", ""),
                     "effort": effort,
                     "context_window": context_window,
+                    # Native compaction window from the trial config; None unless
+                    # `auto_compact_window` was set. The header shows configured
+                    # vs effective (min with the model window — 200K for a
+                    # pattern-unknown third-party model id).
+                    "auto_compact_window": meta.get("auto_compact_window"),
                 }
             except Exception:
                 pass
