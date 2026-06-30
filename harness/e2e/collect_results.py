@@ -1364,17 +1364,6 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = "",
             if ctx:
                 ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
                 parts.append(f"\033[35mcontext={ctx_label}\033[0m")
-            # Context auto-compaction window (trial config `auto_compact_window`).
-            # claude-code compacts at min(this, model window); for a
-            # pattern-unknown third-party model the window is 200K, so any value
-            # >= 200K compacts at ~200K. Show configured→effective when they
-            # differ so the 200K cap is visible at a glance.
-            acw = trial_cfg.get("auto_compact_window")
-            if acw:
-                acw = int(acw)
-                eff = min(acw, ctx) if ctx else acw
-                lbl = f"{acw // 1000}K" if eff == acw else f"{acw // 1000}K→{eff // 1000}K"
-                parts.append(f"\033[35mcompact={lbl}\033[0m")
             print(f"  {' | '.join(parts)}")
     print()
     print(sep_top)
@@ -1664,12 +1653,6 @@ def print_compact_table(
         if ctx:
             ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
             parts.append(f"\033[35mcontext={ctx_label}\033[0m")
-        acw = trial_cfg.get("auto_compact_window")
-        if acw:
-            acw = int(acw)
-            eff = min(acw, ctx) if ctx else acw
-            lbl = f"{acw // 1000}K" if eff == acw else f"{acw // 1000}K→{eff // 1000}K"
-            parts.append(f"\033[35mcompact={lbl}\033[0m")
         config_str = f"\n  {' | '.join(parts)}"
 
     # Header
@@ -2526,12 +2509,6 @@ def main():
                 if ctx:
                     ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
                     parts.append(f"\033[35mcontext={ctx_label}\033[0m")
-                acw = trial_cfg.get("auto_compact_window")
-                if acw:
-                    acw = int(acw)
-                    eff = min(acw, ctx) if ctx else acw
-                    lbl = f"{acw // 1000}K" if eff == acw else f"{acw // 1000}K→{eff // 1000}K"
-                    parts.append(f"\033[35mcompact={lbl}\033[0m")
                 print(f"\n\U0001f3c3 {trial_list[0]} | {' | '.join(parts)}")
 
             if args.detail == "":
