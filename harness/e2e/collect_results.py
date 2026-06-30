@@ -1581,13 +1581,17 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                         # so HIGH is its built-in and maximum reasoning level.
                         effort = "high"
 
-                # Detect context window from agent_stats.json modelUsage.
-                # Codex CLI reports the *compressed* context window (95% of the
-                # model's actual context).  Recover the model context window so
-                # the display matches the model spec (e.g. 272K, not 258K).
-                context_window = None
+                # Context window. A trial config can declare the true window via
+                # metadata `context_window`, which wins over the agent_stats value
+                # below: claude-code labels a model it can't pattern-match (e.g.
+                # glm-5.2) as 200K regardless of the endpoint's real 1M window, so
+                # the declared value is how a 1M-no-compaction trial shows as 1M.
+                context_window = meta.get("context_window")
+                # Otherwise detect from agent_stats.json modelUsage. Codex CLI
+                # reports the *compressed* context window (95% of the model's
+                # actual context); recover it so the display matches the spec.
                 stats_path = ws_root / "e2e_trial" / trial / "agent_stats.json"
-                if stats_path.exists():
+                if context_window is None and stats_path.exists():
                     try:
                         with open(stats_path) as f:
                             stats = _json.load(f)
