@@ -119,6 +119,17 @@ CODE_HOSTING_DOMAINS = [
     "ghfast.top",
     "ghproxy.com",
     "gitclone.com",
+    # Go module proxies. proxy/sum/index.golang.org resolve to Google shared IPs
+    # (142.250.0.0/15 etc.) that CDN_CIDR_RANGES *allows* for the API endpoint,
+    # so CIDR-deny can't block them without breaking Vertex/GLM. /etc/hosts
+    # poisoning is domain-level, so it blocks these without touching the API.
+    # This closes the confirmed cheat: `GOPROXY=https://proxy.golang.org,direct
+    # go get ...@<target>` overriding the (env-only, override-able) GOPROXY=off.
+    "proxy.golang.org",
+    "sum.golang.org",
+    "index.golang.org",
+    "goproxy.cn",
+    "goproxy.io",
 ]
 
 # Well-known CDN CIDR ranges to handle IP rotation during long trials.
