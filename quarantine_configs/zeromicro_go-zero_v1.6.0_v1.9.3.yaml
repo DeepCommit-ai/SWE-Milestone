@@ -25,6 +25,18 @@ deny_cidrs:
   - 104.16.0.0/12      # Cloudflare (goproxy.io)
   - 155.102.0.0/16     # Qiniu/Kunlun CDN (goproxy.cn)
 
+# Domains on Google's Vertex-shared range that can't be IP-blocked without
+# cutting the LLM path. verify_network_lockdown exempts ONLY these from the
+# reachability assertion (defended by /etc/hosts poison + GOPROXY=off). Omitting
+# one ⇒ verify (correctly) FAILs it as reachable via the still-ACCEPTed Google
+# CDN range — this replaces the old fail-open runtime auto-exempt (#2b).
+firewall_exempt_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+
 go_offline: true
 
 # The main module is never in its own module cache; any copy of it there is
@@ -33,9 +45,9 @@ cache_forbid_globs:
   - /go/pkg/mod/cache/download/github.com/zeromicro/*
   - /go/pkg/mod/github.com/zeromicro/*
 
-# Only the IP-blockable proxies are asserted here (proxy.golang.org shares
-# Google's Vertex range and can't be IP-blocked — GOPROXY=off is its defense;
-# verify_network_lockdown auto-exempts it from the unreachable assertion).
+# Only the IP-blockable proxies are asserted here (proxy.golang.org & friends
+# share Google's Vertex range and can't be IP-blocked — see
+# firewall_exempt_domains above; GOPROXY=off + /etc/hosts poison is their defense).
 verify_fetch_urls:
   - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip
   - https://goproxy.io/github.com/zeromicro/go-zero/@v/v1.9.3.zip

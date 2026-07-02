@@ -27,10 +27,10 @@ def _runner(agent_name="claude-code"):
 
 
 class TestDetectOverload:
-    def test_matches_overloaded_literal(self):
+    def test_matches_structured_overload_error(self):
         r = _runner()
+        # Real Anthropic 529 body — the structured token, not the bare word.
         assert r._detect_overload('{"type":"error","error":{"type":"overloaded_error"}}') is True
-        assert r._detect_overload("Error: model is Overloaded right now") is True
 
     def test_matches_quoted_json_529_forms(self):
         r = _runner()
@@ -52,6 +52,11 @@ class TestDetectOverload:
         assert r._detect_overload(src) is False
         assert r._detect_overload("test_case_529 passed; 529 items processed") is False
         assert r._detect_overload("HTTP 200 OK; latency 529ms") is False
+        # A bare "overloaded" in agent prose / viewed text must NOT match — only
+        # the structured overloaded_error token does (#8). Pre-fix this diverted
+        # unrelated failures into a 1h 529 backoff loop.
+        assert r._detect_overload("Error: model is Overloaded right now") is False
+        assert r._detect_overload("the CI runner seemed overloaded, retrying") is False
 
     def test_only_scans_tail(self):
         r = _runner()
@@ -72,7 +77,7 @@ class TestDetectOverload:
 
     def test_true_for_each_oauth_agent(self):
         for name in ("claude-code", "codex", "gemini-cli"):
-            assert _runner(agent_name=name)._detect_overload("overloaded") is True
+            assert _runner(agent_name=name)._detect_overload('{"code":529}') is True
 
 
 # --- Reference model of the inline run_e2e.recover() overload backoff ----------

@@ -1920,6 +1920,13 @@ Example:
     parser.add_argument("--repo-name", default=None, help="Repository name (required for fresh start)")
     parser.add_argument("--milestone-version", default="test_multi_stage_v2", help="Milestone version string")
     parser.add_argument("--image", default=None, help="Base docker image for agent (required for fresh start)")
+    parser.add_argument(
+        "--unprotected",
+        action="store_true",
+        help="Bypass the quarantine fail-closed guard (run a repo that has a "
+        "policy WITHOUT applying it — scores may be tainted). Normally you launch "
+        "via scripts/run_all.py, which applies the policy and runs the gate.",
+    )
 
     # Paths (required for fresh start, optional for resume)
     parser.add_argument(
@@ -2053,6 +2060,21 @@ Example:
 
     if missing_args:
         parser.error(f"the following arguments are required for fresh start: {', '.join(missing_args)}")
+
+    # Fail-closed quarantine guard (#3): scripts/run_all.py applies the per-repo
+    # policy env + runs the coverage gate; a direct run_e2e launch bypasses both.
+    # Refuse to start a repo that HAS a policy but wasn't given the quarantine
+    # env (EVOCLAW_QUARANTINE), unless --unprotected is explicitly set.
+    from harness.e2e.quarantine import quarantine_guard_error
+    _guard = quarantine_guard_error(
+        args.repo_name,
+        Path(__file__).resolve().parent.parent.parent,
+        quarantine_active=bool(os.environ.get("EVOCLAW_QUARANTINE")),
+        unprotected=args.unprotected,
+    )
+    if _guard:
+        logger.error(_guard)
+        sys.exit(1)
 
     # Setup Paths
     workspace_root = args.workspace_root.resolve()

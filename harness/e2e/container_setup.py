@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Optional
 
 from harness.e2e.agents import AgentFramework, get_agent_framework
-from harness.e2e.quarantine import cidr_overlaps_any
+from harness.e2e.quarantine import (
+    QUARANTINE_MIRROR_DOMAINS,
+    cidr_overlaps_any,
+    goproxy_value,
+)
 
 logger = logging.getLogger("e2e.container_setup")
 
@@ -119,17 +123,10 @@ CODE_HOSTING_DOMAINS = [
     "ghfast.top",
     "ghproxy.com",
     "gitclone.com",
-    # Go module proxies. proxy/sum/index.golang.org resolve to Google shared IPs
-    # (142.250.0.0/15 etc.) that CDN_CIDR_RANGES *allows* for the API endpoint,
-    # so CIDR-deny can't block them without breaking Vertex/GLM. /etc/hosts
-    # poisoning is domain-level, so it blocks these without touching the API.
-    # This closes the confirmed cheat: `GOPROXY=https://proxy.golang.org,direct
-    # go get ...@<target>` overriding the (env-only, override-able) GOPROXY=off.
-    "proxy.golang.org",
-    "sum.golang.org",
-    "index.golang.org",
-    "goproxy.cn",
-    "goproxy.io",
+    # NOTE: public module-proxy mirror domains (proxy.golang.org, goproxy.cn, …)
+    # are NOT here — they are a cross-ecosystem answer channel poisoned only in
+    # quarantine containers via QUARANTINE_MIRROR_DOMAINS (quarantine.py) +
+    # _poison_domain_list, so non-quarantine baselines keep working go fetches.
 ]
 
 # Well-known CDN CIDR ranges to handle IP rotation during long trials.
@@ -140,6 +137,37 @@ CDN_CIDR_RANGES = [
     "142.250.0.0/15",  # Google
     "216.239.32.0/19",  # Google
 ]
+
+
+def _poison_domain_list(quarantine_active: bool) -> list[str]:
+    """Domains to blackhole in /etc/hosts for this container.
+
+    Code-hosting sites are poisoned in every container (defense in depth). The
+    public module-proxy mirror domains (QUARANTINE_MIRROR_DOMAINS) are a
+    cross-ecosystem answer channel and are added ONLY under quarantine, so a
+    non-quarantine/baseline container keeps working go module fetches (#4).
+    """
+    return list(CODE_HOSTING_DOMAINS) + (
+        list(QUARANTINE_MIRROR_DOMAINS) if quarantine_active else []
+    )
+
+
+def _interpret_probe(returncode: int, stdout: str) -> bool:
+    """Interpret an in-container reachability probe's output.
+
+    True (reachable) on a REACH marker, False (blocked) on BLOCK. A result with
+    neither marker means the probe itself failed to run (python3 missing, docker
+    exec error) — INDETERMINATE, not 'blocked', so raise rather than let a
+    broken probe silently pass verification (fail-open) (#11).
+    """
+    if "REACH" in stdout:
+        return True
+    if "BLOCK" in stdout:
+        return False
+    raise RuntimeError(
+        f"network probe did not run (rc={returncode}, stdout={stdout!r}) — "
+        f"cannot determine reachability"
+    )
 
 
 class ContainerSetup:
@@ -1106,7 +1134,11 @@ echo "iptables rules applied successfully"
         logger.info("  iptables rules applied")
 
         # --- Step 4: Poison /etc/hosts ---
-        hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in CODE_HOSTING_DOMAINS)
+        # Mirror domains (go proxies) are poisoned only under quarantine so a
+        # non-quarantine/baseline container keeps working go fetches (#4).
+        _quarantine = bool(os.environ.get("EVOCLAW_QUARANTINE"))
+        _poison = _poison_domain_list(_quarantine)
+        hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in _poison)
         hosts_script = f"""
 # Append code-hosting blocks to /etc/hosts
 cat >> /etc/hosts << 'HOSTS_EOF'
@@ -1117,22 +1149,25 @@ HOSTS_EOF
 
 # Lock permissions so non-root cannot edit
 chmod 644 /etc/hosts
-echo "/etc/hosts poisoned with {len(CODE_HOSTING_DOMAINS)} domains"
+echo "/etc/hosts poisoned with {len(_poison)} domains"
 """
         subprocess.run(
             ["docker", "exec", self.container_name, "/bin/sh", "-c", hosts_script],
             capture_output=True,
             text=True,
         )
-        logger.info(f"  /etc/hosts poisoned ({len(CODE_HOSTING_DOMAINS)} domains)")
+        logger.info(f"  /etc/hosts poisoned ({len(_poison)} domains)")
 
         # --- Step 5: Set Go env vars ---
-        # Under go quarantine (EVOCLAW_GO_OFFLINE), the proxy itself is the
-        # answer-fetch channel (`go get <self>@<target>`), so write GOPROXY=off
-        # (go then refuses both proxy and direct/VCS fetches and works from
-        # /go/pkg/mod). Shell profiles override docker -e, so this MUST be
-        # written here, not only injected via get_quarantine_env_vars.
-        _goproxy = "off" if os.environ.get("EVOCLAW_GO_OFFLINE") else "https://proxy.golang.org,direct"
+        # GOPROXY=off under go quarantine (the proxy is the answer channel) OR
+        # any quarantine (mirror domains are hosts-poisoned above, so a bare
+        # proxy URL would resolve to 0.0.0.0 and every fetch would fail). A
+        # non-quarantine container keeps the sanctioned proxy. Shell profiles
+        # override docker -e, so this MUST be written here (#4).
+        _goproxy = goproxy_value(
+            go_offline=bool(os.environ.get("EVOCLAW_GO_OFFLINE")),
+            quarantine_active=_quarantine,
+        )
         go_env_script = f"""
 # Configure Go module fetching (quarantine-aware)
 cat >> /etc/environment << 'EOF'
@@ -1204,17 +1239,25 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
             "except Exception:\n"
             "    print('BLOCK')\n"
         )
-        result = subprocess.run(
-            [
-                "docker", "exec", "--user", user,
-                "-e", f"HOME=/home/{user}" if user != "root" else "HOME=/root",
-                self.container_name, "python3", "-c", probe_script, url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return "REACH" in result.stdout
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "exec", "--user", user,
+                    "-e", f"HOME=/home/{user}" if user != "root" else "HOME=/root",
+                    self.container_name, "python3", "-c", probe_script, url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as e:
+            # The probe (docker exec + in-container DNS/connect) outran 15s.
+            # Treat as indeterminate and fail closed — never read a hung probe
+            # as 'blocked' (#11).
+            raise RuntimeError(
+                f"network probe timed out after 15s for {url} — cannot verify lockdown"
+            ) from e
+        return _interpret_probe(result.returncode, result.stdout)
 
     def verify_network_lockdown(self) -> bool:
         """Verify that network lockdown is active in the container.
@@ -1282,44 +1325,22 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # covers code hosting; a typo'd deny CIDR/domain would otherwise pass
         # verification while leaving the exact cheat channel (e.g. PyPI) open.
         _deny_domains = [d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()]
-        # Some denied registries share a CDN/IP range with an ALLOWED service
-        # and cannot be blocked at the IP layer without also cutting that
-        # service — notably the Go proxies (proxy.golang.org, sum.golang.org,
-        # golang.org, go.dev) ride Google ranges shared with Vertex
-        # aiplatform. For those the defense is the package-manager offline
-        # switch (GOPROXY=off), not the firewall; don't hard-fail verification
-        # on them (a known residual until the SNI egress proxy lands, issue
-        # #12). Detected automatically: a denied domain whose resolved IPs all
-        # fall inside a still-ACCEPTed CDN range. goproxy.cn (Qiniu 155.102),
-        # goproxy.io (Cloudflare) and the Fastly/Cloudflare registries are NOT
-        # exempt — their ranges are denied, so they must verify unreachable.
-        import ipaddress as _ipaddr
-        _deny_cidr_list = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
-        _accepted_cdn = []
-        for _c in CDN_CIDR_RANGES:
-            if _deny_cidr_list and cidr_overlaps_any(_c, _deny_cidr_list):
-                continue
-            try:
-                _accepted_cdn.append(_ipaddr.ip_network(_c))
-            except ValueError:
-                pass
-
-        def _shares_allowed_cdn(host: str) -> bool:
-            try:
-                ips = {sa[0] for *_, sa in socket.getaddrinfo(host, None, socket.AF_INET)}
-            except socket.gaierror:
-                return False
-            return bool(ips) and all(
-                any(_ipaddr.ip_address(ip) in net for net in _accepted_cdn) for ip in ips
-            )
-
+        # A denied registry is exempt from the reachability assertion ONLY if the
+        # policy DECLARES it un-CIDR-blockable (EVOCLAW_FIREWALL_EXEMPT — e.g.
+        # proxy.golang.org shares Vertex's Google range, defended by /etc/hosts
+        # poison + GOPROXY=off). Everything else MUST verify unreachable. The old
+        # runtime "resolved IPs all fall in a still-ACCEPTed CDN range" inference
+        # is gone: a typo'd/omitted deny_cidr made a normal registry look exempt
+        # and silently pass (fail-open, #2b). A missing deny_cidr is now caught up
+        # front by the coverage gate; a wrong one is caught by this assertion.
+        _exempt = {d.strip().lower() for d in os.environ.get("EVOCLAW_FIREWALL_EXEMPT", "").split(",") if d.strip()}
         _verified = 0
         for host in _deny_domains:
-            if _shares_allowed_cdn(host):
+            if host.lower() in _exempt:
                 logger.warning(
-                    f"  Quarantine: '{host}' shares an allowed CDN/IP range "
-                    f"(e.g. Vertex/Google) — not IP-blockable; relying on the "
-                    f"package-manager offline switch (residual until SNI proxy)."
+                    f"  Quarantine: '{host}' firewall-exempt (declared "
+                    f"un-CIDR-blockable) — defended by /etc/hosts poison + "
+                    f"offline switch (residual until SNI proxy)."
                 )
                 continue
             if self._url_reachable_in_container(f"https://{host}"):

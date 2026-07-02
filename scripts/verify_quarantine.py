@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from harness.e2e.container_setup import ContainerSetup  # noqa: E402
-from harness.e2e.quarantine import load_quarantine_env  # noqa: E402
+from harness.e2e.quarantine import image_for_repo, load_quarantine_env  # noqa: E402
 
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from run_all import _load_dotenv_files  # noqa: E402
@@ -60,7 +60,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     _load_dotenv_files()
     repo = _match_repo(args.repo)
-    image = args.image or f"{repo.lower()}/base:latest"
+    # Default to the SAME image production runs use (base-offline for quarantine
+    # repos), so the smoke test audits what trials actually launch (#7).
+    image = args.image or image_for_repo(repo, PROJECT_ROOT)
     container = f"quarantine-verify-{repo.lower().replace('/', '_')[:40]}"
 
     q_env = load_quarantine_env(repo, PROJECT_ROOT)

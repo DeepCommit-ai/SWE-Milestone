@@ -150,11 +150,11 @@ class AgentRunner:
 
     # Server-side TRANSIENT overload (HTTP 529) indicators — distinct from a
     # genuine quota rate-limit. These should trigger a fast exponential backoff
-    # retry rather than the long rate-limit sleep. Tokens are kept SPECIFIC
-    # (quoted-JSON forms + literal "overloaded" + the GLM bigmodel Chinese
-    # phrases) so a bare "529" appearing in viewed source/log text cannot match.
+    # retry rather than the long rate-limit sleep. Tokens are kept STRUCTURED
+    # (the overloaded_error token + quoted-JSON 529 forms + the GLM bigmodel
+    # Chinese phrases) so a bare "overloaded"/"529" in viewed source/log/prose
+    # cannot match and misroute an unrelated failure into 529 backoff (#8).
     _OVERLOAD_PATTERNS = [
-        "overloaded",
         "overloaded_error",
         '"code":"529"',
         '"code":529',

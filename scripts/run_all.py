@@ -102,29 +102,6 @@ def _image_exists(ref: str) -> bool:
     )
 
 
-def get_image_name(repo_name: str) -> str:
-    """Derive Docker image name from repo directory name (lowercase).
-
-    Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default: v0.9).
-    When the DEFAULT pin is absent locally, falls back to :latest with a loud
-    warning (mirrors harness/e2e/image_version.py; never silent, and never
-    falls back when the tag was set explicitly).
-    """
-    env_tag = os.environ.get("EVOCLAW_IMAGE_TAG")
-    tag = env_tag or "v0.9"
-    base = f"{repo_name.lower()}/base"
-    ref = f"{base}:{tag}"
-    if _image_exists(ref):
-        return ref
-    if env_tag is None and _image_exists(f"{base}:latest"):
-        print(
-            f"⚠️  WARNING: {ref} not found locally; falling back to {base}:latest "
-            f"(content unverified — run scripts/pull_images.sh, see EVOCLAW_IMAGE_TAG)"
-        )
-        return f"{base}:latest"
-    return ref
-
-
 def generate_collect_config(
     config_dir: Path,
     trial_name: str,

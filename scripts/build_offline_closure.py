@@ -488,6 +488,15 @@ _GO_MISSING_TOKEN_RES = [
 ]
 
 
+def _escape_go_path(path: str) -> str:
+    """Go module cache case-encoding (module.EscapePath): an uppercase letter X
+    is stored as '!x', so github.com/IBM/sarama lives at
+    .../download/github.com/!i!b!m/sarama/@v. Probing the raw path would always
+    miss an uppercase module and misclassify a present dep as a closure gap (#9).
+    """
+    return "".join(f"!{c.lower()}" if c.isupper() else c for c in path)
+
+
 def _go_cache_has_path(staging_tag: str, import_or_module: str) -> bool:
     """True iff the closure's module cache already holds bytes for `import_or_module`.
 
@@ -517,7 +526,7 @@ def _go_cache_has_path(staging_tag: str, import_or_module: str) -> bool:
     parts = path.split("/")
     # Probe longest→shortest prefix: the module path is a prefix of the import path.
     # Each candidate must have an @v sub-dir to be a valid cache hit.
-    cands = ["/go/pkg/mod/cache/download/" + "/".join(parts[:n])
+    cands = ["/go/pkg/mod/cache/download/" + _escape_go_path("/".join(parts[:n]))
              for n in range(len(parts), 0, -1)]
     quoted = " ".join(f"'{c}'" for c in cands)
     r = subprocess.run(
@@ -1342,6 +1351,26 @@ def _wheel_is_forbidden(wheel_filename: str, forbid: list[str]) -> bool:
     return norm in fb
 
 
+def _artifact_is_forbidden(filename: str, forbid: list[str]) -> bool:
+    """True iff a wheelhouse artifact (wheel OR sdist) is a forbidden dist.
+
+    Wheels go through _wheel_is_forbidden. sdists are `{dist}-{version}.tar.gz`
+    (or .tgz/.zip): strip the ext and the trailing `-version`, then normalize on
+    the FULL dist name (same boundary as wheels). Covers the pip-download sdist
+    fallback the old .whl-only audit missed (#6).
+    """
+    name = filename.strip()
+    if name.endswith(".whl"):
+        return _wheel_is_forbidden(name, forbid)
+    for ext in (".tar.gz", ".tgz", ".zip"):
+        if name.endswith(ext):
+            dist = name[: -len(ext)].rsplit("-", 1)[0]
+            norm = dist.strip().lower().replace("_", "-")
+            fb = {f.strip().lower().replace("_", "-") for f in (forbid or [])}
+            return norm in fb
+    return False
+
+
 def audit_wheelhouse_self_exclusion(staging_tag: str, forbid: list[str]) -> None:
     """pip-specific in-image self-exclusion AUDIT (fail-closed).
 
@@ -1365,7 +1394,7 @@ def audit_wheelhouse_self_exclusion(staging_tag: str, forbid: list[str]) -> None
               file=sys.stderr)
         sys.exit(1)
     offending = [w for w in (r.stdout or "").split()
-                 if w.endswith(".whl") and _wheel_is_forbidden(w, forbid)]
+                 if _artifact_is_forbidden(w, forbid)]
     if offending:
         print(f"Error: offline closure AUDIT failed for {staging_tag}: /wheelhouse "
               f"contains forbidden self@B wheel(s) — refusing (the offline index "

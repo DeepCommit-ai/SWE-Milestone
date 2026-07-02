@@ -10,6 +10,30 @@ def _R(returncode=0, stdout="", stderr=""):
     """A stand-in for subprocess.CompletedProcess in monkeypatched tests."""
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
+def test_escape_go_path_uppercase():
+    # #9: Go module cache case-encodes an uppercase letter X as '!x'
+    # (module.EscapePath), so the probe path must be escaped or an uppercase
+    # module always reads as absent → spurious closure_gap → sys.exit(1).
+    assert boc._escape_go_path("github.com/IBM/sarama") == "github.com/!i!b!m/sarama"
+    assert boc._escape_go_path("github.com/BurntSushi/toml") == "github.com/!burnt!sushi/toml"
+    assert boc._escape_go_path("github.com/redis/go-redis/v9") == "github.com/redis/go-redis/v9"
+
+
+def test_artifact_is_forbidden_sdist_and_wheel():
+    # #6: the self-exclusion audit must catch an sdist (.tar.gz/.zip), not only
+    # a wheel — pip download falls back to sdist when no wheel matches.
+    forbid = ["scikit-learn"]
+    assert boc._artifact_is_forbidden("scikit_learn-1.6.0.tar.gz", forbid) is True
+    assert boc._artifact_is_forbidden("scikit-learn-1.6.0.tar.gz", forbid) is True
+    assert boc._artifact_is_forbidden("scikit_learn-1.6.0.zip", forbid) is True
+    assert boc._artifact_is_forbidden(
+        "scikit_learn-1.6.0-cp39-abi3-linux_x86_64.whl", forbid
+    ) is True
+    # full-name boundary: scikit-image / numpy are NOT scikit-learn
+    assert boc._artifact_is_forbidden("scikit_image-0.22.0.tar.gz", forbid) is False
+    assert boc._artifact_is_forbidden("numpy-1.26.0.tar.gz", forbid) is False
+
+
 def test_load_closure_config_missing_exits(tmp_path):
     (tmp_path / "quarantine_configs").mkdir()
     (tmp_path / "quarantine_configs" / "foo.yaml").write_text("ecosystem: [pip]\n")

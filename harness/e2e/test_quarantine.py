@@ -16,6 +16,118 @@ def _write_config(root, repo, text):
     (d / f"{repo}.yaml").write_text(text)
 
 
+class TestMirrorDomainsAndGoproxy:
+    """#4: go-proxy mirror domains are a cross-ecosystem answer channel poisoned
+    only in quarantine containers; GOPROXY must agree with that poisoning."""
+
+    def test_mirror_domains_cover_all_go_proxies(self):
+        from harness.e2e.quarantine import QUARANTINE_MIRROR_DOMAINS
+
+        assert set(QUARANTINE_MIRROR_DOMAINS) >= {
+            "proxy.golang.org",
+            "sum.golang.org",
+            "index.golang.org",
+            "goproxy.cn",
+            "goproxy.io",
+        }
+
+    def test_goproxy_off_under_go_offline(self):
+        from harness.e2e.quarantine import goproxy_value
+
+        assert goproxy_value(go_offline=True, quarantine_active=False) == "off"
+
+    def test_goproxy_off_under_quarantine_even_without_go_offline(self):
+        # A quarantine container poisons the go-proxy mirror domains, so a bare
+        # GOPROXY=proxy.golang.org would resolve to 0.0.0.0 and every fetch would
+        # fail. Under quarantine GOPROXY must be off regardless of ecosystem.
+        from harness.e2e.quarantine import goproxy_value
+
+        assert goproxy_value(go_offline=False, quarantine_active=True) == "off"
+
+    def test_goproxy_direct_when_unprotected(self):
+        # Non-quarantine container: mirror domains are NOT poisoned, so the
+        # sanctioned proxy must stay configured (pre-PR baseline parity).
+        from harness.e2e.quarantine import goproxy_value
+
+        assert (
+            goproxy_value(go_offline=False, quarantine_active=False)
+            == "https://proxy.golang.org,direct"
+        )
+
+    def test_load_quarantine_env_sets_quarantine_flag(self, tmp_path):
+        _write_config(
+            tmp_path, "r", "ecosystem: [go]\ndeny_domains: [proxy.golang.org]\n"
+        )
+        env = load_quarantine_env("r", tmp_path)
+        assert env["EVOCLAW_QUARANTINE"] == "1"
+
+
+class TestGateHardening:
+    """#1: fail-closed gate must reject a policy whose registry stays reachable
+    — a missing deny_cidrs (CDN accept survives) or a missing offline switch."""
+
+    def _errs(self, tmp_path, name, body):
+        _write_config(tmp_path, name, body)
+        return quarantine_coverage_errors([name], tmp_path)
+
+    def test_missing_deny_cidrs_rejected(self, tmp_path):
+        # pypi is Fastly-fronted; with no deny_cidrs the CDN accept range stays
+        # and pypi is reachable — deny_domains alone doesn't drop it.
+        errs = self._errs(
+            tmp_path, "sk",
+            "ecosystem: [pip]\ndeny_domains: [pypi.org, files.pythonhosted.org]\n",
+        )
+        assert errs
+        assert any("cidr" in e.lower() or "exempt" in e.lower() for e in errs)
+
+    def test_deny_cidrs_present_passes(self, tmp_path):
+        errs = self._errs(
+            tmp_path, "sk",
+            "ecosystem: [pip]\n"
+            "deny_domains: [pypi.org, files.pythonhosted.org]\n"
+            "deny_cidrs: [151.101.0.0/16]\n",
+        )
+        assert errs == []
+
+    def test_missing_offline_switch_rejected(self, tmp_path):
+        # cargo ecosystem without cargo_offline: the package manager runs online
+        # against crates.io even with the firewall up (legitimate fetch path).
+        errs = self._errs(
+            tmp_path, "rg",
+            "ecosystem: [cargo]\n"
+            "deny_domains: [crates.io, static.crates.io, index.crates.io]\n"
+            "deny_cidrs: [151.101.0.0/16]\n",
+        )
+        assert errs
+        assert any("offline" in e.lower() for e in errs)
+
+    def test_cargo_with_offline_switch_passes(self, tmp_path):
+        errs = self._errs(
+            tmp_path, "rg",
+            "ecosystem: [cargo]\ncargo_offline: true\n"
+            "deny_domains: [crates.io, static.crates.io, index.crates.io]\n"
+            "deny_cidrs: [151.101.0.0/16]\n",
+        )
+        assert errs == []
+
+    def test_firewall_exempt_domain_needs_no_cidr(self, tmp_path):
+        # proxy/sum.golang.org ride Google's Vertex range (un-CIDR-blockable),
+        # so they're exempt (poison + GOPROXY=off defense); goproxy.cn/io still
+        # require deny_cidrs.
+        errs = self._errs(
+            tmp_path, "gz",
+            "ecosystem: [go]\ngo_offline: true\n"
+            "deny_domains: [proxy.golang.org, sum.golang.org, goproxy.cn, goproxy.io]\n"
+            "deny_cidrs: [104.16.0.0/12, 155.102.0.0/16]\n"
+            "firewall_exempt_domains: [proxy.golang.org, sum.golang.org]\n",
+        )
+        assert errs == []
+
+    def test_none_ecosystem_needs_no_switches(self, tmp_path):
+        errs = self._errs(tmp_path, "n", "ecosystem: [none]\n")
+        assert errs == []
+
+
 class TestLoadQuarantineEnv:
     def test_absent_config_returns_empty(self, tmp_path):
         assert load_quarantine_env("norepo", tmp_path) == {}
@@ -37,6 +149,15 @@ deny_cidrs: [151.101.0.0/16]
         env = load_quarantine_env("r1", tmp_path)
         assert env["EVOCLAW_DENY_DOMAINS"] == "crates.io,static.crates.io"
         assert env["EVOCLAW_DENY_CIDRS"] == "151.101.0.0/16"
+
+    def test_firewall_exempt_domains_exported(self, tmp_path):
+        # #2b: verify_network_lockdown must only exempt domains the policy
+        # DECLARES un-CIDR-blockable, not infer it at runtime (fail-open).
+        _write_config(tmp_path, "gz", """
+firewall_exempt_domains: [proxy.golang.org, sum.golang.org]
+""")
+        env = load_quarantine_env("gz", tmp_path)
+        assert env["EVOCLAW_FIREWALL_EXEMPT"] == "proxy.golang.org,sum.golang.org"
 
     def test_offline_switches(self, tmp_path):
         _write_config(tmp_path, "r2", """
@@ -76,6 +197,52 @@ verify_fetch_urls:
             load_quarantine_env("r4", tmp_path)
 
 
+class TestQuarantineGuard:
+    """#3: a direct run_e2e launch of a repo that HAS a policy but wasn't given
+    the quarantine env must refuse (the 'silently ran unprotected' condition)."""
+
+    def test_flags_unapplied_policy(self, tmp_path):
+        from harness.e2e.quarantine import quarantine_guard_error
+
+        _write_config(tmp_path, "sk", "ecosystem: [pip]\ndeny_domains: [pypi.org]\n")
+        err = quarantine_guard_error(
+            "sk", tmp_path, quarantine_active=False, unprotected=False
+        )
+        assert err and "sk" in err
+
+    def test_ok_when_quarantine_active(self, tmp_path):
+        from harness.e2e.quarantine import quarantine_guard_error
+
+        _write_config(tmp_path, "sk", "ecosystem: [pip]\n")
+        assert (
+            quarantine_guard_error(
+                "sk", tmp_path, quarantine_active=True, unprotected=False
+            )
+            is None
+        )
+
+    def test_ok_when_unprotected(self, tmp_path):
+        from harness.e2e.quarantine import quarantine_guard_error
+
+        _write_config(tmp_path, "sk", "ecosystem: [pip]\n")
+        assert (
+            quarantine_guard_error(
+                "sk", tmp_path, quarantine_active=False, unprotected=True
+            )
+            is None
+        )
+
+    def test_ok_when_no_policy(self, tmp_path):
+        from harness.e2e.quarantine import quarantine_guard_error
+
+        assert (
+            quarantine_guard_error(
+                "norepo", tmp_path, quarantine_active=False, unprotected=False
+            )
+            is None
+        )
+
+
 class TestCoverageGate:
     def test_missing_config_is_error(self, tmp_path):
         errs = quarantine_coverage_errors(["repoA"], tmp_path)
@@ -92,9 +259,13 @@ class TestCoverageGate:
         assert len(errs) == 1 and "conda" in errs[0]
 
     def test_uncovered_registry_is_error(self, tmp_path):
+        # offline switch + deny_cidrs present so the ONLY gap is the two
+        # un-denied registry domains (isolates this assertion).
         _write_config(tmp_path, "repoD", """
 ecosystem: [cargo]
+cargo_offline: true
 deny_domains: [crates.io]
+deny_cidrs: [151.101.0.0/16]
 """)
         errs = quarantine_coverage_errors(["repoD"], tmp_path)
         assert len(errs) == 1
@@ -103,8 +274,12 @@ deny_domains: [crates.io]
     def test_full_coverage_passes(self, tmp_path):
         _write_config(tmp_path, "repoE", """
 ecosystem: [go, npm]
+go_offline: true
+npm_offline: true
 deny_domains: [proxy.golang.org, sum.golang.org, goproxy.cn, goproxy.io,
                registry.npmjs.org, registry.yarnpkg.com]
+deny_cidrs: [104.16.0.0/12, 155.102.0.0/16]
+firewall_exempt_domains: [proxy.golang.org, sum.golang.org]
 """)
         assert quarantine_coverage_errors(["repoE"], tmp_path) == []
 
@@ -215,25 +390,35 @@ class TestAgentQuarantineEnvVars:
 
 
 class TestImageForRepo:
-    def test_no_config_uses_base(self, tmp_path):
-        assert image_for_repo("Foo_Bar", tmp_path) == "foo_bar/base:latest"
+    """image_for_repo selects base-offline for a quarantine repo and base
+    otherwise, and delegates TAG resolution to resolve_image so EVOCLAW_IMAGE_TAG
+    pinning is honored instead of hardcoding :latest (#5)."""
 
-    def test_cargo_quarantine_uses_offline(self, tmp_path):
-        _write_config(tmp_path, "rg", "ecosystem: [cargo]\ncargo_offline: true\n")
-        assert image_for_repo("rg", tmp_path) == "rg/base-offline:latest"
+    def _patch_resolver(self, monkeypatch, seen):
+        monkeypatch.setattr(
+            "harness.e2e.quarantine.resolve_image",
+            lambda base: seen.append(base) or f"{base}:PIN",
+        )
 
-    def test_go_quarantine_uses_offline(self, tmp_path):
+    def test_no_config_uses_base_via_resolver(self, tmp_path, monkeypatch):
+        seen = []
+        self._patch_resolver(monkeypatch, seen)
+        assert image_for_repo("Foo_Bar", tmp_path) == "foo_bar/base:PIN"
+        assert seen == ["foo_bar/base"]
+
+    def test_go_quarantine_uses_offline_base_via_resolver(self, tmp_path, monkeypatch):
         _write_config(tmp_path, "gz", "ecosystem: [go]\ngo_offline: true\n")
-        assert image_for_repo("gz", tmp_path) == "gz/base-offline:latest"
+        seen = []
+        self._patch_resolver(monkeypatch, seen)
+        assert image_for_repo("gz", tmp_path) == "gz/base-offline:PIN"
+        assert seen == ["gz/base-offline"]
 
-    def test_pip_only_uses_offline(self, tmp_path):
-        # pip closure is now baked into base-offline:latest (no longer host-mounted).
-        _write_config(tmp_path, "sk", "ecosystem: [pip]\npip_wheelhouse: /wh\n")
-        assert image_for_repo("sk", tmp_path) == "sk/base-offline:latest"
-
-    def test_image_for_repo_pip_uses_base_offline(self, tmp_path):
-        _write_config(tmp_path, "scikit-learn_x", "ecosystem: [pip]\npip_wheelhouse: /x\n")
-        assert image_for_repo("scikit-learn_x", tmp_path).endswith("/base-offline:latest")
+    def test_pip_uses_offline_base_via_resolver(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, "sk", "ecosystem: [pip]\n")
+        seen = []
+        self._patch_resolver(monkeypatch, seen)
+        assert image_for_repo("sk", tmp_path) == "sk/base-offline:PIN"
+        assert seen == ["sk/base-offline"]
 
 
 class TestCidrOverlap:

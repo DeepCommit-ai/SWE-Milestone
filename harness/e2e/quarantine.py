@@ -16,6 +16,8 @@ from pathlib import Path
 
 import yaml
 
+from harness.e2e.image_version import resolve_image
+
 # Registry domains that can serve a repo's own published artifacts, per
 # ecosystem. The coverage gate (quarantine_coverage_errors) requires a repo's
 # policy to deny ALL of its declared ecosystems' registries, so a repo whose
@@ -28,6 +30,48 @@ ECOSYSTEM_REGISTRIES: dict[str, list[str]] = {
     "maven": ["repo1.maven.org", "repo.maven.apache.org", "central.sonatype.com"],
     "npm": ["registry.npmjs.org", "registry.yarnpkg.com"],
 }
+
+# YAML key that forces each ecosystem's package manager offline. pip is NOT here:
+# EVOCLAW_PIP_OFFLINE is auto-derived from ecosystem=pip (no per-repo key). The
+# gate requires the switch so a denied registry can't still be reached through
+# the legitimate package-manager fetch path.
+ECOSYSTEM_YAML_OFFLINE_KEY: dict[str, str] = {
+    "cargo": "cargo_offline",
+    "go": "go_offline",
+    "maven": "maven_offline",
+    "npm": "npm_offline",
+}
+
+# Public module-proxy mirror domains. A Go module proxy mirrors ANY public repo
+# with a v-prefixed semver tag (not just Go projects — element-web's v1.11.97 is
+# reachable too) at proxy.golang.org/<host>/<owner>/<repo>/@v/<tag>.zip, so it is
+# a cross-ecosystem answer-fetch channel. proxy/sum/index.golang.org ride Google
+# IP ranges shared with Vertex aiplatform, so they can't be CIDR-denied without
+# cutting the LLM path; the defense is domain-level /etc/hosts poisoning applied
+# to EVERY quarantine container, plus GOPROXY=off. Poisoned ONLY under quarantine
+# (container_setup._poison_domain_list) so non-quarantine/baseline containers keep
+# working go module fetches (parity).
+QUARANTINE_MIRROR_DOMAINS: list[str] = [
+    "proxy.golang.org",
+    "sum.golang.org",
+    "index.golang.org",
+    "goproxy.cn",
+    "goproxy.io",
+]
+
+
+def goproxy_value(go_offline: bool, quarantine_active: bool) -> str:
+    """GOPROXY to write into a container's shell profiles.
+
+    'off' under go quarantine (the proxy itself is the answer channel:
+    `go get <self>@<target>`) AND under any quarantine (the mirror domains are
+    /etc/hosts-poisoned, so a bare proxy URL resolves to 0.0.0.0 and every fetch
+    fails). Otherwise the sanctioned proxy, preserving the pre-quarantine
+    baseline (a non-quarantine container must keep fetching go modules).
+    """
+    if go_offline or quarantine_active:
+        return "off"
+    return "https://proxy.golang.org,direct"
 
 
 def _as_list(v) -> list:
@@ -95,9 +139,11 @@ def image_for_repo(repo_name: str, project_root: Path) -> str:
     """
     lower = repo_name.lower()
     q = load_quarantine_config(repo_name, project_root)
-    if q is not None:                       # any quarantine ecosystem (incl pip) uses the offline-closure image
-        return f"{lower}/base-offline:latest"
-    return f"{lower}/base:latest"
+    base = f"{lower}/base-offline" if q is not None else f"{lower}/base"
+    # resolve_image honors the EVOCLAW_IMAGE_TAG pin (default v0.9) with a loud
+    # :latest fallback — NOT a hardcoded :latest, which silently ignored the pin
+    # so reproducibility runs graded against the wrong data version.
+    return resolve_image(base)
 
 
 def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
@@ -121,12 +167,21 @@ def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
         return {}
 
     env: dict[str, str] = {}
+    # Quarantine is active for this repo (policy file present). Signal it so
+    # container_setup poisons the mirror domains + forces GOPROXY off, and the
+    # run_e2e fail-closed guard can tell an env-injected launch from a raw one.
+    env["EVOCLAW_QUARANTINE"] = "1"
     dd = q.get("deny_domains")
     dc = q.get("deny_cidrs")
     if dd:
         env["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
     if dc:
         env["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
+    # Domains the policy declares un-CIDR-blockable (share a Google/Vertex range);
+    # verify_network_lockdown exempts ONLY these from the reachability assertion.
+    fe = q.get("firewall_exempt_domains")
+    if fe:
+        env["EVOCLAW_FIREWALL_EXEMPT"] = ",".join(fe) if isinstance(fe, list) else str(fe)
 
     # pip offline: the pip wheelhouse is now baked INTO base-offline:latest at
     # /wheelhouse (scripts/build_offline_closure.py). Signal the in-image path
@@ -192,6 +247,8 @@ def quarantine_coverage_errors(repo_names: list[str], project_root: Path) -> lis
             )
             continue
         deny = {str(d).strip().lower() for d in _as_list(q.get("deny_domains"))}
+        deny_cidrs = _as_list(q.get("deny_cidrs"))
+        exempt = {str(d).strip().lower() for d in _as_list(q.get("firewall_exempt_domains"))}
         for eco in ecosystems:
             if eco == "none":
                 continue
@@ -202,9 +259,59 @@ def quarantine_coverage_errors(repo_names: list[str], project_root: Path) -> lis
                     f"(known: {sorted(ECOSYSTEM_REGISTRIES)} or 'none')"
                 )
                 continue
+            # (a) deny_domains must name every registry (keeps them off the
+            #     whitelist so their resolved IPs aren't ACCEPTed individually).
             missing = [r for r in regs if r not in deny]
             if missing:
                 errors.append(
                     f"{name}: ecosystem '{eco}' registries not in deny_domains: {missing}"
                 )
+            # (b) the ecosystem's package manager must be forced offline, else a
+            #     denied registry is still reachable via the legitimate fetch path.
+            off_key = ECOSYSTEM_YAML_OFFLINE_KEY.get(eco)
+            if off_key and not q.get(off_key):
+                errors.append(
+                    f"{name}: ecosystem '{eco}' has no '{off_key}: true' — the "
+                    f"package manager would fetch online despite the deny"
+                )
+            # (c) each registry must be dropped at the IP layer. deny_domains
+            #     alone doesn't: registries ride shared CDN ranges that stay
+            #     ACCEPTed unless a deny_cidr overlaps them. Require deny_cidrs,
+            #     UNLESS the registry is firewall_exempt (un-CIDR-able because it
+            #     shares a Google/Vertex range; defended by /etc/hosts poison +
+            #     the offline switch — the known proxy.golang.org residual).
+            need_cidr = [r for r in regs if r.lower() not in exempt]
+            if need_cidr and not deny_cidrs:
+                errors.append(
+                    f"{name}: ecosystem '{eco}' registries {need_cidr} reachable "
+                    f"via CDN — add deny_cidrs (their CDN ranges) or list them in "
+                    f"firewall_exempt_domains"
+                )
     return errors
+
+
+def quarantine_guard_error(
+    repo_name: str,
+    project_root: Path,
+    quarantine_active: bool,
+    unprotected: bool,
+) -> str | None:
+    """Fail-closed guard for direct entry points (e.g. run_e2e).
+
+    The coverage gate + env injection live in scripts/run_all.py; a direct
+    `run_e2e.py --repo-name X` launch bypasses them. Returns an error string when
+    the repo HAS a quarantine policy but this launch didn't apply it
+    (quarantine_active False — EVOCLAW_QUARANTINE not injected) and --unprotected
+    wasn't passed — exactly the 'silently ran unprotected' condition issue #12
+    set out to make impossible. Returns None to proceed.
+    """
+    if quarantine_active or unprotected:
+        return None
+    if load_quarantine_config(repo_name, project_root) is None:
+        return None
+    return (
+        f"{repo_name}: quarantine_configs/{repo_name}.yaml exists but this launch "
+        f"has no quarantine env (EVOCLAW_QUARANTINE unset). Launch via "
+        f"scripts/run_all.py (applies the policy), or pass --unprotected to run "
+        f"without protection (scores may be tainted)."
+    )
