@@ -260,7 +260,6 @@ class ContainerSetup:
         if reasoning_effort:
             framework_kwargs["reasoning_effort"] = reasoning_effort
         self._framework: AgentFramework = get_agent_framework(agent_framework_name, **framework_kwargs)
-        self._agent_framework_name = agent_framework_name
         self.repo_name = repo_name
 
         # F2: run_all injects the quarantine env into the worker subprocess; a
