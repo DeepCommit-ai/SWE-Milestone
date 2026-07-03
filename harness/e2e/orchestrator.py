@@ -200,8 +200,6 @@ class E2EOrchestrator:
         generated_patterns: Optional[list[str]] = None,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns: Optional[list[str]] = None,  # Test files agent can modify
         main_branch: str = "main",  # Main branch name from repo config
-        drop_params: bool = False,  # Deprecated, use api_router
-        api_router: bool = False,  # Deploy vendored claude-code-router-py for API translation
         reasoning_effort: Optional[str] = None,  # For framework env var injection
     ):
         self.repo_name = repo_name
@@ -217,7 +215,6 @@ class E2EOrchestrator:
         self.repo_src_dirs = repo_src_dirs
         self.test_dirs = test_dirs
         self.main_branch = main_branch
-        self.api_router = api_router or drop_params
 
         # Create SrcFileFilter for filtering test and excluded files from snapshots
         # All filtering (test_dirs, exclude_patterns) is done through SrcFileFilter
@@ -247,7 +244,6 @@ class E2EOrchestrator:
             agent_name=self.agent_name,
             e2e_workspace_path=self.e2e_workspace_path,
             agent_framework_name=self.agent_name,  # agent_name is the framework (e.g., "gemini-cli")
-            api_router=self.api_router,
             reasoning_effort=self.reasoning_effort,
             repo_name=self.repo_name,  # authoritative repo id for F2 policy recovery
         )
