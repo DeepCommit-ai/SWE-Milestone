@@ -197,6 +197,53 @@ verify_fetch_urls:
             load_quarantine_env("r4", tmp_path)
 
 
+class TestFirewallExemptWhitelist:
+    """F1: firewall_exempt_domains must be restricted to genuinely un-CIDR-blockable
+    (Google/Vertex-shared) domains. Exempting a CIDR-blockable registry would
+    bypass BOTH the gate's cidr requirement and verify's reachability assertion —
+    a declaration-driven fail-open. The gate must reject it."""
+
+    def test_cidr_blockable_registry_in_exempt_rejected(self, tmp_path):
+        # crates.io IS Fastly-CIDR-blockable; exempting it would silently reopen
+        # the answer channel. Even WITH a deny_cidr present, listing it as exempt
+        # is illegal (verify would still skip it).
+        _write_config(tmp_path, "evil", """
+ecosystem: [cargo]
+cargo_offline: true
+deny_domains: [crates.io, static.crates.io, index.crates.io]
+deny_cidrs: [151.101.0.0/16]
+firewall_exempt_domains: [crates.io]
+""")
+        errs = quarantine_coverage_errors(["evil"], tmp_path)
+        assert errs
+        assert any("crates.io" in e and "exempt" in e.lower() for e in errs)
+
+    def test_google_shared_domains_in_exempt_allowed(self, tmp_path):
+        _write_config(tmp_path, "gz", """
+ecosystem: [go]
+go_offline: true
+deny_domains: [proxy.golang.org, sum.golang.org, goproxy.cn, goproxy.io]
+deny_cidrs: [104.16.0.0/12, 155.102.0.0/16]
+firewall_exempt_domains: [proxy.golang.org, sum.golang.org, golang.org, go.dev, pkg.go.dev]
+""")
+        assert quarantine_coverage_errors(["gz"], tmp_path) == []
+
+
+class TestResumeUnprotected:
+    """Resuming an --unprotected baseline must stay OPEN, not silently re-harden.
+    The flag is persisted in trial_metadata and read back on resume (it isn't a
+    CLI arg the second time)."""
+
+    def test_metadata_wants_unprotected(self):
+        from harness.e2e.quarantine import metadata_wants_unprotected
+
+        assert metadata_wants_unprotected({"unprotected": True}) is True
+        assert metadata_wants_unprotected({"unprotected": False}) is False
+        assert metadata_wants_unprotected({"model": "m"}) is False
+        assert metadata_wants_unprotected({}) is False
+        assert metadata_wants_unprotected(None) is False
+
+
 class TestQuarantineGuard:
     """#3: a direct run_e2e launch of a repo that HAS a policy but wasn't given
     the quarantine env must refuse (the 'silently ran unprotected' condition)."""

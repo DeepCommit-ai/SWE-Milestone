@@ -14,9 +14,11 @@ from typing import Optional
 
 from harness.e2e.agents import AgentFramework, get_agent_framework
 from harness.e2e.quarantine import (
+    FIREWALL_EXEMPTABLE_DOMAINS,
     QUARANTINE_MIRROR_DOMAINS,
     cidr_overlaps_any,
     goproxy_value,
+    load_quarantine_env,
 )
 
 logger = logging.getLogger("e2e.container_setup")
@@ -170,6 +172,58 @@ def _interpret_probe(returncode: int, stdout: str) -> bool:
     )
 
 
+def _quarantine_env_from_image(image_name: str, project_root=None) -> dict:
+    """Recover the full quarantine env for the repo this image belongs to, from
+    the on-disk policy file.
+
+    Used when the process env lacks the quarantine vars — a direct `run_e2e
+    --resume-trial` or a manual `run_milestone` don't inject q_env the way
+    run_all does, and without this the mirror-domain poison + registry deny would
+    silently not apply (F2 de-harden). The signal is a DISK FACT (does the
+    image's repo have a quarantine_configs/<repo>.yaml), not a propagated env
+    var, so it survives env loss. A repo with no config recovers {} and stays
+    unprotected (parity preserved). Docker repo names are lowercase while config
+    filenames may not be (e.g. BurntSushi), so match case-insensitively.
+    """
+    repo_lower = (image_name or "").split("/")[0].split(":")[0].strip().lower()
+    if not repo_lower:
+        return {}
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
+    conf_dir = root / "quarantine_configs"
+    if not conf_dir.is_dir():
+        return {}
+    match = next(
+        (p.stem for p in sorted(conf_dir.glob("*.yaml")) if p.stem.lower() == repo_lower),
+        None,
+    )
+    if not match:
+        return {}
+    return load_quarantine_env(match, root)
+
+
+def _recover_quarantine_env(repo_name, image_name: str, project_root=None) -> dict:
+    """Recover the full quarantine env from the repo's on-disk policy, for the
+    env-less launch paths (direct run_e2e --resume-trial / manual run_milestone)
+    that don't inject it like run_all does.
+
+    Prefer the AUTHORITATIVE repo_name passed by the caller (a known fact) over
+    parsing the image name (a fragile signal that misparses a registry-prefixed
+    image and would silently leave a policy'd repo unprotected — F2-c). Match
+    case-insensitively (config filenames may be mixed-case, e.g. BurntSushi,
+    while docker repos are lowercase). Returns {} for a non-quarantine repo
+    (parity preserved).
+    """
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
+    conf_dir = root / "quarantine_configs"
+    if repo_name and conf_dir.is_dir():
+        stems = {p.stem.lower(): p.stem for p in conf_dir.glob("*.yaml")}
+        match = stems.get(str(repo_name).strip().lower())
+        if match:
+            return load_quarantine_env(match, root)
+    # Fallback: parse the image (only when repo_name is absent or unmatched).
+    return _quarantine_env_from_image(image_name, project_root)
+
+
 class ContainerSetup:
     """Docker container initialization with fakeroot user and Claude credentials."""
 
@@ -190,6 +244,7 @@ class ContainerSetup:
         drop_params: bool = False,
         api_router: bool = False,
         reasoning_effort: Optional[str] = None,
+        repo_name: Optional[str] = None,
     ):
         """Initialize container setup.
 
@@ -220,6 +275,24 @@ class ContainerSetup:
         self._framework: AgentFramework = get_agent_framework(agent_framework_name, **framework_kwargs)
         self.api_router = api_router or drop_params
         self._agent_framework_name = agent_framework_name
+        self.repo_name = repo_name
+
+        # F2: run_all injects the quarantine env into the worker subprocess; a
+        # direct run_e2e --resume-trial or a manual run_milestone does NOT.
+        # Recover it from the repo's on-disk policy HERE (in __init__), BEFORE
+        # start_container reads it for the offline -e flags and before
+        # lock_network/verify read it. Skip when EVOCLAW_QUARANTINE is already
+        # present (run_all path — leave it so a canary env override still applies)
+        # or when EVOCLAW_UNPROTECTED is set (operator explicitly wants an open
+        # baseline). Uses the authoritative repo_name, not a fragile image parse.
+        if not os.environ.get("EVOCLAW_QUARANTINE") and not os.environ.get("EVOCLAW_UNPROTECTED"):
+            _recovered = _recover_quarantine_env(repo_name, image_name)
+            if _recovered:
+                os.environ.update(_recovered)
+                logger.info(
+                    f"Quarantine env recovered from policy for "
+                    f"'{repo_name or image_name.split('/')[0]}' (env-less launch path)"
+                )
 
     def get_agent_mounts(self) -> list[str]:
         """Return Docker volume mount arguments for the agent.
@@ -1333,7 +1406,15 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # is gone: a typo'd/omitted deny_cidr made a normal registry look exempt
         # and silently pass (fail-open, #2b). A missing deny_cidr is now caught up
         # front by the coverage gate; a wrong one is caught by this assertion.
-        _exempt = {d.strip().lower() for d in os.environ.get("EVOCLAW_FIREWALL_EXEMPT", "").split(",") if d.strip()}
+        # Only honor exempts that are in the code-level whitelist (defense in
+        # depth: the gate rejects illegal exempts at launch, but --unprotected
+        # bypasses the gate — verify must not skip a CIDR-blockable registry just
+        # because the policy mislabeled it exempt) (F1).
+        _exempt = {
+            d.strip().lower()
+            for d in os.environ.get("EVOCLAW_FIREWALL_EXEMPT", "").split(",")
+            if d.strip()
+        } & FIREWALL_EXEMPTABLE_DOMAINS
         _verified = 0
         for host in _deny_domains:
             if host.lower() in _exempt:

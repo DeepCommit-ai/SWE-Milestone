@@ -249,6 +249,7 @@ class E2EOrchestrator:
             agent_framework_name=self.agent_name,  # agent_name is the framework (e.g., "gemini-cli")
             api_router=self.api_router,
             reasoning_effort=self.reasoning_effort,
+            repo_name=self.repo_name,  # authoritative repo id for F2 policy recovery
         )
 
         # Load config (priority: config_path > trial_root > workspace_root > harness/e2e default)

@@ -42,6 +42,23 @@ ECOSYSTEM_YAML_OFFLINE_KEY: dict[str, str] = {
     "npm": "npm_offline",
 }
 
+# The ONLY domains a policy may list in firewall_exempt_domains: those that
+# genuinely CANNOT be IP/CIDR-blocked because they ride Google's Vertex-shared
+# ranges (blocking the range would cut the model path). Their defense is
+# /etc/hosts poison + GOPROXY=off. This is a CODE-LEVEL whitelist (a fact, not a
+# self-declaration): exempting anything else — e.g. a Fastly/Cloudflare registry
+# that IS CIDR-blockable — would make the gate waive its deny_cidr requirement
+# AND make verify skip its reachability probe, silently reopening the answer
+# channel. So the gate rejects any exempt domain outside this set (F1).
+FIREWALL_EXEMPTABLE_DOMAINS: frozenset[str] = frozenset({
+    "proxy.golang.org",
+    "sum.golang.org",
+    "index.golang.org",
+    "golang.org",
+    "go.dev",
+    "pkg.go.dev",
+})
+
 # Public module-proxy mirror domains. A Go module proxy mirrors ANY public repo
 # with a v-prefixed semver tag (not just Go projects — element-web's v1.11.97 is
 # reachable too) at proxy.golang.org/<host>/<owner>/<repo>/@v/<tag>.zip, so it is
@@ -249,6 +266,18 @@ def quarantine_coverage_errors(repo_names: list[str], project_root: Path) -> lis
         deny = {str(d).strip().lower() for d in _as_list(q.get("deny_domains"))}
         deny_cidrs = _as_list(q.get("deny_cidrs"))
         exempt = {str(d).strip().lower() for d in _as_list(q.get("firewall_exempt_domains"))}
+        # F1: firewall_exempt is a CIDR-deny + verify-probe waiver, so it must be
+        # restricted to genuinely un-CIDR-blockable domains. A CIDR-blockable
+        # registry listed here would pass the gate with no deny_cidr AND be
+        # skipped by verify — a declaration-driven fail-open. Reject it up front.
+        illegal_exempt = sorted(exempt - FIREWALL_EXEMPTABLE_DOMAINS)
+        if illegal_exempt:
+            errors.append(
+                f"{name}: firewall_exempt_domains has CIDR-blockable domain(s) "
+                f"{illegal_exempt} — only Google-shared un-blockable domains "
+                f"{sorted(FIREWALL_EXEMPTABLE_DOMAINS)} may be exempt; deny the "
+                f"rest with deny_cidrs"
+            )
         for eco in ecosystems:
             if eco == "none":
                 continue
@@ -315,3 +344,14 @@ def quarantine_guard_error(
         f"scripts/run_all.py (applies the policy), or pass --unprotected to run "
         f"without protection (scores may be tainted)."
     )
+
+
+def metadata_wants_unprotected(metadata) -> bool:
+    """True if a resumed trial's saved metadata recorded it as --unprotected.
+
+    run_e2e persists the flag alongside model/image so a resumed open baseline
+    stays open — without it, ContainerSetup.__init__ would recover the policy and
+    silently re-harden a trial that ran with the network open before the
+    interruption (the resume corollary of F2-b).
+    """
+    return bool(metadata and metadata.get("unprotected"))

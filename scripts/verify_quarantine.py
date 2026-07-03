@@ -74,7 +74,7 @@ def main() -> int:
     for k, v in sorted(q_env.items()):
         print(f"  {k}={v}")
 
-    cs = ContainerSetup(container_name=container, image_name=image)
+    cs = ContainerSetup(container_name=container, image_name=image, repo_name=repo)
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
 
     failures = 0

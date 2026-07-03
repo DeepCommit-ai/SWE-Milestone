@@ -1818,6 +1818,15 @@ def _run_resume_mode(args):
 
     # Extract config from original metadata, allow CLI overrides
     metadata = trial_state.original_config
+    # Resume corollary of F2-b: keep a resumed --unprotected baseline OPEN. The
+    # flag isn't a CLI arg the second time, so read it from the persisted metadata
+    # and set the signal BEFORE the orchestrator (and its ContainerSetup) is
+    # constructed — otherwise __init__'s policy recovery would silently re-harden
+    # a trial that ran with the network open before the interruption.
+    from harness.e2e.quarantine import metadata_wants_unprotected
+    if metadata_wants_unprotected(metadata) and not os.environ.get("EVOCLAW_UNPROTECTED"):
+        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+        logger.info("Resume: trial was launched --unprotected; keeping it open (no re-harden)")
     # --model override for resume (e.g., fix a wrong model after fatal error)
     if getattr(args, '_model_explicitly_set', False):
         logger.info(f"Overriding model: {metadata.get('model')} → {args.model}")
@@ -2038,6 +2047,12 @@ Example:
     )
 
     args = parser.parse_args()
+
+    # --unprotected: signal ContainerSetup NOT to recover quarantine from policy
+    # (operator explicitly wants an open baseline run) — covers fresh AND resume,
+    # both of which construct ContainerSetup (F2-b).
+    if getattr(args, "unprotected", False):
+        os.environ["EVOCLAW_UNPROTECTED"] = "1"
 
     # Track whether --model was explicitly provided (vs default)
     args._model_explicitly_set = '--model' in sys.argv
@@ -2290,6 +2305,9 @@ Example:
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
         "api_router": args.api_router or args.drop_params,
+        # Persist --unprotected so a resumed open baseline stays open (isn't
+        # silently re-hardened by ContainerSetup's policy recovery on resume).
+        "unprotected": bool(args.unprotected),
     }
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:
