@@ -1,7 +1,7 @@
 data_root: /data2/gangda/EvoClaw-data
 trial_name: claude-code_kimi-k2.6
 agent: claude-code
-# Kimi's coding endpoint speaks native Anthropic /v1/messages — no router needed.
+# Kimi's coding endpoint speaks native Anthropic /v1/messages.
 # The endpoint exposes ONE model id `kimi-for-coding`, but accepts "kimi-k2.6"
 # (and probably any alias) as input and maps to kimi-for-coding internally
 # (verified 2026-04-22 via direct probe).
