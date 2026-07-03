@@ -64,9 +64,18 @@ Two forms for `trial_name`:
 > name) points all five slots at the same model, keeping every request on
 > your proxy.
 
-> **Google Vertex AI (gemini-cli only):** Vertex doesn't use an API key — it
-> uses ADC. Set `vertex_ai: true` with `agent: gemini-cli`; the ADC is copied
-> into the container and gemini-cli talks to Vertex directly (no proxy). You set
+> **Context compaction (`auto_compact_window`, claude-code only):** by default
+> claude-code runs with **no compaction** — context grows to the endpoint's
+> ceiling (~1M). Set `auto_compact_window: 200000` in the trial config to make
+> it compact at 200K instead (its native `CLAUDE_CODE_AUTO_COMPACT_WINDOW`;
+> values above 200K are capped, so `200000` is the only useful setting). The
+> monitor header's `context=` label reflects the effective window. Details:
+> [`adding-a-model.md`](./adding-a-model.md).
+
+> **Google Vertex AI (gemini-cli / claude-code):** Vertex doesn't use an API
+> key — it uses ADC. Set `vertex_ai: true` with `agent: gemini-cli` (Gemini
+> ids) or `agent: claude-code` (Claude ids); the ADC is copied into the
+> container and the agent talks to Vertex directly (no proxy). You set
 > neither `UNIFIED_API_KEY` nor `UNIFIED_BASE_URL`. See [`vertex-ai.md`](./vertex-ai.md).
 
 ---
@@ -403,10 +412,10 @@ shell-exported var still wins):
 | Variable | Description |
 |---|---|
 | `EVOCLAW_DATA_ROOT` | Where you downloaded EvoClaw-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
-| `EVOCLAW_WHEELHOUSE_DIR` | Base dir of the offline pip wheelhouses. Only needed for quarantine runs. |
 
 > **Quarantine (anti-cheat) is zero-touch.** It auto-applies to any repo that has
 > a `quarantine_configs/<repo>.yaml` policy — nothing to pass per run (a `🔒` marker
-> shows at launch). To run an **unprotected baseline** for such a repo, move its
-> `quarantine_configs/<repo>.yaml` aside. Full design + how to add a repo:
-> [`quarantine.md`](./quarantine.md).
+> shows at launch), and a coverage gate refuses to launch a repo whose policy is
+> missing or incomplete. To run an **unprotected baseline**, pass `--unprotected`
+> (the only escape hatch — moving the policy file aside trips the gate). Full
+> design + how to add a repo: [`quarantine.md`](./quarantine.md).

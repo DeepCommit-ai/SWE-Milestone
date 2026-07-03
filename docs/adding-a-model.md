@@ -42,7 +42,8 @@ below are the details and the two exceptions (new domain, pricing).
 > settings are supported:
 >
 > - **unset** → no compaction (context runs to the endpoint's ~1M ceiling).
-> - **`200000`** → compact at 200K. The monitor header shows `compact=200K`.
+> - **`200000`** → compact at 200K. The monitor header's `context=` label
+>   reflects the effective window (`context=200K` vs `context=1M`).
 >
 > Any value above 200K is capped to 200K, so don't bother — `200000` is the max.
 

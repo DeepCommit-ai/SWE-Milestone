@@ -2,8 +2,8 @@
 #
 # Repo-intrinsic, configured ONCE per repo. Auto-on: the mere presence of this
 # file makes run_all.py apply the policy to this repo's container (no trial-
-# config flag). To run an UNPROTECTED baseline for this repo, move this file
-# aside temporarily. See docs/quarantine.md.
+# config flag). To run an UNPROTECTED baseline pass --unprotected to run_all.py
+# (moving this file aside would trip the coverage gate). See docs/quarantine.md.
 #
 # Why: scikit-learn cheated by `pip download scikit-learn==1.6.0` — pulling its
 # own target-version source from PyPI. Block PyPI at the network layer (domain +

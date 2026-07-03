@@ -98,7 +98,7 @@ cp .env .env_private
 # edit .env_private →  EVOCLAW_DATA_ROOT=/abs/path/to/EvoClaw-data
 ```
 
-Trial configs then use `data_root: ${EVOCLAW_DATA_ROOT}` — no host path to repeat. (Only anti-cheat *quarantine* runs also need `EVOCLAW_WHEELHOUSE_DIR`; see [docs/quarantine.md](docs/quarantine.md).)
+Trial configs then use `data_root: ${EVOCLAW_DATA_ROOT}` — no host path to repeat. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
 
 ## 🚀 Usage
 

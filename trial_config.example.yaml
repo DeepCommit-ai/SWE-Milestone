@@ -33,6 +33,12 @@ timeout: 18000
 # Controls the model's thinking depth. Not all agents/models support this.
 # reasoning_effort: high
 
+# Context compaction (claude-code only). Unset = NO compaction: context runs
+# to the endpoint's ceiling (~1M). 200000 = compact at 200K (claude-code's
+# native CLAUDE_CODE_AUTO_COMPACT_WINDOW; values above 200K are capped to
+# 200K, so this is the only useful setting). See docs/adding-a-model.md.
+# auto_compact_window: 200000
+
 # ─── Optional ───────────────────────────────────────────
 
 # Run specific repos only (default: all repos found in data_root)
