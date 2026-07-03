@@ -186,7 +186,6 @@ def build_cmd(
     timeout: int,
     trial_name: str,
     reasoning_effort: str | None,
-    api_router: bool,
     force: bool,
     milestones: str | None = None,
     project_root: Path | None = None,
@@ -224,8 +223,6 @@ def build_cmd(
         cmd.extend(["--reasoning-effort", reasoning_effort])
     if milestones:
         cmd.extend(["--milestones", str(milestones)])
-    if api_router:
-        cmd.append("--api-router")
     if force:
         cmd.append("--force")
     return cmd, ("force" if force else "fresh")
@@ -288,7 +285,6 @@ def main():
     # Optional milestone-prefix: run only the first N (or P%) of each repo's DAG,
     # dependency-closed. CLI --milestones overrides the trial config's 'milestones:'.
     milestones = args.milestones if args.milestones is not None else cfg.get("milestones", None)
-    api_router = cfg.get("api_router", cfg.get("drop_params", False))
     default_haiku_model = cfg.get("default_haiku_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
@@ -313,11 +309,10 @@ def main():
     vertex_location = cfg.get("vertex_location", "global")
     vertex_project = cfg.get("vertex_project", None)
     if vertex_ai:
-        # No Anthropic↔OpenAI router in Vertex mode. For claude-code, route all
-        # of Claude Code's class-based model slots to this same Vertex model so
-        # background/subagent calls don't fall back to the hard-coded Anthropic
-        # defaults (which may not be enabled on the Vertex project).
-        api_router = False
+        # For claude-code, route all of Claude Code's class-based model slots to
+        # this same Vertex model so background/subagent calls don't fall back to
+        # the hard-coded Anthropic defaults (which may not be enabled on the
+        # Vertex project).
         if not default_haiku_model:
             default_haiku_model = model
 
@@ -438,7 +433,7 @@ def main():
 
         cmd, mode = build_cmd(
             repo, agent, model, timeout, trial_name,
-            reasoning_effort, api_router, args.force,
+            reasoning_effort, args.force,
             milestones, project_root,
         )
         # Per-repo quarantine: apply this repo's anti-cheat policy (if any) only

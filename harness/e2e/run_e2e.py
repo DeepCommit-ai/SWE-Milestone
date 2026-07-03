@@ -1108,7 +1108,6 @@ class E2ETrialRunner:
             timeout_ms=self.timeout_ms,
             prompt_version=self.prompt_version,
             reasoning_effort=self.reasoning_effort,
-            api_router=self.orchestrator.api_router,
         )
 
         # Capture initial state
@@ -1880,7 +1879,6 @@ def _run_resume_mode(args):
         exclude_patterns=exclude_patterns,
         generated_patterns=generated_patterns,
         modifiable_test_patterns=modifiable_test_patterns,
-        api_router=metadata.get("api_router", metadata.get("drop_params", False)),
         reasoning_effort=metadata.get("reasoning_effort"),
     )
 
@@ -2011,20 +2009,6 @@ Example:
         "--remove-container",
         action="store_true",
         help="Remove container after trial completes (default: keep container running)",
-    )
-
-    parser.add_argument(
-        "--api-router",
-        action="store_true",
-        help="Deploy the vendored claude-code-router-py inside the container to "
-        "translate Anthropic Messages API to OpenAI format. Only applies to "
-        "claude-code agent.",
-    )
-
-    parser.add_argument(
-        "--drop-params",
-        action="store_true",
-        help="Deprecated: use --api-router instead.",
     )
 
     parser.add_argument(
@@ -2304,7 +2288,6 @@ Example:
         "dag_path": str(dag_path),
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
-        "api_router": args.api_router or args.drop_params,
         # Persist --unprotected so a resumed open baseline stays open (isn't
         # silently re-hardened by ContainerSetup's policy recovery on resume).
         "unprotected": bool(args.unprotected),
@@ -2331,7 +2314,6 @@ Example:
         exclude_patterns=exclude_patterns,  # Exclude patterns for SrcFileFilter
         generated_patterns=generated_patterns,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns=modifiable_test_patterns,  # Test files agent can modify
-        api_router=args.api_router or args.drop_params,
         reasoning_effort=args.reasoning_effort,
     )
 
