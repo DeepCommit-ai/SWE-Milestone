@@ -25,6 +25,15 @@ from typing import Any, Dict, List, Optional
 
 MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # ── Anthropic Claude ──────────────────────────────────────────────────
+    # Fable 5 — the tier above Opus ($10/$50 list; Vertex bills the same).
+    "claude-fable": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.00,
+        "cache_write": 12.50,
+        "cache_write_5m": 12.50,   # 1.25x input
+        "cache_write_1h": 20.0,    # 2.0x input
+    },
     "claude-sonnet": {
         "input": 3.0,
         "output": 15.0,
@@ -94,6 +103,9 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30, "cache_read": 0.01875},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00, "cache_read": 0.3125},
     # ── Z.AI GLM ──────────────────────────────────────────────────────────
+    # glm-5.2: cache_write ("Cached Input Storage") is a limited-time promo (free);
+    # list price is expected to track glm-5.1's 1.4 once the promo ends.
+    "glm-5.2": {"input": 1.4, "output": 4.4, "cache_read": 0.26, "cache_write": 0.0},
     "glm-5.1": {"input": 1.4, "output": 4.4, "cache_read": 0.26, "cache_write": 1.4},
     "glm-5": {"input": 1.0, "output": 3.2, "cache_read": 0.20, "cache_write": 1.0},
     "glm-5-turbo": {"input": 1.2, "output": 4.0, "cache_read": 0.24, "cache_write": 1.2},
@@ -106,6 +118,30 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache_read": 0.003625, "cache_write": 0.435},
     # ── MiniMax ───────────────────────────────────────────────────────────
     "minimax-2.5": {"input": 0.3, "output": 2.4, "cache_read": 0.03, "cache_write": 0.375},
+    # ── Qwen ──────────────────────────────────────────────────────────────
+    # OpenRouter market average 2026-06 (no cache discount listed → cache
+    # billed at input rate). Actual trials ran on a Fireworks dedicated
+    # deployment (GPU-hour billed); this is the per-token market equivalent.
+    "qwen3.6-27b": {"input": 0.289, "output": 2.40, "cache_read": 0.289, "cache_write": 0.289},
+}
+
+# Fireworks dedicated-deployment IDs used for the qwen3.6-27b trials —
+# resolve them to the canonical entry above.
+MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/trm5ci0n"] = MODEL_PRICING["qwen3.6-27b"]
+MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/p016vorq"] = MODEL_PRICING["qwen3.6-27b"]
+
+# Fireworks' Anthropic-compatible endpoint reported NO cache fields for the
+# deepseek-v4-pro trials — every context token landed in inputTokens at the
+# full cache-miss rate. On DeepSeek's official API the same claude-code
+# traffic would hit the automatic context cache: sibling opus-4.8 trials on
+# this harness measure a 96.9% cache-hit token share. Blend the official
+# rates ($0.003625 hit / $0.435 miss, api-docs.deepseek.com 2026-06) at that
+# ratio for an effective input price:
+#   0.969 × 0.003625 + 0.031 × 0.435 ≈ 0.017
+# Exact-match entry overrides the substring match to the canonical
+# "deepseek-v4-pro" entry above, which keeps the official per-token rates.
+MODEL_PRICING["accounts/fireworks/models/deepseek-v4-pro"] = {
+    "input": 0.017, "output": 0.87, "cache_read": 0.003625, "cache_write": 0.435,
 }
 
 
@@ -140,6 +176,7 @@ def _strip_prefix(model: str) -> str:
 # so they don't need to appear here.
 _MATCH_ORDER = [
     # Anthropic family names (match any dated version)
+    ("fable", "claude-fable"),
     ("opus", "claude-opus"),
     ("haiku", "claude-haiku"),
     ("sonnet", "claude-sonnet"),
@@ -164,6 +201,7 @@ _MATCH_ORDER = [
     ("gemini-1.5-flash", "gemini-1.5-flash"),
     ("gemini-1.5-pro", "gemini-1.5-pro"),
     # GLM (only needed for versioned suffixes like "glm-5-20260401")
+    ("glm-5.2", "glm-5.2"),      # must come before "glm-5"
     ("glm-5.1", "glm-5.1"),      # must come before "glm-5"
     ("glm-5-turbo", "glm-5-turbo"),  # must come before "glm-5"
     ("glm-5", "glm-5"),

@@ -1,0 +1,35 @@
+# Quarantine (anti-cheat) policy — element-web v1.11.95 → v1.11.97
+#
+# Lowest-risk repo: the app itself is not published to npm. BUT much of the
+# delta can live in matrix-js-sdk / matrix-* deps, which ARE on npm at
+# post-baseline versions — so the registry is denied for parity and npm
+# forced offline against the pre-baked 775M node_modules (the agent
+# attempted 1 WebFetch of upstream; blocked). yarn 1.22 has no clean
+# offline env switch; the network deny is the hard layer for it.
+
+ecosystem: [npm]
+
+deny_domains:
+  - registry.npmjs.org
+  - registry.yarnpkg.com
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (fronts npm registry)
+
+npm_offline: true
+
+verify_fetch_urls:
+  - https://registry.npmjs.org/matrix-js-sdk
+  - https://registry.yarnpkg.com/matrix-js-sdk
+
+closure:
+  cache_paths:
+    - /usr/local/share/.cache/yarn/v6
+  offline_build: "cd /testbed && yarn install --offline --frozen-lockfile"
+  # serve@14.2.5 is declared by feature_enhancements/SRS.md and
+  # maintenance_ui_ux/SRS.md as a "Node.js Global Package" used to serve the built
+  # static bundle for playwright tests. It is installed via `npm install -g` (NOT
+  # yarn), so it is NOT in the yarn cache. Baking it in here makes it available
+  # without any offline install step at eval time.
+  global_npm_tools:
+    - serve@14.2.5

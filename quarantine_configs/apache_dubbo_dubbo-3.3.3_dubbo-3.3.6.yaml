@@ -1,0 +1,50 @@
+# Quarantine (anti-cheat) policy — dubbo 3.3.3 → 3.3.6
+#
+# CONFIRMED CHEAT (claude-code_fable-5_001, 2026-06-10): 49 refs to
+# repo.maven.apache.org .../org/apache/dubbo/<mod>/3.3.[456]/*-sources.jar
+# across 13+ modules, diffed against /testbed and copied (3.3.3→4→5
+# version bisection). Maven Central rides Cloudflare; deny the /12 (the
+# builtin accept is /13 — overlap-matched by container_setup). LLM paths
+# are unaffected (api.anthropic.com/claude.ai = Anthropic ASN, Vertex =
+# Google ranges). Collateral (nodejs.org, gradle.org, spring.io, javadoc.io
+# riding Cloudflare) is acceptable: the image pre-bakes the toolchain.
+#
+# Maven runs offline (-o via MAVEN_ARGS, Maven 3.9.9) against the image's
+# 1.2G /root/.m2 — redirected via maven.repo.local because the agent runs
+# as fakeroot whose own ~/.m2 starts empty.
+
+ecosystem: [maven]
+
+deny_domains:
+  - repo1.maven.org
+  - repo.maven.apache.org
+  - central.sonatype.com
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (fronts Maven Central + sonatype)
+
+maven_offline: true
+maven_repo_local: /root/.m2/repository
+
+# Baseline artifacts (3.3.3-SNAPSHOT) are legitimately in the cache; any
+# 3.3.4+ artifact would be answer material.
+cache_forbid_globs:
+  - /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*
+  - /root/.m2/repository/org/apache/dubbo/*/3.[4-9]*
+
+verify_fetch_urls:
+  - https://repo.maven.apache.org/maven2/org/apache/dubbo/dubbo-common/3.3.6/dubbo-common-3.3.6-sources.jar
+  - https://repo1.maven.org/maven2/org/apache/dubbo/dubbo-common/3.3.6/dubbo-common-3.3.6-sources.jar
+
+closure:
+  cache_paths:
+    - /root/.m2/repository
+  # Offline closure gate: compile the milestone B-source against the unioned `.m2`
+  # with no network. The lint plugins (spotless/checkstyle/rat) are NOT part of the
+  # dependency closure — a mid-migration milestone checkpoint legitimately carries
+  # un-formatted/lint-dirty source, and an early spotless ABORT would mask the
+  # dependency-resolution signal the gate actually checks. We skip them so a real
+  # `Cannot access ... in offline mode` surfaces (the maven classifier then BLOCKS
+  # on a third-party gap, treats an unresolved self@B sibling — removed by design —
+  # as source-state). `git clean -xfd` resets any built sibling state first.
+  offline_build: "git clean -xfd && mvn -o test-compile -Dspotless.check.skip=true -Dspotless.apply.skip=true -Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true"

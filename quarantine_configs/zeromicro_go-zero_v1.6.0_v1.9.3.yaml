@@ -1,0 +1,82 @@
+# Quarantine (anti-cheat) policy — go-zero v1.6.0 → v1.9.3
+#
+# Channel (attempted via WebFetch, blocked; the registry path was open):
+# `go get github.com/zeromicro/go-zero@v1.9.3` or a raw curl of the proxy
+# zip serves the full target source. Primary defense is GOPROXY=off (go
+# refuses proxy AND direct/VCS fetches, works from the image's /go/pkg/mod);
+# domain-deny is belt-and-suspenders. goproxy.cn (the image's configured
+# proxy, Qiniu CDN) and goproxy.io (Cloudflare) are CIDR-deniable;
+# proxy.golang.org rides Google ranges shared with Vertex aiplatform, so it
+# is domain-deny only — narrow residual (curl --resolve with a known Google
+# IP) accepted until the SNI egress proxy lands (issue #12 long-term plan).
+
+ecosystem: [go]
+
+deny_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - goproxy.cn
+  - goproxy.io
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (goproxy.io)
+  - 155.102.0.0/16     # Qiniu/Kunlun CDN (goproxy.cn)
+
+# Domains on Google's Vertex-shared range that can't be IP-blocked without
+# cutting the LLM path. verify_network_lockdown exempts ONLY these from the
+# reachability assertion (defended by /etc/hosts poison + GOPROXY=off). Omitting
+# one ⇒ verify (correctly) FAILs it as reachable via the still-ACCEPTed Google
+# CDN range — this replaces the old fail-open runtime auto-exempt (#2b).
+firewall_exempt_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+
+go_offline: true
+
+# The main module is never in its own module cache; any copy of it there is
+# answer material.
+cache_forbid_globs:
+  - /go/pkg/mod/cache/download/github.com/zeromicro/*
+  - /go/pkg/mod/github.com/zeromicro/*
+
+# Only the IP-blockable proxies are asserted here (proxy.golang.org & friends
+# share Google's Vertex range and can't be IP-blocked — see
+# firewall_exempt_domains above; GOPROXY=off + /etc/hosts poison is their defense).
+verify_fetch_urls:
+  - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip
+  - https://goproxy.io/github.com/zeromicro/go-zero/@v/v1.9.3.zip
+
+closure:
+  cache_paths:
+    - /go/pkg/mod/cache/download
+  # Build-scoped gate, NOT whole-graph `go mod download`. The milestone module
+  # caches were warmed by `go build` (dataset prep), so they hold exactly what
+  # BUILDING needs — the compiled-package closure — not the full MVS download
+  # graph. `go mod download` requires a `<v>.zip` for every selected module
+  # (including direct requires the compiled code never imports, e.g.
+  # go-redis/v9@v9.4.0.zip, absent from ALL 23 milestone caches), so it raised a
+  # FALSE closure failure. The agent's real workflow is `go build`/`go test`, so
+  # we gate on a build.
+  #
+  # `-mod=mod` (NOT the go1.21 readonly default) is REQUIRED: several milestones'
+  # go.mod still declare `go 1.19`, and go1.21's `go build` default (-mod=readonly)
+  # REFUSES to build a go-1.19 module that needs any go.mod/go.sum bookkeeping
+  # ("updates to go.mod needed; go mod tidy") even when every module is already in
+  # the cache — a FALSE closure failure. `-mod=mod` lets go reconcile go.mod
+  # in-place from the cached modules; under `--network none` it can only ever use
+  # the closure's bytes, so a pass still proves offline-sufficiency. Empirically
+  # 21/23 milestones build offline this way; the 2 failures (m027, m028) are
+  # SOURCE-STATE (their START-state source imports go-redis/v8 + golang/mock +
+  # mongo-driver, which their own go.mod doesn't require — yet the bytes ARE in the
+  # cache), NOT closure gaps. The driver's classifier probes the cache to tell a
+  # real gap (bytes absent → fail-closed) from a source-state inconsistency (bytes
+  # present → recorded, does not block publish). The driver injects each
+  # milestone's /testbed (B source) and runs this with `--network none`.
+  offline_build: "go build -mod=mod ./..."
+  toolchain: {go: "1.21.13", gotoolchain_local: true}

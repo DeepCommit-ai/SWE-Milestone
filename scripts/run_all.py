@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
+from harness.e2e.quarantine import image_for_repo, load_quarantine_env, quarantine_coverage_errors
+
 
 def _adc_project() -> str | None:
     """Read quota_project_id from the host ADC file (Vertex project default)."""
@@ -73,94 +75,6 @@ def _load_dotenv_files() -> None:
         os.environ.setdefault(key, val)  # a real shell-exported var wins
 
 
-def _assert_wheelhouse_excludes(wheelhouse: str, forbid: list[str]) -> None:
-    """Fail closed if the offline quarantine wheelhouse contains an artifact
-    whose distribution name matches a forbidden prefix (the repo-under-test's own
-    package). Without this, an un-audited wheelhouse could silently serve the
-    answer offline via PIP_FIND_LINKS, defeating the network deny. See
-    docs/quarantine.md.
-    """
-    norm_forbid = [f.strip().lower().replace("_", "-") for f in forbid if f.strip()]
-    if not norm_forbid:
-        return
-    offending = []
-    for name in os.listdir(wheelhouse):
-        low = name.lower().replace("_", "-")
-        if not low.endswith((".whl", ".tar.gz", ".zip")):
-            continue
-        if any(low.startswith(pref + "-") for pref in norm_forbid):
-            offending.append(name)
-    if offending:
-        print(
-            f"Error: quarantine wheelhouse {wheelhouse} contains forbidden "
-            f"artifact(s) {sorted(offending)} matching wheelhouse_forbid={forbid}. "
-            f"Refusing to run — this would serve the repo's own target source "
-            f"offline. Rebuild the wheelhouse with scripts/build_quarantine_wheelhouse.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
-    """Per-repo anti-cheat ("quarantine") policy → container env vars.
-
-    Quarantine prevents an agent from fetching the repo-under-test's own
-    target-version source (the answer) over the network: it denies the registry
-    serving that source and forces the package manager offline against a vetted
-    wheelhouse. The policy is **repo-intrinsic** (scikit denies PyPI, go-zero the
-    Go proxy, …), so it lives once per repo in `quarantine_configs/<repo>.yaml`.
-
-    Auto-on: presence of the file IS the switch (no trial-config flag). Returns
-    {} (quarantine off) if the file is absent. Applied only to THIS repo's
-    container — not globally to the whole trial. Fails closed (sys.exit) on a
-    malformed policy or a wheelhouse that ships the repo's own package.
-    See docs/quarantine.md.
-    """
-    conf_path = project_root / "quarantine_configs" / f"{repo_name}.yaml"
-    if not conf_path.exists():
-        return {}
-    try:
-        with open(conf_path) as f:
-            q = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"Error: failed to read quarantine config {conf_path}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    env: dict[str, str] = {}
-    dd = q.get("deny_domains")
-    dc = q.get("deny_cidrs")
-    wh = q.get("pip_wheelhouse")
-    if dd:
-        env["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
-    if dc:
-        env["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
-    if wh:
-        # Expand ${EVOCLAW_WHEELHOUSE_DIR} etc. so the policy file carries no
-        # host-specific absolute path (set the base once in .env_private).
-        wh = str(Path(os.path.expandvars(str(wh))).expanduser().resolve())
-        if not Path(wh).is_dir():
-            print(f"Error: {conf_path}: pip_wheelhouse not found: {wh} "
-                  f"(is EVOCLAW_WHEELHOUSE_DIR set in .env_private?)", file=sys.stderr)
-            sys.exit(1)
-        # Fail closed if the wheelhouse ships the repo's own package — an
-        # un-audited wheelhouse must not be able to serve the answer offline.
-        forbid = q.get("wheelhouse_forbid") or []
-        if isinstance(forbid, str):
-            forbid = [forbid]
-        _assert_wheelhouse_excludes(wh, forbid)
-        if not forbid:
-            print(
-                f"Warning: {conf_path}: pip_wheelhouse set without wheelhouse_forbid "
-                f"— cannot assert the wheelhouse excludes the repo's own package "
-                f"(see docs/quarantine.md).",
-                file=sys.stderr,
-            )
-        else:
-            env["EVOCLAW_WHEELHOUSE_FORBID"] = ",".join(forbid)
-        env["EVOCLAW_PIP_WHEELHOUSE"] = wh
-    return env
-
-
 def discover_repos(data_root: Path, repo_filters: list[str] | None = None) -> list[Path]:
     """Find all repo directories in data_root that contain metadata.json."""
     repos = []
@@ -186,29 +100,6 @@ def _image_exists(ref: str) -> bool:
         ).returncode
         == 0
     )
-
-
-def get_image_name(repo_name: str) -> str:
-    """Derive Docker image name from repo directory name (lowercase).
-
-    Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default: v0.9).
-    When the DEFAULT pin is absent locally, falls back to :latest with a loud
-    warning (mirrors harness/e2e/image_version.py; never silent, and never
-    falls back when the tag was set explicitly).
-    """
-    env_tag = os.environ.get("EVOCLAW_IMAGE_TAG")
-    tag = env_tag or "v0.9"
-    base = f"{repo_name.lower()}/base"
-    ref = f"{base}:{tag}"
-    if _image_exists(ref):
-        return ref
-    if env_tag is None and _image_exists(f"{base}:latest"):
-        print(
-            f"⚠️  WARNING: {ref} not found locally; falling back to {base}:latest "
-            f"(content unverified — run scripts/pull_images.sh, see EVOCLAW_IMAGE_TAG)"
-        )
-        return f"{base}:latest"
-    return ref
 
 
 def generate_collect_config(
@@ -298,11 +189,16 @@ def build_cmd(
     api_router: bool,
     force: bool,
     milestones: str | None = None,
+    project_root: Path | None = None,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
     trial_dir = repo / "e2e_trial" / trial_name
     metadata_path = trial_dir / "trial_metadata.json"
+    # Quarantine repos run offline, so use the offline-closure image
+    # (base-offline:latest) baked with the B-version dependency closure.
+    _root = project_root or Path(__file__).resolve().parent.parent
+    image = image_for_repo(repo_name, _root)
 
     if not force and trial_dir.exists() and metadata_path.exists():
         # Resume reuses the existing trial dir, where --milestones already wrote
@@ -316,7 +212,7 @@ def build_cmd(
     cmd = [
         sys.executable, "-m", "harness.e2e.run_e2e",
         "--repo-name", repo_name,
-        "--image", get_image_name(repo_name),
+        "--image", image,
         "--srs-root", str(repo / "srs"),
         "--workspace-root", str(repo),
         "--agent", agent,
@@ -356,6 +252,12 @@ def main():
              "('10') or a percentage ('50%%'). Overrides 'milestones:' in the trial config. "
              "Selection is the first N in topological order (prerequisites always included), "
              "written per-trial to milestone_selection.txt; the dataset is never modified.",
+    )
+    parser.add_argument(
+        "--unprotected", action="store_true",
+        help="Bypass the quarantine coverage gate and launch even if a repo's "
+             "anti-cheat policy is missing/incomplete. Scores from unprotected "
+             "repos can be tainted by registry answer-fetch (see issue #12).",
     )
     args = parser.parse_args()
 
@@ -424,6 +326,18 @@ def main():
     if default_haiku_model:
         os.environ["UNIFIED_DEFAULT_HAIKU_MODEL"] = default_haiku_model
 
+    # Auto-compaction window: a single yaml flag (auto_compact_window: 300000)
+    # makes claude-code trigger native context compaction at that token budget
+    # instead of the model's pattern-matched default. Propagated to the agent
+    # container as CLAUDE_CODE_AUTO_COMPACT_WINDOW (ClaudeCodeFramework reads
+    # EVOCLAW_AUTO_COMPACT_WINDOW). Compaction is built-in agent behaviour, not
+    # a custom optimization — preserves benchmark parity. claude-code caps the
+    # value at the model's context window; for pattern-unknown third-party
+    # models that ceiling may fall back to 200K.
+    auto_compact_window = cfg.get("auto_compact_window", None)
+    if auto_compact_window:
+        os.environ["EVOCLAW_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+
     # Validate
     if not data_root.exists():
         print(f"Error: data_root not found: {data_root}", file=sys.stderr)
@@ -436,6 +350,25 @@ def main():
     if not repos:
         print(f"Error: no repos found in {data_root}", file=sys.stderr)
         sys.exit(1)
+
+    # Fail-closed quarantine coverage gate (issue #12): refuse to launch any
+    # repo whose anti-cheat policy is absent or doesn't deny its ecosystem's
+    # registries. 3 of 7 repos were confirmed cheating via exactly this gap
+    # (crates.io / Maven Central fetches of their own target-version source)
+    # because quarantine used to be silently opt-in.
+    project_root = Path(__file__).resolve().parent.parent
+    gate_errors = quarantine_coverage_errors([r.name for r in repos], project_root)
+    if gate_errors:
+        print("Quarantine coverage gate:", file=sys.stderr)
+        for e in gate_errors:
+            print(f"  - {e}", file=sys.stderr)
+        if args.unprotected:
+            print("  --unprotected set: launching anyway (scores may be tainted).",
+                  file=sys.stderr)
+        else:
+            print("Refusing to launch. Add/fix quarantine_configs/<repo>.yaml "
+                  "(see docs/quarantine.md) or pass --unprotected.", file=sys.stderr)
+            sys.exit(1)
 
     # Resolve trial name based on yaml + flags + existing trial dirs
     trial_name = resolve_trial_name(yaml_trial_name, repos, args.force, args.new)
@@ -484,7 +417,6 @@ def main():
     print("=" * 60)
 
     # Generate collect config for monitor.sh
-    project_root = Path(__file__).resolve().parent.parent
     log_dir = project_root / ".evoclaw"
     log_dir.mkdir(parents=True, exist_ok=True)
     collect_config = generate_collect_config(
@@ -507,7 +439,7 @@ def main():
         cmd, mode = build_cmd(
             repo, agent, model, timeout, trial_name,
             reasoning_effort, api_router, args.force,
-            milestones,
+            milestones, project_root,
         )
         # Per-repo quarantine: apply this repo's anti-cheat policy (if any) only
         # to its own container, via the worker subprocess env (not global).

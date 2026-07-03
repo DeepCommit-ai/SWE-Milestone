@@ -97,28 +97,45 @@ class AgentFramework(ABC):
         return []
 
     def get_quarantine_mounts(self) -> List[str]:
-        """Quarantine: mount the offline pip wheelhouse read-only.
+        """Quarantine: return extra Docker volume mounts for offline operation.
 
-        Shared across agents so EVERY framework (not just claude-code) gets the
-        offline dependency closure when EVOCLAW_PIP_WHEELHOUSE is set. Without
-        this, a non-claude agent under quarantine has PyPI firewalled but no
-        offline index, so legitimate dependency installs break. Pairs with
-        get_quarantine_env_vars(). See docs/quarantine.md.
+        The pip dependency closure is baked into the repo's base-offline image
+        under /wheelhouse by the closure builder — no host mount is needed or
+        performed.  Other ecosystems (cargo, go, maven, npm) also rely solely
+        on caches pre-baked into the image.  This method is kept for interface
+        compatibility and as an extension point for future mounts.
+        See docs/quarantine.md.
         """
-        wh = os.environ.get("EVOCLAW_PIP_WHEELHOUSE")
-        if wh and os.path.isdir(wh):
-            return ["-v", f"{wh}:/wheelhouse:ro"]
         return []
 
     def get_quarantine_env_vars(self) -> List[str]:
-        """Quarantine: force pip offline to the wheelhouse (no PyPI index).
+        """Quarantine: force the repo's package manager(s) offline.
 
         Belt to the EVOCLAW_DENY_* firewall suspenders, shared across agents.
-        See docs/quarantine.md.
+        pip reads the in-image /wheelhouse (baked by the closure builder) when
+        EVOCLAW_PIP_OFFLINE is set; cargo/go/maven/npm run offline against
+        their own image-baked caches. GOPROXY=off is additionally written into
+        /etc/environment + .bashrc by container_setup.lock_network (shell
+        profiles would override a bare docker -e). See docs/quarantine.md.
         """
-        if os.environ.get("EVOCLAW_PIP_WHEELHOUSE"):
-            return ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
-        return []
+        env: List[str] = []
+        if os.environ.get("EVOCLAW_PIP_OFFLINE"):
+            env += ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
+        if os.environ.get("EVOCLAW_CARGO_OFFLINE"):
+            env += ["-e", "CARGO_NET_OFFLINE=true"]
+        if os.environ.get("EVOCLAW_GO_OFFLINE"):
+            env += ["-e", "GOPROXY=off"]
+        if os.environ.get("EVOCLAW_MAVEN_OFFLINE"):
+            margs = "-o"
+            repo_local = os.environ.get("EVOCLAW_MAVEN_REPO_LOCAL")
+            if repo_local:
+                # The image's populated cache lives under root's home; the
+                # agent runs as fakeroot, whose own ~/.m2 starts empty.
+                margs += f" -Dmaven.repo.local={repo_local}"
+            env += ["-e", f"MAVEN_ARGS={margs}"]
+        if os.environ.get("EVOCLAW_NPM_OFFLINE"):
+            env += ["-e", "npm_config_offline=true"]
+        return env
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return the reasoning effort level actually used by the agent.

@@ -235,6 +235,7 @@ class MilestoneRunner:
             workdir="/testbed",
             agent_name=self.agent_name,
             agent_framework_name=self.agent_name,
+            repo_name=self.workspace_root.parent.name,  # authoritative repo id (F2)
         )
 
         # Log directory

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import signal
 import sys
@@ -1129,6 +1130,20 @@ class E2ETrialRunner:
         resume_subprocess_retry_limit = int(getattr(config, "resume_subprocess_retry_limit", 0) or 0)
         recovery_wait_seconds = int(getattr(config, "recovery_wait_seconds", 60) or 0)
 
+        # Graceful HTTP-529 server-overload backoff config. Server overload is a
+        # TRANSIENT condition distinct from a genuine quota rate-limit: instead of
+        # a long sleep we exponentially back off (base → cap) and only give up,
+        # gracefully and resumably, once we've spent `giveup` continuous wall-clock
+        # seconds backing off without any successful agent turn in between.
+        overload_backoff_base = int(getattr(config, "overload_backoff_base_seconds", 20) or 20)
+        overload_backoff_cap = int(getattr(config, "overload_backoff_cap_seconds", 300) or 300)
+        overload_giveup_seconds = int(getattr(config, "overload_giveup_seconds", 3600) or 3600)
+        # Accumulated continuous-overload wall-clock seconds; reset to 0 on any
+        # successful agent turn so isolated overloads don't accumulate over hours.
+        overload_backoff_total = 0
+        # Current backoff step (the un-jittered delay to use on the NEXT overload).
+        overload_backoff_step = overload_backoff_base
+
         while not dag.is_done() and no_progress_count < max_no_progress_attempts:
             if first_run:
                 if resume_session_first:
@@ -1269,6 +1284,13 @@ class E2ETrialRunner:
                     f"Agent recover {recover_count} completed" + (" ✓" if success else " ✗ (failed)")
                 )
 
+            if success:
+                # A successful agent turn means the endpoint is healthy again;
+                # forget any accumulated continuous-overload time so isolated 529s
+                # spread across hours never add up to a spurious give-up.
+                overload_backoff_total = 0
+                overload_backoff_step = overload_backoff_base
+
             if not success:
                 # Check for fatal configuration errors - no point retrying
                 if self.agent_runner._last_fatal_error:
@@ -1317,6 +1339,49 @@ class E2ETrialRunner:
                         self.agent_runner.invalidate_persistent_session(reason="invalid_session")
                     except Exception as e:
                         logger.warning(f"Failed to invalidate persistent session: {e}")
+                # Transient server overload (HTTP 529): fast exponential backoff
+                # instead of a long rate-limit sleep. Only when there is NO parsed
+                # real reset time — a genuine quota with a parsed reset falls
+                # through to the rate-limit long-sleep below (CRITICAL #2).
+                if self.agent_runner._last_overload and not self.agent_runner._rate_limit_reset_seconds:
+                    # Give up gracefully once we've spent the whole continuous-overload
+                    # budget backing off without a single successful turn in between.
+                    if overload_backoff_total >= overload_giveup_seconds:
+                        logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        orchestrator_logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        _set_last_run_summary("endpoint_unavailable")
+                        return False
+                    # Exponential step capped at the cap, with ±20% jitter so two
+                    # concurrent repos hitting 529 don't re-synchronize their retries.
+                    base_delay = min(overload_backoff_step, overload_backoff_cap)
+                    delay = max(1, int(base_delay * random.uniform(0.8, 1.2)))
+                    logger.warning(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)...",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    orchestrator_logger.info(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    # Backoff waits must not count as "no progress" (mirror rate-limit).
+                    no_progress_count = max(0, no_progress_count - 1)
+                    # Best-effort credential refresh, but never skip the backoff.
+                    if self.agent_runner.refresh_container_credentials():
+                        logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                        orchestrator_logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                    time.sleep(delay)
+                    overload_backoff_total += delay
+                    overload_backoff_step = min(overload_backoff_step * 2, overload_backoff_cap)
+                    # Session is still valid - resume it (overload is external, not a session problem).
+                    continue
                 # Check if this was a rate limit - sleep until reset
                 if self.agent_runner._last_rate_limit:
                     reset_secs = self.agent_runner._rate_limit_reset_seconds
@@ -1753,6 +1818,15 @@ def _run_resume_mode(args):
 
     # Extract config from original metadata, allow CLI overrides
     metadata = trial_state.original_config
+    # Resume corollary of F2-b: keep a resumed --unprotected baseline OPEN. The
+    # flag isn't a CLI arg the second time, so read it from the persisted metadata
+    # and set the signal BEFORE the orchestrator (and its ContainerSetup) is
+    # constructed — otherwise __init__'s policy recovery would silently re-harden
+    # a trial that ran with the network open before the interruption.
+    from harness.e2e.quarantine import metadata_wants_unprotected
+    if metadata_wants_unprotected(metadata) and not os.environ.get("EVOCLAW_UNPROTECTED"):
+        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+        logger.info("Resume: trial was launched --unprotected; keeping it open (no re-harden)")
     # --model override for resume (e.g., fix a wrong model after fatal error)
     if getattr(args, '_model_explicitly_set', False):
         logger.info(f"Overriding model: {metadata.get('model')} → {args.model}")
@@ -1855,6 +1929,13 @@ Example:
     parser.add_argument("--repo-name", default=None, help="Repository name (required for fresh start)")
     parser.add_argument("--milestone-version", default="test_multi_stage_v2", help="Milestone version string")
     parser.add_argument("--image", default=None, help="Base docker image for agent (required for fresh start)")
+    parser.add_argument(
+        "--unprotected",
+        action="store_true",
+        help="Bypass the quarantine fail-closed guard (run a repo that has a "
+        "policy WITHOUT applying it — scores may be tainted). Normally you launch "
+        "via scripts/run_all.py, which applies the policy and runs the gate.",
+    )
 
     # Paths (required for fresh start, optional for resume)
     parser.add_argument(
@@ -1967,6 +2048,12 @@ Example:
 
     args = parser.parse_args()
 
+    # --unprotected: signal ContainerSetup NOT to recover quarantine from policy
+    # (operator explicitly wants an open baseline run) — covers fresh AND resume,
+    # both of which construct ContainerSetup (F2-b).
+    if getattr(args, "unprotected", False):
+        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+
     # Track whether --model was explicitly provided (vs default)
     args._model_explicitly_set = '--model' in sys.argv
 
@@ -1988,6 +2075,21 @@ Example:
 
     if missing_args:
         parser.error(f"the following arguments are required for fresh start: {', '.join(missing_args)}")
+
+    # Fail-closed quarantine guard (#3): scripts/run_all.py applies the per-repo
+    # policy env + runs the coverage gate; a direct run_e2e launch bypasses both.
+    # Refuse to start a repo that HAS a policy but wasn't given the quarantine
+    # env (EVOCLAW_QUARANTINE), unless --unprotected is explicitly set.
+    from harness.e2e.quarantine import quarantine_guard_error
+    _guard = quarantine_guard_error(
+        args.repo_name,
+        Path(__file__).resolve().parent.parent.parent,
+        quarantine_active=bool(os.environ.get("EVOCLAW_QUARANTINE")),
+        unprotected=args.unprotected,
+    )
+    if _guard:
+        logger.error(_guard)
+        sys.exit(1)
 
     # Setup Paths
     workspace_root = args.workspace_root.resolve()
@@ -2188,6 +2290,11 @@ Example:
         "prompt_version": args.prompt_version,
         "timeout_seconds": args.timeout,
         "reasoning_effort": effective_reasoning_effort,
+        # Native claude-code context-compaction window in tokens. Set from the
+        # trial config `auto_compact_window` (propagated via the
+        # EVOCLAW_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
+        # display it. None when the config doesn't set it.
+        "auto_compact_window": os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,
@@ -2198,6 +2305,9 @@ Example:
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
         "api_router": args.api_router or args.drop_params,
+        # Persist --unprotected so a resumed open baseline stays open (isn't
+        # silently re-hardened by ContainerSetup's policy recovery on resume).
+        "unprotected": bool(args.unprotected),
     }
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:

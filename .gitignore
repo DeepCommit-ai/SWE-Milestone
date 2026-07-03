@@ -273,3 +273,6 @@ trial_configs/*
 
 # Ad-hoc analysis notes (not for source control)
 docs/openhands_analysis/
+
+# Superpowers process artifacts (plans, scratch) — not for source control
+docs/superpowers/

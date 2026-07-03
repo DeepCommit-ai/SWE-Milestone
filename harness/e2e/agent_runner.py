@@ -95,6 +95,7 @@ class AgentRunner:
         self.logger = logging.getLogger(f"agent.{container_name}")
         self._last_auth_error = False  # Set by _execute_with_streaming on auth failures
         self._last_rate_limit = False  # Set by _execute_with_streaming on rate limit
+        self._last_overload = False  # Set on transient server-overload (HTTP 529) responses
         self._rate_limit_reset_seconds: Optional[int] = None  # Seconds until rate limit resets
         # Set when repeated 500 errors suggest a possible model/backend compatibility issue (inferred).
         self._last_model_unavailable = False
@@ -145,6 +146,22 @@ class AgentRunner:
         "too many requests",
         '"code":"429"',
         '"code":429',
+    ]
+
+    # Server-side TRANSIENT overload (HTTP 529) indicators — distinct from a
+    # genuine quota rate-limit. These should trigger a fast exponential backoff
+    # retry rather than the long rate-limit sleep. Tokens are kept STRUCTURED
+    # (the overloaded_error token + quoted-JSON 529 forms + the GLM bigmodel
+    # Chinese phrases) so a bare "overloaded"/"529" in viewed source/log/prose
+    # cannot match and misroute an unrelated failure into 529 backoff (#8).
+    _OVERLOAD_PATTERNS = [
+        "overloaded_error",
+        '"code":"529"',
+        '"code":529',
+        '"status":529',
+        '"http_status":529',
+        "访问量过大",
+        "访问量较大",
     ]
 
     # Resume/session invalidation indicators (seen in Gemini CLI resume failures)
@@ -210,6 +227,23 @@ class AgentRunner:
                 return True
         return False
 
+    def _detect_overload(self, output: str) -> bool:
+        """Check if agent output indicates a transient server overload (HTTP 529).
+
+        Mirrors ``_detect_rate_limit``: only OAuth-based agents (claude-code,
+        codex, gemini-cli) are scanned, and only the trailing ``output[-5000:]``
+        tail, so source/log text the agent merely *viewed* cannot cause false
+        positives. Overload is treated distinctly from a quota rate-limit so the
+        recover loop can fast-backoff-retry instead of long-sleeping.
+        """
+        if self.agent_name not in self._OAUTH_AGENTS:
+            return False
+        tail = output[-5000:].lower()
+        for pattern in self._OVERLOAD_PATTERNS:
+            if pattern in tail:
+                return True
+        return False
+
     def _detect_invalid_session_error(self, output: str) -> bool:
         """Check if output indicates an invalid/expired local session reference."""
         output_lower = output.lower()
@@ -257,6 +291,10 @@ class AgentRunner:
             self.logger.warning("⏳ Rate limit detected in %s output", context)
         else:
             self._rate_limit_reset_seconds = None
+
+        self._last_overload = self._detect_overload(output)
+        if self._last_overload:
+            self.logger.warning("🌊 Server overload (HTTP 529) detected in %s output", context)
 
         self._last_model_unavailable = self._detect_gemini_model_compatibility_issue(output)
         self._last_model_hint = self._build_model_hint() if self._last_model_unavailable else None
@@ -641,6 +679,7 @@ class AgentRunner:
             self.logger.error(f"Failed to execute agent: {e}")
             self._last_auth_error = False
             self._last_rate_limit = False
+            self._last_overload = False
             self._rate_limit_reset_seconds = None
             self._last_model_unavailable = False
             self._last_model_hint = None
@@ -816,6 +855,7 @@ class AgentRunner:
 
         self._last_auth_error = False
         self._last_rate_limit = False
+        self._last_overload = False
         self._rate_limit_reset_seconds = None
         self._last_model_unavailable = False
         self._last_model_hint = None
@@ -841,6 +881,7 @@ class AgentRunner:
         self._append_session_history({"event": "resume_attempt", "session_id": session_id})
         self._last_auth_error = False
         self._last_rate_limit = False
+        self._last_overload = False
         self._rate_limit_reset_seconds = None
         self._last_model_unavailable = False
         self._last_model_hint = None
@@ -948,6 +989,7 @@ class AgentRunner:
             self.logger.error(f"Resume timed out after {timeout_minutes:.1f} minutes")
             self._last_auth_error = False
             self._last_rate_limit = False
+            self._last_overload = False
             self._rate_limit_reset_seconds = None
             self._last_model_unavailable = False
             self._last_model_hint = None
@@ -968,6 +1010,7 @@ class AgentRunner:
             self.logger.error(f"Failed to resume session: {e}")
             self._last_auth_error = False
             self._last_rate_limit = False
+            self._last_overload = False
             self._rate_limit_reset_seconds = None
             self._last_model_unavailable = False
             self._last_model_hint = None

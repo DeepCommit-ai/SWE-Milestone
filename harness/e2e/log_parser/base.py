@@ -507,7 +507,19 @@ class AgentLogParser(ABC):
                 f"agent jsonl logs are missing or the per-agent log_parser "
                 f"failed to extract per-message/turn usage."
             )
-        total_turns = sum(ms.turns for ms in milestone_stats.values()) if milestone_stats else 0
+        # When milestone_stats is empty — e.g. the container was already stopped
+        # at extraction time, so get_milestone_times() returned {} and no unit
+        # could be attributed to a milestone window — fall back to the raw
+        # parsed-unit count rather than reporting 0. total_turns equals
+        # len(native_usage_units) for healthy trials anyway (every unit lands in
+        # some milestone window). This guards the DeepSeek/Qwen failure mode:
+        # "total_turns=0 but 743 units were parsed" because the container died
+        # before stats extraction. (native_usage_units empty → 0, unchanged.)
+        total_turns = (
+            sum(ms.turns for ms in milestone_stats.values())
+            if milestone_stats
+            else len(native_usage_units)
+        )
 
         # Derive session counts from session_history.jsonl (authoritative)
         # when available, since stdout-based counts can miss sessions whose

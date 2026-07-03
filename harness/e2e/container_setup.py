@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Optional
 
 from harness.e2e.agents import AgentFramework, get_agent_framework
+from harness.e2e.quarantine import (
+    FIREWALL_EXEMPTABLE_DOMAINS,
+    QUARANTINE_MIRROR_DOMAINS,
+    cidr_overlaps_any,
+    goproxy_value,
+    load_quarantine_env,
+)
 
 logger = logging.getLogger("e2e.container_setup")
 
@@ -60,6 +67,7 @@ WHITELISTED_DOMAINS = [
     "static.crates.io",
     "index.crates.io",
     "rustup.rs",
+    "static.rust-lang.org",  # official rust toolchain binary source (rustc/cargo/std); safe — cannot serve a repo's @B crate (those ride crates.io, still denied under quarantine)
     # === Maven / Java ===
     "repo1.maven.org",
     "repo.maven.apache.org",
@@ -117,6 +125,10 @@ CODE_HOSTING_DOMAINS = [
     "ghfast.top",
     "ghproxy.com",
     "gitclone.com",
+    # NOTE: public module-proxy mirror domains (proxy.golang.org, goproxy.cn, …)
+    # are NOT here — they are a cross-ecosystem answer channel poisoned only in
+    # quarantine containers via QUARANTINE_MIRROR_DOMAINS (quarantine.py) +
+    # _poison_domain_list, so non-quarantine baselines keep working go fetches.
 ]
 
 # Well-known CDN CIDR ranges to handle IP rotation during long trials.
@@ -127,6 +139,89 @@ CDN_CIDR_RANGES = [
     "142.250.0.0/15",  # Google
     "216.239.32.0/19",  # Google
 ]
+
+
+def _poison_domain_list(quarantine_active: bool) -> list[str]:
+    """Domains to blackhole in /etc/hosts for this container.
+
+    Code-hosting sites are poisoned in every container (defense in depth). The
+    public module-proxy mirror domains (QUARANTINE_MIRROR_DOMAINS) are a
+    cross-ecosystem answer channel and are added ONLY under quarantine, so a
+    non-quarantine/baseline container keeps working go module fetches (#4).
+    """
+    return list(CODE_HOSTING_DOMAINS) + (
+        list(QUARANTINE_MIRROR_DOMAINS) if quarantine_active else []
+    )
+
+
+def _interpret_probe(returncode: int, stdout: str) -> bool:
+    """Interpret an in-container reachability probe's output.
+
+    True (reachable) on a REACH marker, False (blocked) on BLOCK. A result with
+    neither marker means the probe itself failed to run (python3 missing, docker
+    exec error) — INDETERMINATE, not 'blocked', so raise rather than let a
+    broken probe silently pass verification (fail-open) (#11).
+    """
+    if "REACH" in stdout:
+        return True
+    if "BLOCK" in stdout:
+        return False
+    raise RuntimeError(
+        f"network probe did not run (rc={returncode}, stdout={stdout!r}) — "
+        f"cannot determine reachability"
+    )
+
+
+def _quarantine_env_from_image(image_name: str, project_root=None) -> dict:
+    """Recover the full quarantine env for the repo this image belongs to, from
+    the on-disk policy file.
+
+    Used when the process env lacks the quarantine vars — a direct `run_e2e
+    --resume-trial` or a manual `run_milestone` don't inject q_env the way
+    run_all does, and without this the mirror-domain poison + registry deny would
+    silently not apply (F2 de-harden). The signal is a DISK FACT (does the
+    image's repo have a quarantine_configs/<repo>.yaml), not a propagated env
+    var, so it survives env loss. A repo with no config recovers {} and stays
+    unprotected (parity preserved). Docker repo names are lowercase while config
+    filenames may not be (e.g. BurntSushi), so match case-insensitively.
+    """
+    repo_lower = (image_name or "").split("/")[0].split(":")[0].strip().lower()
+    if not repo_lower:
+        return {}
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
+    conf_dir = root / "quarantine_configs"
+    if not conf_dir.is_dir():
+        return {}
+    match = next(
+        (p.stem for p in sorted(conf_dir.glob("*.yaml")) if p.stem.lower() == repo_lower),
+        None,
+    )
+    if not match:
+        return {}
+    return load_quarantine_env(match, root)
+
+
+def _recover_quarantine_env(repo_name, image_name: str, project_root=None) -> dict:
+    """Recover the full quarantine env from the repo's on-disk policy, for the
+    env-less launch paths (direct run_e2e --resume-trial / manual run_milestone)
+    that don't inject it like run_all does.
+
+    Prefer the AUTHORITATIVE repo_name passed by the caller (a known fact) over
+    parsing the image name (a fragile signal that misparses a registry-prefixed
+    image and would silently leave a policy'd repo unprotected — F2-c). Match
+    case-insensitively (config filenames may be mixed-case, e.g. BurntSushi,
+    while docker repos are lowercase). Returns {} for a non-quarantine repo
+    (parity preserved).
+    """
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
+    conf_dir = root / "quarantine_configs"
+    if repo_name and conf_dir.is_dir():
+        stems = {p.stem.lower(): p.stem for p in conf_dir.glob("*.yaml")}
+        match = stems.get(str(repo_name).strip().lower())
+        if match:
+            return load_quarantine_env(match, root)
+    # Fallback: parse the image (only when repo_name is absent or unmatched).
+    return _quarantine_env_from_image(image_name, project_root)
 
 
 class ContainerSetup:
@@ -149,6 +244,7 @@ class ContainerSetup:
         drop_params: bool = False,
         api_router: bool = False,
         reasoning_effort: Optional[str] = None,
+        repo_name: Optional[str] = None,
     ):
         """Initialize container setup.
 
@@ -179,6 +275,24 @@ class ContainerSetup:
         self._framework: AgentFramework = get_agent_framework(agent_framework_name, **framework_kwargs)
         self.api_router = api_router or drop_params
         self._agent_framework_name = agent_framework_name
+        self.repo_name = repo_name
+
+        # F2: run_all injects the quarantine env into the worker subprocess; a
+        # direct run_e2e --resume-trial or a manual run_milestone does NOT.
+        # Recover it from the repo's on-disk policy HERE (in __init__), BEFORE
+        # start_container reads it for the offline -e flags and before
+        # lock_network/verify read it. Skip when EVOCLAW_QUARANTINE is already
+        # present (run_all path — leave it so a canary env override still applies)
+        # or when EVOCLAW_UNPROTECTED is set (operator explicitly wants an open
+        # baseline). Uses the authoritative repo_name, not a fragile image parse.
+        if not os.environ.get("EVOCLAW_QUARANTINE") and not os.environ.get("EVOCLAW_UNPROTECTED"):
+            _recovered = _recover_quarantine_env(repo_name, image_name)
+            if _recovered:
+                os.environ.update(_recovered)
+                logger.info(
+                    f"Quarantine env recovered from policy for "
+                    f"'{repo_name or image_name.split('/')[0]}' (env-less launch path)"
+                )
 
     def get_agent_mounts(self) -> list[str]:
         """Return Docker volume mount arguments for the agent.
@@ -375,6 +489,7 @@ try:
         '/usr/local/lib/node_modules',  # Global npm modules
         '/root/.npm',            # npm cache
         '/root/.cache',          # General cache (pip, etc.)
+        '/root/.m2',             # Maven local repo (fakeroot needs rw under the quarantine maven.repo.local redirect)
     ]
 
     for toolchain_dir in toolchain_dirs:
@@ -1030,13 +1145,17 @@ echo "Git history truncated successfully"
         # registry fronted by that CDN becomes unreachable even via raw curl.
         # Needed because EVOCLAW_DENY_DOMAINS only drops DNS-resolved IPs, while
         # registries like PyPI ride a shared CDN range (Fastly 151.101.0.0/16)
-        # that CDN_CIDR_RANGES would otherwise accept wholesale. Keep Google
-        # (Vertex) and Cloudflare (claude.ai) ranges so the LLM path survives.
-        _deny_cidrs = {c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()}
+        # that CDN_CIDR_RANGES would otherwise accept wholesale. Overlap
+        # matching (not string equality): the builtin Cloudflare accept is
+        # 104.16.0.0/13 while a policy may deny 104.16.0.0/12 — equality would
+        # leave the /13 accepted and the registry reachable. LLM paths survive
+        # on other ranges (Vertex = Google, api.anthropic.com = Anthropic ASN).
+        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
         if _deny_cidrs:
-            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges: {sorted(_deny_cidrs)}")
+            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges overlapping: {sorted(_deny_cidrs)}")
         for cidr in CDN_CIDR_RANGES:
-            if cidr in _deny_cidrs:
+            if _deny_cidrs and cidr_overlaps_any(cidr, _deny_cidrs):
+                logger.warning(f"  CDN range {cidr} overlaps a denied CIDR — not accepted")
                 continue
             accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
 
@@ -1088,7 +1207,11 @@ echo "iptables rules applied successfully"
         logger.info("  iptables rules applied")
 
         # --- Step 4: Poison /etc/hosts ---
-        hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in CODE_HOSTING_DOMAINS)
+        # Mirror domains (go proxies) are poisoned only under quarantine so a
+        # non-quarantine/baseline container keeps working go fetches (#4).
+        _quarantine = bool(os.environ.get("EVOCLAW_QUARANTINE"))
+        _poison = _poison_domain_list(_quarantine)
+        hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in _poison)
         hosts_script = f"""
 # Append code-hosting blocks to /etc/hosts
 cat >> /etc/hosts << 'HOSTS_EOF'
@@ -1099,20 +1222,29 @@ HOSTS_EOF
 
 # Lock permissions so non-root cannot edit
 chmod 644 /etc/hosts
-echo "/etc/hosts poisoned with {len(CODE_HOSTING_DOMAINS)} domains"
+echo "/etc/hosts poisoned with {len(_poison)} domains"
 """
         subprocess.run(
             ["docker", "exec", self.container_name, "/bin/sh", "-c", hosts_script],
             capture_output=True,
             text=True,
         )
-        logger.info(f"  /etc/hosts poisoned ({len(CODE_HOSTING_DOMAINS)} domains)")
+        logger.info(f"  /etc/hosts poisoned ({len(_poison)} domains)")
 
         # --- Step 5: Set Go env vars ---
-        go_env_script = """
-# Configure Go to use module proxy instead of direct VCS
+        # GOPROXY=off under go quarantine (the proxy is the answer channel) OR
+        # any quarantine (mirror domains are hosts-poisoned above, so a bare
+        # proxy URL would resolve to 0.0.0.0 and every fetch would fail). A
+        # non-quarantine container keeps the sanctioned proxy. Shell profiles
+        # override docker -e, so this MUST be written here (#4).
+        _goproxy = goproxy_value(
+            go_offline=bool(os.environ.get("EVOCLAW_GO_OFFLINE")),
+            quarantine_active=_quarantine,
+        )
+        go_env_script = f"""
+# Configure Go module fetching (quarantine-aware)
 cat >> /etc/environment << 'EOF'
-GOPROXY=https://proxy.golang.org,direct
+GOPROXY={_goproxy}
 GONOSUMCHECK=*
 GONOSUMDB=*
 EOF
@@ -1120,11 +1252,11 @@ EOF
 # Also set for fakeroot's shell profile
 mkdir -p /home/fakeroot
 cat >> /home/fakeroot/.bashrc << 'EOF'
-export GOPROXY=https://proxy.golang.org,direct
+export GOPROXY={_goproxy}
 export GONOSUMCHECK=*
 export GONOSUMDB=*
 EOF
-echo "Go env vars configured"
+echo "Go env vars configured (GOPROXY={_goproxy})"
 """
         subprocess.run(
             ["docker", "exec", self.container_name, "/bin/sh", "-c", go_env_script],
@@ -1152,6 +1284,53 @@ echo "Go env vars configured"
         self.verify_network_lockdown()
 
         logger.info("Network lockdown applied successfully")
+
+    def _url_reachable_in_container(self, url: str, user: str = "fakeroot") -> bool:
+        """True if `url`'s host:port is reachable (TCP) from inside the container.
+
+        Uses python3 (guaranteed present by init) rather than curl, so the
+        probe is real even on images without curl (e.g. the scikit base). A
+        successful TCP connect proves the channel is open — that is exactly
+        what the iptables IP/CIDR deny is meant to prevent, so a full HTTP
+        round-trip is unnecessary. Only the first IPv4 address is tried, with
+        a short timeout, so a blocked (DROP'd) host fails fast instead of
+        walking every CDN anycast IP. Mirrors docs/quarantine.md.
+        """
+        probe_script = (
+            "import sys, socket\n"
+            "from urllib.parse import urlparse\n"
+            "u = urlparse(sys.argv[1])\n"
+            "port = u.port or (443 if u.scheme == 'https' else 80)\n"
+            "try:\n"
+            "    infos = socket.getaddrinfo(u.hostname, port, socket.AF_INET, socket.SOCK_STREAM)\n"
+            "    fam, typ, proto, _, sa = infos[0]\n"
+            "    s = socket.socket(fam, typ, proto)\n"
+            "    s.settimeout(4)\n"
+            "    s.connect(sa)\n"
+            "    s.close()\n"
+            "    print('REACH')\n"
+            "except Exception:\n"
+            "    print('BLOCK')\n"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "exec", "--user", user,
+                    "-e", f"HOME=/home/{user}" if user != "root" else "HOME=/root",
+                    self.container_name, "python3", "-c", probe_script, url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as e:
+            # The probe (docker exec + in-container DNS/connect) outran 15s.
+            # Treat as indeterminate and fail closed — never read a hung probe
+            # as 'blocked' (#11).
+            raise RuntimeError(
+                f"network probe timed out after 15s for {url} — cannot verify lockdown"
+            ) from e
+        return _interpret_probe(result.returncode, result.stdout)
 
     def verify_network_lockdown(self) -> bool:
         """Verify that network lockdown is active in the container.
@@ -1219,26 +1398,81 @@ echo "Go env vars configured"
         # covers code hosting; a typo'd deny CIDR/domain would otherwise pass
         # verification while leaving the exact cheat channel (e.g. PyPI) open.
         _deny_domains = [d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()]
+        # A denied registry is exempt from the reachability assertion ONLY if the
+        # policy DECLARES it un-CIDR-blockable (EVOCLAW_FIREWALL_EXEMPT — e.g.
+        # proxy.golang.org shares Vertex's Google range, defended by /etc/hosts
+        # poison + GOPROXY=off). Everything else MUST verify unreachable. The old
+        # runtime "resolved IPs all fall in a still-ACCEPTed CDN range" inference
+        # is gone: a typo'd/omitted deny_cidr made a normal registry look exempt
+        # and silently pass (fail-open, #2b). A missing deny_cidr is now caught up
+        # front by the coverage gate; a wrong one is caught by this assertion.
+        # Only honor exempts that are in the code-level whitelist (defense in
+        # depth: the gate rejects illegal exempts at launch, but --unprotected
+        # bypasses the gate — verify must not skip a CIDR-blockable registry just
+        # because the policy mislabeled it exempt) (F1).
+        _exempt = {
+            d.strip().lower()
+            for d in os.environ.get("EVOCLAW_FIREWALL_EXEMPT", "").split(",")
+            if d.strip()
+        } & FIREWALL_EXEMPTABLE_DOMAINS
+        _verified = 0
         for host in _deny_domains:
-            probe = subprocess.run(
-                [
-                    "docker", "exec", "--user", "fakeroot",
-                    "-e", "HOME=/home/fakeroot", self.container_name,
-                    "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                    "--connect-timeout", "3", "--max-time", "5",
-                    f"https://{host}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if probe.returncode == 0 and probe.stdout.strip().startswith("2"):
+            if host.lower() in _exempt:
+                logger.warning(
+                    f"  Quarantine: '{host}' firewall-exempt (declared "
+                    f"un-CIDR-blockable) — defended by /etc/hosts poison + "
+                    f"offline switch (residual until SNI proxy)."
+                )
+                continue
+            if self._url_reachable_in_container(f"https://{host}"):
                 raise RuntimeError(
                     f"Quarantine verification failed: denied host '{host}' is still "
                     f"reachable — EVOCLAW_DENY_DOMAINS/EVOCLAW_DENY_CIDRS not effective"
                 )
-        if _deny_domains:
-            logger.info(f"  Quarantine verified: {len(_deny_domains)} denied host(s) unreachable")
+            _verified += 1
+        if _verified:
+            logger.info(f"  Quarantine verified: {_verified} denied host(s) unreachable")
+
+        # Quarantine: probe the exact registry URLs of the observed cheats
+        # (e.g. the self-crate on static.crates.io, the -sources.jar on Maven
+        # Central). ANY successful connect — even an HTTP error response —
+        # means the answer-fetch channel is open; the deny must make connects
+        # fail. Uses python3 (guaranteed by init), not curl, so the check is
+        # real even on images that ship no curl (e.g. the scikit base).
+        _verify_urls = [u.strip() for u in os.environ.get("EVOCLAW_VERIFY_FETCH_URLS", "").split(",") if u.strip()]
+        for url in _verify_urls:
+            if self._url_reachable_in_container(url):
+                raise RuntimeError(
+                    f"Quarantine verification failed: answer-fetch URL still "
+                    f"reachable: {url}"
+                )
+        if _verify_urls:
+            logger.info(f"  Quarantine verified: {len(_verify_urls)} answer-fetch URL(s) blocked")
+
+        # Quarantine: fail closed if the image's pre-baked package cache
+        # contains the repo's own artifacts at a post-baseline version (the
+        # offline closure must not be able to serve the answer — the cache
+        # analogue of the pip wheelhouse_forbid audit).
+        _forbid_globs = [g.strip() for g in os.environ.get("EVOCLAW_CACHE_FORBID_GLOBS", "").split(",") if g.strip()]
+        for glob_pat in _forbid_globs:
+            audit = subprocess.run(
+                [
+                    "docker", "exec", self.container_name,
+                    "/bin/sh", "-c", f"ls -d {glob_pat} 2>/dev/null | head -5",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if audit.stdout.strip():
+                raise RuntimeError(
+                    f"Quarantine cache audit failed: forbidden artifact(s) in the "
+                    f"image cache match '{glob_pat}':\n{audit.stdout.strip()}\n"
+                    f"The offline cache could serve the repo's own target-version "
+                    f"source. Rebuild/clean the image before running."
+                )
+        if _forbid_globs:
+            logger.info(f"  Quarantine cache audit passed: {len(_forbid_globs)} forbid glob(s) matched nothing")
 
         # Verify sudo is revoked
         sudo_result = subprocess.run(
