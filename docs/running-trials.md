@@ -14,11 +14,11 @@ For single-milestone debugging, raw `run_e2e` invocation, result collection,
 
 ```bash
 # 1. Host paths — set once, auto-loaded every run (persists across shells)
-cp .env .env_private                     # then set EVOCLAW_DATA_ROOT in .env_private
+cp .env .env_private                     # then set SWE_MILESTONE_DATA_ROOT in .env_private
 
 # 2. Trial config
 cp trial_config.example.yaml trial_config.yaml
-# Edit: trial_name, agent, model  (data_root defaults to ${EVOCLAW_DATA_ROOT})
+# Edit: trial_name, agent, model  (data_root defaults to ${SWE_MILESTONE_DATA_ROOT})
 
 # 3. API credentials  (skip for Vertex/ADC; can also live in .env_private)
 export UNIFIED_API_KEY="sk-..."
@@ -411,7 +411,7 @@ shell-exported var still wins):
 
 | Variable | Description |
 |---|---|
-| `EVOCLAW_DATA_ROOT` | Where you downloaded SWE-Milestone-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
+| `SWE_MILESTONE_DATA_ROOT` | Where you downloaded SWE-Milestone-data. Trial configs use `data_root: ${SWE_MILESTONE_DATA_ROOT}`. |
 
 > **Quarantine (anti-cheat) is zero-touch.** It auto-applies to any repo that has
 > a `quarantine_configs/<repo>.yaml` policy — nothing to pass per run (a `🔒` marker

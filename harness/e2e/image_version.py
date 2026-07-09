@@ -11,12 +11,12 @@ remotely). Parse safety rests on one invariant, enforced by validate_component:
 repo_full and milestone never contain "__". "base" and "base-offline" are
 ordinary milestones — no special-casing anywhere.
 
-Version pinning: EVOCLAW_IMAGE_TAG env var, default DEFAULT_IMAGE_TAG.
+Version pinning: SWE_MILESTONE_IMAGE_TAG env var, default DEFAULT_IMAGE_TAG.
 Resolution rules (deliberately loud, never silent):
 - If <image>:<pinned> exists locally, use it.
 - If the pin came from the DEFAULT (env var not set) and <image>:latest exists,
   fall back to :latest with a prominent warning. The content is NOT verified.
-- If EVOCLAW_IMAGE_TAG is set explicitly, never fall back: reproducibility
+- If SWE_MILESTONE_IMAGE_TAG is set explicitly, never fall back: reproducibility
   runs must fail fast rather than grade against the wrong data version.
 
 The ONLY legacy branch in the project lives in parse_local_ref(): pre-v1.0
@@ -141,7 +141,7 @@ def resolve_image(image_base: str) -> str:
 
     image_base must not contain a tag (e.g. "swe-milestone/<rf>__milestone_001").
     """
-    env_tag = os.environ.get("EVOCLAW_IMAGE_TAG")
+    env_tag = os.environ.get("SWE_MILESTONE_IMAGE_TAG")
     tag = env_tag or DEFAULT_IMAGE_TAG
     ref = f"{image_base}:{tag}"
     if _image_exists(ref):
@@ -150,7 +150,7 @@ def resolve_image(image_base: str) -> str:
         print(
             f"⚠️  WARNING: {ref} not found locally; falling back to "
             f"{image_base}:latest (content unverified — run "
-            f"scripts/pull_images.sh or tag your images, see EVOCLAW_IMAGE_TAG)"
+            f"scripts/pull_images.sh or tag your images, see SWE_MILESTONE_IMAGE_TAG)"
         )
         return f"{image_base}:latest"
     # Let the caller fail with its normal image-not-found handling.
@@ -195,6 +195,9 @@ def _cli(argv: list[str] | None = None) -> int:
     import argparse
     import sys
 
+    from harness.e2e.env_guard import reject_legacy_env
+    reject_legacy_env()
+
     ap = argparse.ArgumentParser(
         prog="python3 -m harness.e2e.image_version",
         description="Emit hub<->local image plans from the version manifest. "
@@ -210,7 +213,7 @@ def _cli(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=hlp)
         p.add_argument("--org", default=os.environ.get("DOCKERHUB_ORG", "hyd2apse"))
         p.add_argument("--version", default=None,
-                       help="benchmark data version (default: EVOCLAW_IMAGE_TAG or "
+                       help="benchmark data version (default: SWE_MILESTONE_IMAGE_TAG or "
                             f"{DEFAULT_IMAGE_TAG})")
         p.add_argument("--repo", action="append", default=[], metavar="SHORT",
                        help="filter by short name (repeatable)")
@@ -223,7 +226,7 @@ def _cli(argv: list[str] | None = None) -> int:
                                 "builders only produce :latest)")
 
     args = ap.parse_args(argv)
-    version = args.version or os.environ.get("EVOCLAW_IMAGE_TAG") or DEFAULT_IMAGE_TAG
+    version = args.version or os.environ.get("SWE_MILESTONE_IMAGE_TAG") or DEFAULT_IMAGE_TAG
     manifest = args.manifest or default_manifest_path(version)
     rows = load_manifest(manifest)
 

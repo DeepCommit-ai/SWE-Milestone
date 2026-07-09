@@ -8,7 +8,7 @@ same tasks, same environments, same grading.
 
 | Axis | Format | Covers |
 |---|---|---|
-| **Benchmark data version** | `vX.Y` — the image tag (`EVOCLAW_IMAGE_TAG`, default in `harness/e2e/image_version.py`) | tasks, tests, image environments, **grading semantics** |
+| **Benchmark data version** | `vX.Y` — the image tag (`SWE_MILESTONE_IMAGE_TAG`, default in `harness/e2e/image_version.py`) | tasks, tests, image environments, **grading semantics** |
 | **Harness version** | git commits / tags | everything score-neutral (refactors, logging, agent integrations) |
 
 Images have no version identity of their own — their tag *is* the benchmark
@@ -36,7 +36,7 @@ There is no "backward compatible" benchmark change — only *comparable* and
    keep their old digest under the new tag (a free pointer op — pushing a
    retag uploads 0 bytes).
 3. `:latest` / `:staging` are floating build tags, never a published basis;
-   an explicit `EVOCLAW_IMAGE_TAG` never falls back.
+   an explicit `SWE_MILESTONE_IMAGE_TAG` never falls back.
 4. Containers launch with `--pull=never`: a missing local image fails loud,
    never a silent registry fetch.
 5. Results are append-only. Pre-v1.0 trials recorded old-format image names;

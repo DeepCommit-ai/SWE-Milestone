@@ -8,9 +8,9 @@
 #   ./scripts/monitor.sh <trial_name>
 
 # Path to EvoClaw-data (cloned from HuggingFace).
-# Recommended: leave this as ${EVOCLAW_DATA_ROOT} and set the real path ONCE in
+# Recommended: leave this as ${SWE_MILESTONE_DATA_ROOT} and set the real path ONCE in
 # .env_private (auto-loaded). Or hardcode an absolute path here.
-data_root: ${EVOCLAW_DATA_ROOT}
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 
 # Trial name. Two forms:
 #   "my_experiment"     → run_all.py picks the latest matching _NNN

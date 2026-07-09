@@ -103,7 +103,7 @@ per line); retagging hub -> local is a pure pointer operation.
 
 ### Version pinning
 
-The benchmark data version is pinned via `EVOCLAW_IMAGE_TAG` (default `v1.0`,
+The benchmark data version is pinned via `SWE_MILESTONE_IMAGE_TAG` (default `v1.0`,
 defined once in `harness/e2e/image_version.py`). Images for a published
 version are immutable: never re-pushed, never deleted. Pre-v1.0 images remain
 on the hub under the old `hyd2apse/<short>:<milestone>-v0.9` scheme, frozen;

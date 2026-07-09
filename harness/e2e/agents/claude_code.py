@@ -50,10 +50,10 @@ class ClaudeCodeFramework(AgentFramework):
     2. File mode: Uses ~/.claude/.credentials.json file mount
     3. Vertex mode: Claude Code's native CLAUDE_CODE_USE_VERTEX path — talks to
        Vertex AI's Anthropic endpoint via ADC (no API key). Selected when
-       run_all.py sets EVOCLAW_VERTEX (vertex_ai: true in the trial config).
+       run_all.py sets SWE_MILESTONE_VERTEX (vertex_ai: true in the trial config).
 
     API mode takes precedence when UNIFIED_API_KEY is set; Vertex mode is
-    selected by EVOCLAW_VERTEX and ignores the API key / base URL.
+    selected by SWE_MILESTONE_VERTEX and ignores the API key / base URL.
 
     Environment variables:
         UNIFIED_API_KEY: API key (mapped to ANTHROPIC_API_KEY in container)
@@ -109,20 +109,20 @@ class ClaudeCodeFramework(AgentFramework):
         # expects. Passthrough for unknown/native names.
         raw_haiku = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
         self._default_haiku_model = resolve_model_alias(raw_haiku) if raw_haiku else None
-        # Vertex AI mode (run_all.py sets EVOCLAW_VERTEX when vertex_ai: true).
+        # Vertex AI mode (run_all.py sets SWE_MILESTONE_VERTEX when vertex_ai: true).
         # Claude Code has built-in Vertex support (CLAUDE_CODE_USE_VERTEX): it
         # talks to Vertex's Anthropic endpoint directly using ADC — no API key,
         # no proxy. The `model` stays the bare Vertex id (e.g. claude-opus-4-8);
         # CLOUD_ML_REGION may be a region (us-east5, ...) or "global".
-        self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
-        self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
-        self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
-        # Auto-compaction window: run_all.py sets EVOCLAW_AUTO_COMPACT_WINDOW
+        self._vertex = bool(os.environ.get("SWE_MILESTONE_VERTEX"))
+        self._vertex_project = os.environ.get("SWE_MILESTONE_VERTEX_PROJECT")
+        self._vertex_location = os.environ.get("SWE_MILESTONE_VERTEX_LOCATION", "global")
+        # Auto-compaction window: run_all.py sets SWE_MILESTONE_AUTO_COMPACT_WINDOW
         # from the trial config `auto_compact_window`. Passed through to the
         # container as the native CLAUDE_CODE_AUTO_COMPACT_WINDOW so claude-code
         # compacts context at this token budget. Native agent behaviour — does
         # not alter the model ID or request payload sent to the provider.
-        self._auto_compact_window = os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW")
+        self._auto_compact_window = os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW")
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
@@ -219,7 +219,7 @@ class ClaudeCodeFramework(AgentFramework):
                 "-e", f"CLAUDE_CODE_EFFORT_LEVEL={self.EFFORT_MAP[self._reasoning_effort]}",
             ])
         # Auto-compaction window (native claude-code env var). Set from trial
-        # config `auto_compact_window` via run_all.py's EVOCLAW_AUTO_COMPACT_WINDOW.
+        # config `auto_compact_window` via run_all.py's SWE_MILESTONE_AUTO_COMPACT_WINDOW.
         # claude-code triggers context compaction at this token budget; the value
         # is capped at the model's context window (may be 200K for a third-party
         # model whose ID claude-code can't pattern-match).

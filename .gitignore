@@ -138,6 +138,7 @@ celerybeat.pid
 # Environments
 # .env is the committed PUBLIC template; .env_private holds real host paths.
 .env_private
+.env_private*
 .env.*
 .venv
 .venv/

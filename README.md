@@ -93,10 +93,10 @@ SWE-Milestone reads host-specific paths from `.env_private` (gitignored), auto-l
 
 ```bash
 cp .env .env_private
-# edit .env_private →  EVOCLAW_DATA_ROOT=/abs/path/to/SWE-Milestone-data
+# edit .env_private →  SWE_MILESTONE_DATA_ROOT=/abs/path/to/SWE-Milestone-data
 ```
 
-Trial configs then use `data_root: ${EVOCLAW_DATA_ROOT}` — no host path to repeat. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
+Trial configs then use `data_root: ${SWE_MILESTONE_DATA_ROOT}` — no host path to repeat. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
 
 ## 🚀 Usage
 
@@ -110,7 +110,7 @@ cp trial_config.example.yaml trial_config.yaml
 
 ```yaml
 # modify trial_config.yaml 
-data_root: ${EVOCLAW_DATA_ROOT}        # set once in .env_private (or hardcode a path)
+data_root: ${SWE_MILESTONE_DATA_ROOT}        # set once in .env_private (or hardcode a path)
 trial_name: my_experiment              # name for this evaluation run
 agent: claude-code                     # agent: claude-code | codex | gemini-cli | openhands
 model: claude-opus-4-7                 # model identifier (use claude-opus-4-7[1m] for 1M context)

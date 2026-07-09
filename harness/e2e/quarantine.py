@@ -32,7 +32,7 @@ ECOSYSTEM_REGISTRIES: dict[str, list[str]] = {
 }
 
 # YAML key that forces each ecosystem's package manager offline. pip is NOT here:
-# EVOCLAW_PIP_OFFLINE is auto-derived from ecosystem=pip (no per-repo key). The
+# SWE_MILESTONE_PIP_OFFLINE is auto-derived from ecosystem=pip (no per-repo key). The
 # gate requires the switch so a denied registry can't still be reached through
 # the legitimate package-manager fetch path.
 ECOSYSTEM_YAML_OFFLINE_KEY: dict[str, str] = {
@@ -158,7 +158,7 @@ def image_for_repo(repo_name: str, project_root: Path) -> str:
     q = load_quarantine_config(repo_name, project_root)
     milestone = "base-offline" if q is not None else "base"
     base = local_ref(repo_name, milestone)
-    # resolve_image honors the EVOCLAW_IMAGE_TAG pin (default in image_version.py) with a loud
+    # resolve_image honors the SWE_MILESTONE_IMAGE_TAG pin (default in image_version.py) with a loud
     # :latest fallback — NOT a hardcoded :latest, which silently ignored the pin
     # so reproducibility runs graded against the wrong data version.
     return resolve_image(base)
@@ -188,45 +188,45 @@ def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
     # Quarantine is active for this repo (policy file present). Signal it so
     # container_setup poisons the mirror domains + forces GOPROXY off, and the
     # run_e2e fail-closed guard can tell an env-injected launch from a raw one.
-    env["EVOCLAW_QUARANTINE"] = "1"
+    env["SWE_MILESTONE_QUARANTINE"] = "1"
     dd = q.get("deny_domains")
     dc = q.get("deny_cidrs")
     if dd:
-        env["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
+        env["SWE_MILESTONE_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
     if dc:
-        env["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
+        env["SWE_MILESTONE_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
     # Domains the policy declares un-CIDR-blockable (share a Google/Vertex range);
     # verify_network_lockdown exempts ONLY these from the reachability assertion.
     fe = q.get("firewall_exempt_domains")
     if fe:
-        env["EVOCLAW_FIREWALL_EXEMPT"] = ",".join(fe) if isinstance(fe, list) else str(fe)
+        env["SWE_MILESTONE_FIREWALL_EXEMPT"] = ",".join(fe) if isinstance(fe, list) else str(fe)
 
     # pip offline: the pip wheelhouse is now baked INTO base-offline:latest at
     # /wheelhouse (scripts/build_offline_closure.py). Signal the in-image path
-    # via EVOCLAW_PIP_OFFLINE; agents/base.py turns this into PIP_NO_INDEX=1 +
+    # via SWE_MILESTONE_PIP_OFFLINE; agents/base.py turns this into PIP_NO_INDEX=1 +
     # PIP_FIND_LINKS=/wheelhouse. No host path expansion, no is_dir() check —
     # self-exclusion is audited at BUILD TIME (audit_wheelhouse_self_exclusion
     # in the closure builder, Phase 2.1). Detect pip from the top-level ecosystem
     # field (list or str), consistent with how cargo/go/maven/npm are detected.
     ecosystems = [str(e).strip().lower() for e in _as_list(q.get("ecosystem"))]
     if "pip" in ecosystems:
-        env["EVOCLAW_PIP_OFFLINE"] = "1"
+        env["SWE_MILESTONE_PIP_OFFLINE"] = "1"
 
     # Package-manager offline switches (consumed by agents/base.py →
-    # container -e flags; EVOCLAW_GO_OFFLINE also flips the GOPROXY value
+    # container -e flags; SWE_MILESTONE_GO_OFFLINE also flips the GOPROXY value
     # container_setup writes into the container). The firewall deny is the
     # hard layer; these keep legitimate dependency use working offline
     # against the image's pre-baked cache instead of hanging on a DROP.
     if q.get("cargo_offline"):
-        env["EVOCLAW_CARGO_OFFLINE"] = "1"
+        env["SWE_MILESTONE_CARGO_OFFLINE"] = "1"
     if q.get("go_offline"):
-        env["EVOCLAW_GO_OFFLINE"] = "1"
+        env["SWE_MILESTONE_GO_OFFLINE"] = "1"
     if q.get("maven_offline"):
-        env["EVOCLAW_MAVEN_OFFLINE"] = "1"
+        env["SWE_MILESTONE_MAVEN_OFFLINE"] = "1"
     if q.get("maven_repo_local"):
-        env["EVOCLAW_MAVEN_REPO_LOCAL"] = str(q["maven_repo_local"])
+        env["SWE_MILESTONE_MAVEN_REPO_LOCAL"] = str(q["maven_repo_local"])
     if q.get("npm_offline"):
-        env["EVOCLAW_NPM_OFFLINE"] = "1"
+        env["SWE_MILESTONE_NPM_OFFLINE"] = "1"
 
     # Fail-closed audits run inside the container at lockdown time
     # (container_setup.verify_network_lockdown): cache globs that must match
@@ -234,10 +234,10 @@ def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
     # registry URLs of the observed cheats that must fail to connect.
     globs = _as_list(q.get("cache_forbid_globs"))
     if globs:
-        env["EVOCLAW_CACHE_FORBID_GLOBS"] = ",".join(str(g) for g in globs)
+        env["SWE_MILESTONE_CACHE_FORBID_GLOBS"] = ",".join(str(g) for g in globs)
     urls = _as_list(q.get("verify_fetch_urls"))
     if urls:
-        env["EVOCLAW_VERIFY_FETCH_URLS"] = ",".join(str(u) for u in urls)
+        env["SWE_MILESTONE_VERIFY_FETCH_URLS"] = ",".join(str(u) for u in urls)
     return env
 
 
@@ -331,7 +331,7 @@ def quarantine_guard_error(
     The coverage gate + env injection live in scripts/run_all.py; a direct
     `run_e2e.py --repo-name X` launch bypasses them. Returns an error string when
     the repo HAS a quarantine policy but this launch didn't apply it
-    (quarantine_active False — EVOCLAW_QUARANTINE not injected) and --unprotected
+    (quarantine_active False — SWE_MILESTONE_QUARANTINE not injected) and --unprotected
     wasn't passed — exactly the 'silently ran unprotected' condition issue #12
     set out to make impossible. Returns None to proceed.
     """
@@ -341,7 +341,7 @@ def quarantine_guard_error(
         return None
     return (
         f"{repo_name}: quarantine_configs/{repo_name}.yaml exists but this launch "
-        f"has no quarantine env (EVOCLAW_QUARANTINE unset). Launch via "
+        f"has no quarantine env (SWE_MILESTONE_QUARANTINE unset). Launch via "
         f"scripts/run_all.py (applies the policy), or pass --unprotected to run "
         f"without protection (scores may be tainted)."
     )

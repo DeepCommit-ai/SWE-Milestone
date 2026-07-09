@@ -215,7 +215,7 @@ class MilestoneRunner:
             self.image_name = image_name
         else:
             # Path structure: .../harness_workspace/repo_name/test_version
-            # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default:
+            # Benchmark data version is pinned via SWE_MILESTONE_IMAGE_TAG (default:
             # v0.9); falls back to :latest with a warning when the default pin
             # is absent locally (never when the tag was set explicitly).
             repo_name = self.workspace_root.parent.name.lower()
@@ -1495,7 +1495,7 @@ Output Structure:
     )
     parser.add_argument(
         "--image",
-        help="Docker image (default: {repo}/{version}/{mid}:$EVOCLAW_IMAGE_TAG, tag default v0.9)",
+        help="Docker image (default: {repo}/{version}/{mid}:$SWE_MILESTONE_IMAGE_TAG, tag default v0.9)",
     )
     parser.add_argument(
         "--model",

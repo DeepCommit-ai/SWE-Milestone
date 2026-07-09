@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
+from harness.e2e.env_guard import reject_legacy_env
 from harness.e2e.quarantine import image_for_repo, load_quarantine_env, quarantine_coverage_errors
 
 
@@ -264,17 +265,18 @@ def main():
 
     # Load host paths from .env / .env_private (once-configured, persists).
     _load_dotenv_files()
+    reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
 
     # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    # data_root: from the trial config, or EVOCLAW_DATA_ROOT (.env_private).
-    # Supports ${EVOCLAW_DATA_ROOT} expansion so trial configs need no host path.
-    _dr = cfg.get("data_root") or os.environ.get("EVOCLAW_DATA_ROOT")
+    # data_root: from the trial config, or SWE_MILESTONE_DATA_ROOT (.env_private).
+    # Supports ${SWE_MILESTONE_DATA_ROOT} expansion so trial configs need no host path.
+    _dr = cfg.get("data_root") or os.environ.get("SWE_MILESTONE_DATA_ROOT")
     if not _dr:
         print("Error: data_root not set. Put 'data_root:' in the trial config "
-              "or set EVOCLAW_DATA_ROOT in .env_private (see README).", file=sys.stderr)
+              "or set SWE_MILESTONE_DATA_ROOT in .env_private (see README).", file=sys.stderr)
         sys.exit(1)
     data_root = Path(os.path.expandvars(str(_dr))).expanduser().resolve()
     yaml_trial_name = cfg["trial_name"]
@@ -325,13 +327,13 @@ def main():
     # makes claude-code trigger native context compaction at that token budget
     # instead of the model's pattern-matched default. Propagated to the agent
     # container as CLAUDE_CODE_AUTO_COMPACT_WINDOW (ClaudeCodeFramework reads
-    # EVOCLAW_AUTO_COMPACT_WINDOW). Compaction is built-in agent behaviour, not
+    # SWE_MILESTONE_AUTO_COMPACT_WINDOW). Compaction is built-in agent behaviour, not
     # a custom optimization — preserves benchmark parity. claude-code caps the
     # value at the model's context window; for pattern-unknown third-party
     # models that ceiling may fall back to 200K.
     auto_compact_window = cfg.get("auto_compact_window", None)
     if auto_compact_window:
-        os.environ["EVOCLAW_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+        os.environ["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
 
     # Validate
     if not data_root.exists():
@@ -384,9 +386,9 @@ def main():
         if not proj:
             print("Error: set vertex_project (no ADC quota_project_id found)", file=sys.stderr)
             sys.exit(1)
-        os.environ["EVOCLAW_VERTEX"] = "1"
-        os.environ["EVOCLAW_VERTEX_PROJECT"] = proj
-        os.environ["EVOCLAW_VERTEX_LOCATION"] = vertex_location
+        os.environ["SWE_MILESTONE_VERTEX"] = "1"
+        os.environ["SWE_MILESTONE_VERTEX_PROJECT"] = proj
+        os.environ["SWE_MILESTONE_VERTEX_LOCATION"] = vertex_location
         vertex_info = {"project": proj}
 
     mode_label = (

@@ -110,11 +110,11 @@ def main() -> int:
 
         print("Offline switches visible in container env:")
         want = {
-            "EVOCLAW_CARGO_OFFLINE": "CARGO_NET_OFFLINE=true",
-            "EVOCLAW_GO_OFFLINE": "GOPROXY=off",
-            "EVOCLAW_MAVEN_OFFLINE": "MAVEN_ARGS=-o",
-            "EVOCLAW_NPM_OFFLINE": "npm_config_offline=true",
-            "EVOCLAW_PIP_OFFLINE": "PIP_NO_INDEX=1",
+            "SWE_MILESTONE_CARGO_OFFLINE": "CARGO_NET_OFFLINE=true",
+            "SWE_MILESTONE_GO_OFFLINE": "GOPROXY=off",
+            "SWE_MILESTONE_MAVEN_OFFLINE": "MAVEN_ARGS=-o",
+            "SWE_MILESTONE_NPM_OFFLINE": "npm_config_offline=true",
+            "SWE_MILESTONE_PIP_OFFLINE": "PIP_NO_INDEX=1",
         }
         r = subprocess.run(["docker", "exec", container, "env"],
                            capture_output=True, text=True)

@@ -10,7 +10,7 @@ import build_offline_closure as boc
 def _hermetic_naming(monkeypatch):
     """Naming refactor: FROM lines resolve through resolve_image; pin it to
     ':v1.0' regardless of host env/local images so tests stay hermetic."""
-    monkeypatch.delenv("EVOCLAW_IMAGE_TAG", raising=False)
+    monkeypatch.delenv("SWE_MILESTONE_IMAGE_TAG", raising=False)
     monkeypatch.setattr(boc, "resolve_image", lambda base: f"{base}:v1.0")
 
 

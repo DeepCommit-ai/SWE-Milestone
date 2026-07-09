@@ -19,6 +19,7 @@ Features:
 - Retry: Allow re-evaluation when tag changes after initial evaluation
 """
 
+from harness.e2e.env_guard import reject_legacy_env
 import argparse
 import fcntl
 import json
@@ -1823,8 +1824,8 @@ def _run_resume_mode(args):
     # constructed — otherwise __init__'s policy recovery would silently re-harden
     # a trial that ran with the network open before the interruption.
     from harness.e2e.quarantine import metadata_wants_unprotected
-    if metadata_wants_unprotected(metadata) and not os.environ.get("EVOCLAW_UNPROTECTED"):
-        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+    if metadata_wants_unprotected(metadata) and not os.environ.get("SWE_MILESTONE_UNPROTECTED"):
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
         logger.info("Resume: trial was launched --unprotected; keeping it open (no re-harden)")
     # --model override for resume (e.g., fix a wrong model after fatal error)
     if getattr(args, '_model_explicitly_set', False):
@@ -1907,6 +1908,7 @@ def _run_resume_mode(args):
 
 
 def main():
+    reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
     setup_logging()
     parser = argparse.ArgumentParser(
         description="Run End-to-End Agent Trial (Continuous Task Queue Mode with Recovery)",
@@ -2036,7 +2038,7 @@ Example:
     # (operator explicitly wants an open baseline run) — covers fresh AND resume,
     # both of which construct ContainerSetup (F2-b).
     if getattr(args, "unprotected", False):
-        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
 
     # Track whether --model was explicitly provided (vs default)
     args._model_explicitly_set = '--model' in sys.argv
@@ -2063,12 +2065,12 @@ Example:
     # Fail-closed quarantine guard (#3): scripts/run_all.py applies the per-repo
     # policy env + runs the coverage gate; a direct run_e2e launch bypasses both.
     # Refuse to start a repo that HAS a policy but wasn't given the quarantine
-    # env (EVOCLAW_QUARANTINE), unless --unprotected is explicitly set.
+    # env (SWE_MILESTONE_QUARANTINE), unless --unprotected is explicitly set.
     from harness.e2e.quarantine import quarantine_guard_error
     _guard = quarantine_guard_error(
         args.repo_name,
         Path(__file__).resolve().parent.parent.parent,
-        quarantine_active=bool(os.environ.get("EVOCLAW_QUARANTINE")),
+        quarantine_active=bool(os.environ.get("SWE_MILESTONE_QUARANTINE")),
         unprotected=args.unprotected,
     )
     if _guard:
@@ -2276,9 +2278,9 @@ Example:
         "reasoning_effort": effective_reasoning_effort,
         # Native claude-code context-compaction window in tokens. Set from the
         # trial config `auto_compact_window` (propagated via the
-        # EVOCLAW_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
+        # SWE_MILESTONE_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
         # display it. None when the config doesn't set it.
-        "auto_compact_window": os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW"),
+        "auto_compact_window": os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,

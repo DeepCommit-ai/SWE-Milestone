@@ -154,7 +154,7 @@ refuses the launch rather than warning:
   env from the on-disk policy when the process env lacks it (direct
   `run_e2e --resume-trial`, manual `run_milestone`). Protection follows the
   **disk fact** (does this repo have a policy file), not a losable env var. The
-  only exception: `EVOCLAW_UNPROTECTED`, persisted in trial metadata so resuming
+  only exception: `SWE_MILESTONE_UNPROTECTED`, persisted in trial metadata so resuming
   an intentionally-open baseline doesn't silently re-harden it.
 
 The gate checks *what you declared*; the in-container probes check *whether it
@@ -170,7 +170,7 @@ quarantine_configs/<repo>.yaml          policy: repo-intrinsic, auto-on
         │
         ▼
 harness/e2e/quarantine.py               the only policy interpreter (pure functions)
-        │   load_quarantine_env()   → EVOCLAW_* env vars
+        │   load_quarantine_env()   → SWE_MILESTONE_* env vars
         │   quarantine_coverage_errors() → launch gate
         │   image_for_repo()        → base-offline vs base (§8)
         ▼
@@ -197,11 +197,11 @@ the agent's container                   registries unreachable, managers offline
 | `scripts/verify_quarantine.py` | standalone live smoke test |
 | `scripts/pull_images.sh` | distributes images across machines |
 
-The env vars carrying policy into the container: `EVOCLAW_QUARANTINE`,
-`EVOCLAW_DENY_DOMAINS`, `EVOCLAW_DENY_CIDRS`, `EVOCLAW_FIREWALL_EXEMPT`,
-`EVOCLAW_{PIP,CARGO,GO,MAVEN,NPM}_OFFLINE`, `EVOCLAW_MAVEN_REPO_LOCAL`,
-`EVOCLAW_CACHE_FORBID_GLOBS`, `EVOCLAW_VERIFY_FETCH_URLS`, plus
-`EVOCLAW_UNPROTECTED` for the escape hatch.
+The env vars carrying policy into the container: `SWE_MILESTONE_QUARANTINE`,
+`SWE_MILESTONE_DENY_DOMAINS`, `SWE_MILESTONE_DENY_CIDRS`, `SWE_MILESTONE_FIREWALL_EXEMPT`,
+`SWE_MILESTONE_{PIP,CARGO,GO,MAVEN,NPM}_OFFLINE`, `SWE_MILESTONE_MAVEN_REPO_LOCAL`,
+`SWE_MILESTONE_CACHE_FORBID_GLOBS`, `SWE_MILESTONE_VERIFY_FETCH_URLS`, plus
+`SWE_MILESTONE_UNPROTECTED` for the escape hatch.
 
 ## 5. Day-to-day usage
 
@@ -372,14 +372,14 @@ scikit-learn**, use `base-offline` (the pip wheelhouse is baked in at
 `/wheelhouse`, not host-mounted).
 
 **Tag semantics.** The tag is the benchmark **data-version pin** (env
-`EVOCLAW_IMAGE_TAG`, default `v1.0` — defined once in
+`SWE_MILESTONE_IMAGE_TAG`, default `v1.0` — defined once in
 `harness/e2e/image_version.py`); `:latest` is "most recent local build".
 `resolve_image()`:
 
 1. `<image>:<pin>` exists locally → use it.
 2. Pin came from the default and only `:latest` exists → use it **with a loud
    warning** (content unverified).
-3. `EVOCLAW_IMAGE_TAG` set explicitly → never fall back; fail fast.
+3. `SWE_MILESTONE_IMAGE_TAG` set explicitly → never fall back; fail fast.
 
 Containers additionally launch with `--pull=never`: a missing local image is
 a loud failure, never a silent registry fetch mid-eval.

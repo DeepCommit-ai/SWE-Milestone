@@ -111,29 +111,29 @@ class AgentFramework(ABC):
     def get_quarantine_env_vars(self) -> List[str]:
         """Quarantine: force the repo's package manager(s) offline.
 
-        Belt to the EVOCLAW_DENY_* firewall suspenders, shared across agents.
+        Belt to the SWE_MILESTONE_DENY_* firewall suspenders, shared across agents.
         pip reads the in-image /wheelhouse (baked by the closure builder) when
-        EVOCLAW_PIP_OFFLINE is set; cargo/go/maven/npm run offline against
+        SWE_MILESTONE_PIP_OFFLINE is set; cargo/go/maven/npm run offline against
         their own image-baked caches. GOPROXY=off is additionally written into
         /etc/environment + .bashrc by container_setup.lock_network (shell
         profiles would override a bare docker -e). See docs/quarantine.md.
         """
         env: List[str] = []
-        if os.environ.get("EVOCLAW_PIP_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_PIP_OFFLINE"):
             env += ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
-        if os.environ.get("EVOCLAW_CARGO_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_CARGO_OFFLINE"):
             env += ["-e", "CARGO_NET_OFFLINE=true"]
-        if os.environ.get("EVOCLAW_GO_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
             env += ["-e", "GOPROXY=off"]
-        if os.environ.get("EVOCLAW_MAVEN_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_MAVEN_OFFLINE"):
             margs = "-o"
-            repo_local = os.environ.get("EVOCLAW_MAVEN_REPO_LOCAL")
+            repo_local = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL")
             if repo_local:
                 # The image's populated cache lives under root's home; the
                 # agent runs as fakeroot, whose own ~/.m2 starts empty.
                 margs += f" -Dmaven.repo.local={repo_local}"
             env += ["-e", f"MAVEN_ARGS={margs}"]
-        if os.environ.get("EVOCLAW_NPM_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_NPM_OFFLINE"):
             env += ["-e", "npm_config_offline=true"]
         return env
 

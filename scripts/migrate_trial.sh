@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-DATA_ROOT="${EVOCLAW_DATA_ROOT:-$PROJECT_ROOT/EvoClaw-data}"
-LOG_ROOT="${EVOCLAW_LOG_ROOT:-$PROJECT_ROOT/EvoClaw-log}"
+DATA_ROOT="${SWE_MILESTONE_DATA_ROOT:-$PROJECT_ROOT/EvoClaw-data}"
+LOG_ROOT="${SWE_MILESTONE_LOG_ROOT:-$PROJECT_ROOT/EvoClaw-log}"
 
 usage() {
     cat <<'EOF'

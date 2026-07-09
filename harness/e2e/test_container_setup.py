@@ -55,8 +55,8 @@ class TestQuarantineEnvFromImage:
         env = _quarantine_env_from_image(
             "burntsushi_ripgrep_1_2/base-offline:v0.9", tmp_path
         )
-        assert env["EVOCLAW_QUARANTINE"] == "1"
-        assert env["EVOCLAW_DENY_DOMAINS"] == "crates.io"
+        assert env["SWE_MILESTONE_QUARANTINE"] == "1"
+        assert env["SWE_MILESTONE_DENY_DOMAINS"] == "crates.io"
 
     def test_empty_for_no_config_repo(self, tmp_path):
         from harness.e2e.container_setup import _quarantine_env_from_image
@@ -96,8 +96,8 @@ class TestRecoverQuarantineEnv:
             "registry.io/burntsushi_ripgrep_1_2/base-offline:v0.9",
             tmp_path,
         )
-        assert env["EVOCLAW_QUARANTINE"] == "1"
-        assert env["EVOCLAW_CARGO_OFFLINE"] == "1"
+        assert env["SWE_MILESTONE_QUARANTINE"] == "1"
+        assert env["SWE_MILESTONE_CARGO_OFFLINE"] == "1"
 
     def test_repo_name_case_insensitive(self, tmp_path):
         from harness.e2e.container_setup import _recover_quarantine_env
@@ -105,7 +105,7 @@ class TestRecoverQuarantineEnv:
         self._cfg(tmp_path)
         # run_milestone lowercases repo_name; config file is BurntSushi_...
         env = _recover_quarantine_env("burntsushi_ripgrep_1_2", "x/base:latest", tmp_path)
-        assert env["EVOCLAW_QUARANTINE"] == "1"
+        assert env["SWE_MILESTONE_QUARANTINE"] == "1"
 
     def test_falls_back_to_image_when_no_repo_name(self, tmp_path):
         from harness.e2e.container_setup import _recover_quarantine_env
@@ -114,7 +114,7 @@ class TestRecoverQuarantineEnv:
         env = _recover_quarantine_env(
             None, "burntsushi_ripgrep_1_2/base-offline:v0.9", tmp_path
         )
-        assert env["EVOCLAW_QUARANTINE"] == "1"
+        assert env["SWE_MILESTONE_QUARANTINE"] == "1"
 
     def test_empty_for_no_policy(self, tmp_path):
         from harness.e2e.container_setup import _recover_quarantine_env

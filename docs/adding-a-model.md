@@ -226,7 +226,7 @@ timeout: 18000
 python scripts/run_all.py --config trial_configs/claude-code_opus-4.8.yaml
 ```
 
-`run_all.py` sets `EVOCLAW_VERTEX*`; `claude_code.py` then emits
+`run_all.py` sets `SWE_MILESTONE_VERTEX*`; `claude_code.py` then emits
 `CLAUDE_CODE_USE_VERTEX=1` + `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION`,
 mounts the host ADC read-only, and copies it into the agent user's home — Claude
 Code talks to Vertex directly.

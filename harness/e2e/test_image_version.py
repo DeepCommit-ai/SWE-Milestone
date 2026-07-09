@@ -179,7 +179,7 @@ class TestManifest:
 def _run_cli(*argv, env_extra=None):
     import os as _os
     env = dict(_os.environ)
-    env.pop("EVOCLAW_IMAGE_TAG", None)
+    env.pop("SWE_MILESTONE_IMAGE_TAG", None)
     if env_extra:
         env.update(env_extra)
     return sp.run(
@@ -205,7 +205,7 @@ class TestPlanCLI:
 
     def test_version_from_env(self):
         r = _run_cli("pull-plan", "--repo", "navidrome",
-                     env_extra={"EVOCLAW_IMAGE_TAG": "v1.0"})
+                     env_extra={"SWE_MILESTONE_IMAGE_TAG": "v1.0"})
         assert ":v1.0" in r.stdout.splitlines()[0]
 
     def test_org_flag(self):
@@ -255,3 +255,27 @@ class TestPullNeverHardening:
     def test_launch_sites_have_pull_never(self, rel):
         src = (REPO_ROOT / rel).read_text()
         assert '"--pull=never"' in src, f"{rel}: benchmark container launch lacks --pull=never"
+
+
+class TestEnvGuard:
+    """legacy EVOCLAW_* 必须硬报错(防静默忽略,如被无视的 IMAGE_TAG 评错版本)。"""
+
+    def test_clean_env_passes(self, monkeypatch):
+        from harness.e2e.env_guard import reject_legacy_env
+        for k in list(__import__("os").environ):
+            if k.startswith("EVOCLAW_"):
+                monkeypatch.delenv(k)
+        reject_legacy_env()  # 不抛即过
+
+    def test_legacy_var_rejected_with_mapping(self, monkeypatch):
+        from harness.e2e.env_guard import reject_legacy_env
+        monkeypatch.setenv("EVOCLAW_IMAGE_TAG", "v0.9")
+        with pytest.raises(SystemExit) as ei:
+            reject_legacy_env()
+        assert "SWE_MILESTONE_IMAGE_TAG" in str(ei.value)
+
+    def test_plan_cli_rejects_legacy(self):
+        r = _run_cli("pull-plan", "--repo", "navidrome", "--version", "v1.0",
+                     env_extra={"EVOCLAW_DATA_ROOT": "/tmp/x"})
+        assert r.returncode != 0
+        assert "SWE_MILESTONE_DATA_ROOT" in (r.stderr + r.stdout)

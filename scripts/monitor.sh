@@ -63,13 +63,13 @@ done
 # ─────────────────────────────────────────────
 # Resolve data_root (needed before trial auto-detect)
 # ─────────────────────────────────────────────
-EVOCLAW_CONFIG="$PROJECT_ROOT/trial_config.yaml"
+SWE_MILESTONE_CONFIG="$PROJECT_ROOT/trial_config.yaml"
 if [[ -z "$DATA_ROOT" ]]; then
     # Try reading from trial_config.yaml
-    if [[ -f "$EVOCLAW_CONFIG" ]]; then
+    if [[ -f "$SWE_MILESTONE_CONFIG" ]]; then
         DATA_ROOT=$(python3 -c "
 import yaml
-with open('$EVOCLAW_CONFIG') as f:
+with open('$SWE_MILESTONE_CONFIG') as f:
     cfg = yaml.safe_load(f)
 print(cfg.get('data_root', ''))
 " 2>/dev/null)
@@ -256,15 +256,15 @@ fi
 # ─────────────────────────────────────────────
 # Session timeline table
 # ─────────────────────────────────────────────
-export EVOCLAW_DATA_ROOT="$DATA_ROOT"
-export EVOCLAW_TRIAL_NAMES="$(IFS=,; echo "${RESOLVED_TRIALS[*]}")"
+export SWE_MILESTONE_DATA_ROOT="$DATA_ROOT"
+export SWE_MILESTONE_TRIAL_NAMES="$(IFS=,; echo "${RESOLVED_TRIALS[*]}")"
 python3 << 'TIMELINE_EOF'
 import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-data_root = os.environ.get("EVOCLAW_DATA_ROOT", "")
-trial_names_str = os.environ.get("EVOCLAW_TRIAL_NAMES", "")
+data_root = os.environ.get("SWE_MILESTONE_DATA_ROOT", "")
+trial_names_str = os.environ.get("SWE_MILESTONE_TRIAL_NAMES", "")
 if not data_root or not trial_names_str:
     sys.exit(0)
 

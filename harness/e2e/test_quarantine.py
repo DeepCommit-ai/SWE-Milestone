@@ -59,7 +59,7 @@ class TestMirrorDomainsAndGoproxy:
             tmp_path, "r", "ecosystem: [go]\ndeny_domains: [proxy.golang.org]\n"
         )
         env = load_quarantine_env("r", tmp_path)
-        assert env["EVOCLAW_QUARANTINE"] == "1"
+        assert env["SWE_MILESTONE_QUARANTINE"] == "1"
 
 
 class TestGateHardening:
@@ -138,8 +138,8 @@ class TestLoadQuarantineEnv:
             "ecosystem: [pip]\nclosure: {ecosystem: pip}\n"
         )
         env = load_quarantine_env("sk", tmp_path)
-        assert env.get("EVOCLAW_PIP_OFFLINE") == "1"
-        assert "EVOCLAW_PIP_WHEELHOUSE" not in env   # no longer a host path
+        assert env.get("SWE_MILESTONE_PIP_OFFLINE") == "1"
+        assert "SWE_MILESTONE_PIP_WHEELHOUSE" not in env   # no longer a host path
 
     def test_deny_fields(self, tmp_path):
         _write_config(tmp_path, "r1", """
@@ -147,8 +147,8 @@ deny_domains: [crates.io, static.crates.io]
 deny_cidrs: [151.101.0.0/16]
 """)
         env = load_quarantine_env("r1", tmp_path)
-        assert env["EVOCLAW_DENY_DOMAINS"] == "crates.io,static.crates.io"
-        assert env["EVOCLAW_DENY_CIDRS"] == "151.101.0.0/16"
+        assert env["SWE_MILESTONE_DENY_DOMAINS"] == "crates.io,static.crates.io"
+        assert env["SWE_MILESTONE_DENY_CIDRS"] == "151.101.0.0/16"
 
     def test_firewall_exempt_domains_exported(self, tmp_path):
         # #2b: verify_network_lockdown must only exempt domains the policy
@@ -157,7 +157,7 @@ deny_cidrs: [151.101.0.0/16]
 firewall_exempt_domains: [proxy.golang.org, sum.golang.org]
 """)
         env = load_quarantine_env("gz", tmp_path)
-        assert env["EVOCLAW_FIREWALL_EXEMPT"] == "proxy.golang.org,sum.golang.org"
+        assert env["SWE_MILESTONE_FIREWALL_EXEMPT"] == "proxy.golang.org,sum.golang.org"
 
     def test_offline_switches(self, tmp_path):
         _write_config(tmp_path, "r2", """
@@ -168,11 +168,11 @@ maven_repo_local: /root/.m2/repository
 npm_offline: true
 """)
         env = load_quarantine_env("r2", tmp_path)
-        assert env["EVOCLAW_CARGO_OFFLINE"] == "1"
-        assert env["EVOCLAW_GO_OFFLINE"] == "1"
-        assert env["EVOCLAW_MAVEN_OFFLINE"] == "1"
-        assert env["EVOCLAW_MAVEN_REPO_LOCAL"] == "/root/.m2/repository"
-        assert env["EVOCLAW_NPM_OFFLINE"] == "1"
+        assert env["SWE_MILESTONE_CARGO_OFFLINE"] == "1"
+        assert env["SWE_MILESTONE_GO_OFFLINE"] == "1"
+        assert env["SWE_MILESTONE_MAVEN_OFFLINE"] == "1"
+        assert env["SWE_MILESTONE_MAVEN_REPO_LOCAL"] == "/root/.m2/repository"
+        assert env["SWE_MILESTONE_NPM_OFFLINE"] == "1"
 
     def test_audit_lists_joined(self, tmp_path):
         _write_config(tmp_path, "r3", """
@@ -183,11 +183,11 @@ verify_fetch_urls:
   - https://static.crates.io/crates/grep-printer/grep-printer-0.3.1.crate
 """)
         env = load_quarantine_env("r3", tmp_path)
-        assert env["EVOCLAW_CACHE_FORBID_GLOBS"] == (
+        assert env["SWE_MILESTONE_CACHE_FORBID_GLOBS"] == (
             "/usr/local/cargo/registry/cache/*/grep-*.crate,"
             "/usr/local/cargo/registry/src/*/grep-*"
         )
-        assert env["EVOCLAW_VERIFY_FETCH_URLS"] == (
+        assert env["SWE_MILESTONE_VERIFY_FETCH_URLS"] == (
             "https://static.crates.io/crates/grep-printer/grep-printer-0.3.1.crate"
         )
 
@@ -358,7 +358,7 @@ class TestAgentQuarantineEnvVars:
                 return ""
 
         saved = {k: os.environ.pop(k) for k in list(os.environ)
-                 if k.startswith("EVOCLAW_")}
+                 if k.startswith("SWE_MILESTONE_")}
         try:
             os.environ.update(flags)
             args = _F().get_quarantine_env_vars()
@@ -374,32 +374,32 @@ class TestAgentQuarantineEnvVars:
         assert self._env_dict({}) == {}
 
     def test_cargo_offline(self):
-        assert self._env_dict({"EVOCLAW_CARGO_OFFLINE": "1"}) == {
+        assert self._env_dict({"SWE_MILESTONE_CARGO_OFFLINE": "1"}) == {
             "CARGO_NET_OFFLINE": "true"}
 
     def test_go_offline(self):
-        assert self._env_dict({"EVOCLAW_GO_OFFLINE": "1"}) == {"GOPROXY": "off"}
+        assert self._env_dict({"SWE_MILESTONE_GO_OFFLINE": "1"}) == {"GOPROXY": "off"}
 
     def test_maven_offline_with_repo_local(self):
-        env = self._env_dict({"EVOCLAW_MAVEN_OFFLINE": "1",
-                              "EVOCLAW_MAVEN_REPO_LOCAL": "/root/.m2/repository"})
+        env = self._env_dict({"SWE_MILESTONE_MAVEN_OFFLINE": "1",
+                              "SWE_MILESTONE_MAVEN_REPO_LOCAL": "/root/.m2/repository"})
         assert env == {"MAVEN_ARGS": "-o -Dmaven.repo.local=/root/.m2/repository"}
 
     def test_maven_offline_without_repo_local(self):
-        assert self._env_dict({"EVOCLAW_MAVEN_OFFLINE": "1"}) == {"MAVEN_ARGS": "-o"}
+        assert self._env_dict({"SWE_MILESTONE_MAVEN_OFFLINE": "1"}) == {"MAVEN_ARGS": "-o"}
 
     def test_npm_offline(self):
-        assert self._env_dict({"EVOCLAW_NPM_OFFLINE": "1"}) == {
+        assert self._env_dict({"SWE_MILESTONE_NPM_OFFLINE": "1"}) == {
             "npm_config_offline": "true"}
 
     def test_pip_wheelhouse_alone_no_longer_triggers(self):
-        # EVOCLAW_PIP_WHEELHOUSE is the old trigger; it must no longer set pip env.
-        env = self._env_dict({"EVOCLAW_PIP_WHEELHOUSE": "/wh"})
+        # SWE_MILESTONE_PIP_WHEELHOUSE is the old trigger; it must no longer set pip env.
+        env = self._env_dict({"SWE_MILESTONE_PIP_WHEELHOUSE": "/wh"})
         assert env == {}
 
     def test_pip_offline_uses_in_image_wheelhouse(self):
-        # New trigger: EVOCLAW_PIP_OFFLINE=1 → pip reads in-image /wheelhouse.
-        env = self._env_dict({"EVOCLAW_PIP_OFFLINE": "1"})
+        # New trigger: SWE_MILESTONE_PIP_OFFLINE=1 → pip reads in-image /wheelhouse.
+        env = self._env_dict({"SWE_MILESTONE_PIP_OFFLINE": "1"})
         assert env == {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": "/wheelhouse"}
 
     def test_pip_offline_mounts_returns_empty(self):
@@ -424,13 +424,13 @@ class TestAgentQuarantineEnvVars:
                 return ""
 
         saved = {k: os.environ.pop(k) for k in list(os.environ)
-                 if k.startswith("EVOCLAW_")}
+                 if k.startswith("SWE_MILESTONE_")}
         try:
-            os.environ["EVOCLAW_PIP_OFFLINE"] = "1"
-            os.environ["EVOCLAW_PIP_WHEELHOUSE"] = "/any/host/path"
+            os.environ["SWE_MILESTONE_PIP_OFFLINE"] = "1"
+            os.environ["SWE_MILESTONE_PIP_WHEELHOUSE"] = "/any/host/path"
             mounts = _F().get_quarantine_mounts()
         finally:
-            for k in ("EVOCLAW_PIP_OFFLINE", "EVOCLAW_PIP_WHEELHOUSE"):
+            for k in ("SWE_MILESTONE_PIP_OFFLINE", "SWE_MILESTONE_PIP_WHEELHOUSE"):
                 os.environ.pop(k, None)
             os.environ.update(saved)
         assert mounts == []
@@ -438,7 +438,7 @@ class TestAgentQuarantineEnvVars:
 
 class TestImageForRepo:
     """image_for_repo selects base-offline for a quarantine repo and base
-    otherwise, and delegates TAG resolution to resolve_image so EVOCLAW_IMAGE_TAG
+    otherwise, and delegates TAG resolution to resolve_image so SWE_MILESTONE_IMAGE_TAG
     pinning is honored instead of hardcoding :latest (#5)."""
 
     def _patch_resolver(self, monkeypatch, seen):

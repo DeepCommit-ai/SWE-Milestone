@@ -11,7 +11,7 @@ from harness.e2e.image_version import PREFIX, SEP, local_ref, resolve_image
 
 def _base_image(repo_lower: str) -> str:
     """Pinned base-image ref for FROM/probe lines. resolve_image honors the
-    EVOCLAW_IMAGE_TAG pin (loud :latest fallback only on the default pin) —
+    SWE_MILESTONE_IMAGE_TAG pin (loud :latest fallback only on the default pin) —
     fixes the old hardcoded :latest that bypassed version pinning."""
     return resolve_image(local_ref(repo_lower, "base"))
 

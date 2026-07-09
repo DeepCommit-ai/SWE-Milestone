@@ -37,7 +37,7 @@ WHITELISTED_DOMAINS = [
     "api.openai.com",
     "generativelanguage.googleapis.com",
     # Vertex AI direct (gemini-cli + claude-code native Vertex): the aiplatform
-    # endpoint + OAuth token refresh for ADC. Only reachable when EVOCLAW_VERTEX
+    # endpoint + OAuth token refresh for ADC. Only reachable when SWE_MILESTONE_VERTEX
     # puts ADC in-container.
     "aiplatform.googleapis.com",
     "oauth2.googleapis.com",
@@ -279,11 +279,11 @@ class ContainerSetup:
         # direct run_e2e --resume-trial or a manual run_milestone does NOT.
         # Recover it from the repo's on-disk policy HERE (in __init__), BEFORE
         # start_container reads it for the offline -e flags and before
-        # lock_network/verify read it. Skip when EVOCLAW_QUARANTINE is already
+        # lock_network/verify read it. Skip when SWE_MILESTONE_QUARANTINE is already
         # present (run_all path — leave it so a canary env override still applies)
-        # or when EVOCLAW_UNPROTECTED is set (operator explicitly wants an open
+        # or when SWE_MILESTONE_UNPROTECTED is set (operator explicitly wants an open
         # baseline). Uses the authoritative repo_name, not a fragile image parse.
-        if not os.environ.get("EVOCLAW_QUARANTINE") and not os.environ.get("EVOCLAW_UNPROTECTED"):
+        if not os.environ.get("SWE_MILESTONE_QUARANTINE") and not os.environ.get("SWE_MILESTONE_UNPROTECTED"):
             _recovered = _recover_quarantine_env(repo_name, image_name)
             if _recovered:
                 os.environ.update(_recovered)
@@ -884,20 +884,20 @@ echo "Git history truncated successfully"
             Set of unique IP address strings.
         """
         ips: set[str] = set()
-        # Quarantine: domains in EVOCLAW_DENY_DOMAINS are NOT resolved/accepted,
+        # Quarantine: domains in SWE_MILESTONE_DENY_DOMAINS are NOT resolved/accepted,
         # so the agent cannot reach that registry (e.g. PyPI) to fetch the
-        # repo-under-test's own target-version source. Pairs with EVOCLAW_DENY_CIDRS
+        # repo-under-test's own target-version source. Pairs with SWE_MILESTONE_DENY_CIDRS
         # below (needed because a registry's IPs ride a shared CDN range).
-        _deny = {d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()}
+        _deny = {d.strip() for d in os.environ.get("SWE_MILESTONE_DENY_DOMAINS", "").split(",") if d.strip()}
         if _deny:
-            logger.warning(f"EVOCLAW_DENY_DOMAINS active — excluding from whitelist: {sorted(_deny)}")
+            logger.warning(f"SWE_MILESTONE_DENY_DOMAINS active — excluding from whitelist: {sorted(_deny)}")
         # Vertex regional endpoints: a non-"global" location routes to
         # "{LOC}-aiplatform.googleapis.com" (the bare aiplatform.googleapis.com
         # host in WHITELISTED_DOMAINS only covers the `global` endpoint). Resolve
         # the regional host too, else the documented region-switch (e.g.
         # us-east5 once quota lands) dies under the always-on network lockdown.
         domains = list(WHITELISTED_DOMAINS)
-        _vloc = os.environ.get("EVOCLAW_VERTEX_LOCATION", "").strip()
+        _vloc = os.environ.get("SWE_MILESTONE_VERTEX_LOCATION", "").strip()
         if _vloc and _vloc != "global":
             domains.append(f"{_vloc}-aiplatform.googleapis.com")
             logger.info(f"  Vertex location={_vloc}: whitelisting {_vloc}-aiplatform.googleapis.com")
@@ -916,7 +916,7 @@ echo "Git history truncated successfully"
         # range via SNI, so an allowed Fastly-fronted domain (deb.debian.org)
         # would otherwise re-admit IPs the agent can `curl --resolve` the registry
         # through. Removing them here closes that SNI-routing hole.
-        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
+        _deny_cidrs = [c.strip() for c in os.environ.get("SWE_MILESTONE_DENY_CIDRS", "").split(",") if c.strip()]
         if _deny_cidrs:
             import ipaddress
             nets = []
@@ -929,7 +929,7 @@ echo "Git history truncated successfully"
             ips = {ip for ip in ips
                    if not any(ipaddress.ip_address(ip) in n for n in nets)}
             if before != len(ips):
-                logger.warning(f"EVOCLAW_DENY_CIDRS pruned {before - len(ips)} resolved IPs in denied ranges")
+                logger.warning(f"SWE_MILESTONE_DENY_CIDRS pruned {before - len(ips)} resolved IPs in denied ranges")
         return ips
 
     def lock_network(self) -> None:
@@ -986,18 +986,18 @@ echo "Git history truncated successfully"
         accept_lines = []
         for ip in sorted(whitelisted_ips):
             accept_lines.append(f"iptables -A OUTPUT -d {ip} -j ACCEPT")
-        # Quarantine mode: CIDRs in EVOCLAW_DENY_CIDRS are NOT accepted, so a
+        # Quarantine mode: CIDRs in SWE_MILESTONE_DENY_CIDRS are NOT accepted, so a
         # registry fronted by that CDN becomes unreachable even via raw curl.
-        # Needed because EVOCLAW_DENY_DOMAINS only drops DNS-resolved IPs, while
+        # Needed because SWE_MILESTONE_DENY_DOMAINS only drops DNS-resolved IPs, while
         # registries like PyPI ride a shared CDN range (Fastly 151.101.0.0/16)
         # that CDN_CIDR_RANGES would otherwise accept wholesale. Overlap
         # matching (not string equality): the builtin Cloudflare accept is
         # 104.16.0.0/13 while a policy may deny 104.16.0.0/12 — equality would
         # leave the /13 accepted and the registry reachable. LLM paths survive
         # on other ranges (Vertex = Google, api.anthropic.com = Anthropic ASN).
-        _deny_cidrs = [c.strip() for c in os.environ.get("EVOCLAW_DENY_CIDRS", "").split(",") if c.strip()]
+        _deny_cidrs = [c.strip() for c in os.environ.get("SWE_MILESTONE_DENY_CIDRS", "").split(",") if c.strip()]
         if _deny_cidrs:
-            logger.warning(f"EVOCLAW_DENY_CIDRS active — excluding CDN ranges overlapping: {sorted(_deny_cidrs)}")
+            logger.warning(f"SWE_MILESTONE_DENY_CIDRS active — excluding CDN ranges overlapping: {sorted(_deny_cidrs)}")
         for cidr in CDN_CIDR_RANGES:
             if _deny_cidrs and cidr_overlaps_any(cidr, _deny_cidrs):
                 logger.warning(f"  CDN range {cidr} overlaps a denied CIDR — not accepted")
@@ -1054,7 +1054,7 @@ echo "iptables rules applied successfully"
         # --- Step 4: Poison /etc/hosts ---
         # Mirror domains (go proxies) are poisoned only under quarantine so a
         # non-quarantine/baseline container keeps working go fetches (#4).
-        _quarantine = bool(os.environ.get("EVOCLAW_QUARANTINE"))
+        _quarantine = bool(os.environ.get("SWE_MILESTONE_QUARANTINE"))
         _poison = _poison_domain_list(_quarantine)
         hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in _poison)
         hosts_script = f"""
@@ -1083,7 +1083,7 @@ echo "/etc/hosts poisoned with {len(_poison)} domains"
         # non-quarantine container keeps the sanctioned proxy. Shell profiles
         # override docker -e, so this MUST be written here (#4).
         _goproxy = goproxy_value(
-            go_offline=bool(os.environ.get("EVOCLAW_GO_OFFLINE")),
+            go_offline=bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE")),
             quarantine_active=_quarantine,
         )
         go_env_script = f"""
@@ -1239,12 +1239,12 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
             raise RuntimeError("Network lockdown verification failed: github.com is reachable")
 
         # Quarantine: assert the denied registry hosts are actually unreachable
-        # — the whole point of EVOCLAW_DENY_*. The github.com probe above only
+        # — the whole point of SWE_MILESTONE_DENY_*. The github.com probe above only
         # covers code hosting; a typo'd deny CIDR/domain would otherwise pass
         # verification while leaving the exact cheat channel (e.g. PyPI) open.
-        _deny_domains = [d.strip() for d in os.environ.get("EVOCLAW_DENY_DOMAINS", "").split(",") if d.strip()]
+        _deny_domains = [d.strip() for d in os.environ.get("SWE_MILESTONE_DENY_DOMAINS", "").split(",") if d.strip()]
         # A denied registry is exempt from the reachability assertion ONLY if the
-        # policy DECLARES it un-CIDR-blockable (EVOCLAW_FIREWALL_EXEMPT — e.g.
+        # policy DECLARES it un-CIDR-blockable (SWE_MILESTONE_FIREWALL_EXEMPT — e.g.
         # proxy.golang.org shares Vertex's Google range, defended by /etc/hosts
         # poison + GOPROXY=off). Everything else MUST verify unreachable. The old
         # runtime "resolved IPs all fall in a still-ACCEPTed CDN range" inference
@@ -1257,7 +1257,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # because the policy mislabeled it exempt) (F1).
         _exempt = {
             d.strip().lower()
-            for d in os.environ.get("EVOCLAW_FIREWALL_EXEMPT", "").split(",")
+            for d in os.environ.get("SWE_MILESTONE_FIREWALL_EXEMPT", "").split(",")
             if d.strip()
         } & FIREWALL_EXEMPTABLE_DOMAINS
         _verified = 0
@@ -1272,7 +1272,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
             if self._url_reachable_in_container(f"https://{host}"):
                 raise RuntimeError(
                     f"Quarantine verification failed: denied host '{host}' is still "
-                    f"reachable — EVOCLAW_DENY_DOMAINS/EVOCLAW_DENY_CIDRS not effective"
+                    f"reachable — SWE_MILESTONE_DENY_DOMAINS/SWE_MILESTONE_DENY_CIDRS not effective"
                 )
             _verified += 1
         if _verified:
@@ -1284,7 +1284,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # means the answer-fetch channel is open; the deny must make connects
         # fail. Uses python3 (guaranteed by init), not curl, so the check is
         # real even on images that ship no curl (e.g. the scikit base).
-        _verify_urls = [u.strip() for u in os.environ.get("EVOCLAW_VERIFY_FETCH_URLS", "").split(",") if u.strip()]
+        _verify_urls = [u.strip() for u in os.environ.get("SWE_MILESTONE_VERIFY_FETCH_URLS", "").split(",") if u.strip()]
         for url in _verify_urls:
             if self._url_reachable_in_container(url):
                 raise RuntimeError(
@@ -1298,7 +1298,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # contains the repo's own artifacts at a post-baseline version (the
         # offline closure must not be able to serve the answer — the cache
         # analogue of the pip wheelhouse_forbid audit).
-        _forbid_globs = [g.strip() for g in os.environ.get("EVOCLAW_CACHE_FORBID_GLOBS", "").split(",") if g.strip()]
+        _forbid_globs = [g.strip() for g in os.environ.get("SWE_MILESTONE_CACHE_FORBID_GLOBS", "").split(",") if g.strip()]
         for glob_pat in _forbid_globs:
             audit = subprocess.run(
                 [

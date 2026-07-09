@@ -642,7 +642,7 @@ class PatchEvaluator:
         #   deliberately NOT migrated, see docs/versioning.md):
         #               {repo}/{test_name}/{milestone_id}:{tag}
         # Note: Docker image names must be lowercase (OCI spec requirement)
-        # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default in
+        # Benchmark data version is pinned via SWE_MILESTONE_IMAGE_TAG (default in
         # image_version.py); resolve_image falls back to :latest WITH a warning
         # when the default pin is absent locally (never when set explicitly).
         if self.test_name:

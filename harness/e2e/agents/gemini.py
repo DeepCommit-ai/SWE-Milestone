@@ -81,16 +81,16 @@ class GeminiFramework(AgentFramework):
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self._include_directories = include_directories or []
-        # Vertex AI mode (run_all.py sets EVOCLAW_VERTEX when vertex_ai: true).
+        # Vertex AI mode (run_all.py sets SWE_MILESTONE_VERTEX when vertex_ai: true).
         # In this mode the `model` is the exact Vertex publisher id, so the
         # "-preview" alias rewrite below must be skipped (Vertex has no
         # "gemini-3.5-flash-preview"; the bridge registers the bare id).
-        self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
+        self._vertex = bool(os.environ.get("SWE_MILESTONE_VERTEX"))
         # Route B (direct Vertex): gemini-cli's built-in Vertex mode talks native
         # Gemini to Vertex via ADC — no LiteLLM bridge (the bridge double-prefixes
         # SSE and breaks gemini-cli's stream parser). run_all.py supplies these.
-        self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
-        self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
+        self._vertex_project = os.environ.get("SWE_MILESTONE_VERTEX_PROJECT")
+        self._vertex_location = os.environ.get("SWE_MILESTONE_VERTEX_LOCATION", "global")
         # gemini-cli runs thinkingLevel HIGH (dynamic budget, thinkingBudget=-1)
         # by default and only exposes a thinking on/off toggle — there are no
         # graded levels and no CLI/settings knob to set one in this version. So

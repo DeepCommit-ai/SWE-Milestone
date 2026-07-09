@@ -122,7 +122,7 @@ timeout: 18000
 
 ## How it works
 
-When `vertex_ai: true`, `run_all.py` sets `EVOCLAW_VERTEX` + project/location in
+When `vertex_ai: true`, `run_all.py` sets `SWE_MILESTONE_VERTEX` + project/location in
 the env the workers inherit, then the agent framework wires its native Vertex
 mode:
 
