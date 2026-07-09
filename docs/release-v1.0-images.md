@@ -37,10 +37,15 @@ resume with the recorded old names (spec §8).
 
 ## 4. Freeze digests into the manifest (binding layer)
 
+    # NOTE: match the digest to the NEW hub repo — `index .RepoDigests 0` may
+    # return a stale entry from the old-name pull (potentially a list digest).
     python3 -m harness.e2e.image_version push-plan --version v1.0 |
     while IFS=$'\t' read -r local hub; do
-        printf '%s\t%s\n' "$local" \
-            "$(docker image inspect --format '{{index .RepoDigests 0}}' "$hub" 2>/dev/null || echo PUSH-FIRST)"
+        repo="${hub%%:*}"
+        digest=$(docker image inspect \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' "$hub" 2>/dev/null |
+            grep "^${repo}@" | head -1)
+        printf '%s\t%s\n' "$local" "${digest:-PUSH-FIRST}"
     done > manifests/digests-v1.0.tsv
 
 Commit `manifests/digests-v1.0.tsv`. A future v1.x diffs against this file
