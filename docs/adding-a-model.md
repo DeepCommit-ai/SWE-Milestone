@@ -243,3 +243,10 @@ Code talks to Vertex directly.
 - [ ] (claude-code) `default_haiku_model` set
 - [ ] `reasoning_effort` decided (mind claude-code #48051)
 - [ ] config created, launched, monitored
+
+---
+
+**After the trials finish:** surfacing results on the `:5000` dashboard is a
+separate pipeline in the sibling `analysis/` repo — see
+`analysis/docs/dashboard_migration.md` (migrate → register → refresh → build,
+plus the PYTHONPATH pitfall that silently under-reports cost).
