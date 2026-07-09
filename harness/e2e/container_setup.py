@@ -173,6 +173,14 @@ def _interpret_probe(returncode: int, stdout: str) -> bool:
     )
 
 
+def _repo_from_image(image_name: str) -> str:
+    """Best-effort repo_full for log messages (never raises)."""
+    try:
+        return parse_local_ref((image_name or "").strip())[0]
+    except ValueError:
+        return image_name or "?"
+
+
 def _quarantine_env_from_image(image_name: str, project_root=None) -> dict:
     """Recover the full quarantine env for the repo this image belongs to, from
     the on-disk policy file.
@@ -281,7 +289,7 @@ class ContainerSetup:
                 os.environ.update(_recovered)
                 logger.info(
                     f"Quarantine env recovered from policy for "
-                    f"'{repo_name or image_name.split('/')[0]}' (env-less launch path)"
+                    f"'{repo_name or _repo_from_image(image_name)}' (env-less launch path)"
                 )
 
     def get_agent_mounts(self) -> list[str]:

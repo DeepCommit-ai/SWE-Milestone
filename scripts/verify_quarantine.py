@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Live smoke test of a repo's quarantine policy against its real base image.
 
-Spins up <repo>/base:latest with the policy's env applied, runs the minimal
+Spins up the repo's production image (image_for_repo: base-offline for
+quarantine repos, else base) with the policy's env applied, runs the minimal
 base init (fakeroot — NOT the agent install), applies lock_network() (which
 itself runs the fail-closed verification: deny-domain probes, answer-fetch
 URL probes, cache forbid-glob audit), then runs positive probes (LLM
@@ -53,7 +54,9 @@ def _probe(cs: "ContainerSetup", url: str, expect_blocked: bool) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", required=True, help="Repo name substring (matched against quarantine_configs/)")
-    ap.add_argument("--image", default=None, help="Override image (default <repo_lowercase>/base:latest)")
+    ap.add_argument("--image", default=None,
+                    help="Override image (default: image_for_repo — "
+                         "swe-milestone/<repo_full>__base[-offline]:<pin>)")
     ap.add_argument("--keep", action="store_true", help="Keep the container for manual inspection")
     args = ap.parse_args()
 
