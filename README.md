@@ -83,11 +83,12 @@ Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/EvoCla
 git lfs install
 git clone https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data
 
-# Pull all repos at once
+# Pull all images (login first — anonymous pulls are rate-limited, ~115 images)
+docker login
 ./scripts/pull_images.sh
 ```
 
-> See [docs/setup.md](docs/setup.md) for the full data layout, Docker image naming conventions, and manual retag instructions.
+> See [docs/setup.md](docs/setup.md) for the full data layout and image naming scheme, and [docs/versioning.md](docs/versioning.md) for the versioning policy.
 
 **3. Host paths (configure once)**
 
