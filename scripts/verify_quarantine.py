@@ -81,7 +81,7 @@ def main() -> int:
     try:
         # Manual minimal start: docker run with the quarantine env/mounts but
         # WITHOUT the agent init (no claude install needed for a network test).
-        cmd = ["docker", "run", "-d", "--init", "--cap-add=NET_ADMIN",
+        cmd = ["docker", "run", "--pull=never", "-d", "--init", "--cap-add=NET_ADMIN",
                "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
                "--name", container]
         cmd += cs._framework.get_quarantine_env_vars()

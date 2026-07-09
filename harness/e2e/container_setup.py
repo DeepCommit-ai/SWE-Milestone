@@ -574,6 +574,7 @@ print("Container initialization complete!")
         docker_options = [
             "docker",
             "run",
+            "--pull=never",  # hermetic eval: image must already be local (spec §3.3a)
             "-d",
             "--init",
             "--cap-add=NET_ADMIN",

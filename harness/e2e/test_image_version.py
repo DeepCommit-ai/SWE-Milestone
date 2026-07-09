@@ -242,3 +242,16 @@ class TestConsumers:
             "zeromicro_go-zero_v1.6.0_v1.9.3/base-offline:latest"
         )[0]
         assert new == old == "zeromicro_go-zero_v1.6.0_v1.9.3"
+
+
+class TestPullNeverHardening:
+    """spec §3.3a: benchmark 镜像的容器启动必须显式 --pull=never。"""
+
+    @pytest.mark.parametrize("rel", [
+        "harness/e2e/evaluator.py",
+        "harness/e2e/container_setup.py",
+        "scripts/verify_quarantine.py",
+    ])
+    def test_launch_sites_have_pull_never(self, rel):
+        src = (REPO_ROOT / rel).read_text()
+        assert '"--pull=never"' in src, f"{rel}: benchmark container launch lacks --pull=never"

@@ -700,6 +700,7 @@ class PatchEvaluator:
         cmd = [
             "docker",
             "run",
+            "--pull=never",  # hermetic eval: image must already be local (spec §3.3a)
             "-d",
             "--init",
             "--name",
