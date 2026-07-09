@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from harness.e2e.agents import AgentFramework, get_agent_framework
+from harness.e2e.image_version import parse_local_ref
 from harness.e2e.quarantine import (
     FIREWALL_EXEMPTABLE_DOMAINS,
     QUARANTINE_MIRROR_DOMAINS,
@@ -184,10 +185,14 @@ def _quarantine_env_from_image(image_name: str, project_root=None) -> dict:
     var, so it survives env loss. A repo with no config recovers {} and stays
     unprotected (parity preserved). Docker repo names are lowercase while config
     filenames may not be (e.g. BurntSushi), so match case-insensitively.
+    Handles both the swe-milestone/ scheme and legacy pre-v1.0 names (resumed
+    old trials replay recorded image names verbatim).
     """
-    repo_lower = (image_name or "").split("/")[0].split(":")[0].strip().lower()
-    if not repo_lower:
+    try:
+        repo_lower, _ = parse_local_ref((image_name or "").strip())
+    except ValueError:
         return {}
+    repo_lower = repo_lower.lower()
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
     conf_dir = root / "quarantine_configs"
     if not conf_dir.is_dir():

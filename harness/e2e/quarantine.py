@@ -16,7 +16,7 @@ from pathlib import Path
 
 import yaml
 
-from harness.e2e.image_version import resolve_image
+from harness.e2e.image_version import local_ref, resolve_image
 
 # Registry domains that can serve a repo's own published artifacts, per
 # ecosystem. The coverage gate (quarantine_coverage_errors) requires a repo's
@@ -142,22 +142,23 @@ def image_for_repo(repo_name: str, project_root: Path) -> str:
 
     A quarantine repo (one with quarantine_configs/<repo>.yaml) runs under
     network lockdown + forced-offline package managers, so it must use the
-    **offline-closure image** `<repo>/base-offline:latest` — base:latest baked
-    with the B-version dependency closure (scripts/build_offline_closure.py) so
-    the locked-down container can still build A→B offline. Without the closure
-    image, the agent would hit `No matching distribution` / `cargo offline` /
-    `GOPROXY=off` errors on legitimate new deps (the base:latest cache only has
-    the A-version closure). Non-quarantine repos use base:latest as before.
+    **offline-closure image** `swe-milestone/<repo_full>__base-offline` — the
+    base image baked with the B-version dependency closure
+    (scripts/build_offline_closure.py) so the locked-down container can still
+    build A→B offline. Without the closure image, the agent would hit
+    `No matching distribution` / `cargo offline` / `GOPROXY=off` errors on
+    legitimate new deps (the plain base cache only has the A-version closure).
+    Non-quarantine repos use the plain `__base` image as before.
 
     This applies to ALL quarantine ecosystems including pip: the closure builder
-    now bakes the pip wheelhouse directly into base-offline:latest (instead of
+    bakes the pip wheelhouse directly into the base-offline image (instead of
     relying on a host-mounted wheelhouse), making the image fully self-contained
     and portable across machines.
     """
-    lower = repo_name.lower()
     q = load_quarantine_config(repo_name, project_root)
-    base = f"{lower}/base-offline" if q is not None else f"{lower}/base"
-    # resolve_image honors the EVOCLAW_IMAGE_TAG pin (default v0.9) with a loud
+    milestone = "base-offline" if q is not None else "base"
+    base = local_ref(repo_name, milestone)
+    # resolve_image honors the EVOCLAW_IMAGE_TAG pin (default in image_version.py) with a loud
     # :latest fallback — NOT a hardcoded :latest, which silently ignored the pin
     # so reproducibility runs graded against the wrong data version.
     return resolve_image(base)

@@ -450,22 +450,22 @@ class TestImageForRepo:
     def test_no_config_uses_base_via_resolver(self, tmp_path, monkeypatch):
         seen = []
         self._patch_resolver(monkeypatch, seen)
-        assert image_for_repo("Foo_Bar", tmp_path) == "foo_bar/base:PIN"
-        assert seen == ["foo_bar/base"]
+        assert image_for_repo("Foo_Bar", tmp_path) == "swe-milestone/foo_bar__base:PIN"
+        assert seen == ["swe-milestone/foo_bar__base"]
 
     def test_go_quarantine_uses_offline_base_via_resolver(self, tmp_path, monkeypatch):
         _write_config(tmp_path, "gz", "ecosystem: [go]\ngo_offline: true\n")
         seen = []
         self._patch_resolver(monkeypatch, seen)
-        assert image_for_repo("gz", tmp_path) == "gz/base-offline:PIN"
-        assert seen == ["gz/base-offline"]
+        assert image_for_repo("gz", tmp_path) == "swe-milestone/gz__base-offline:PIN"
+        assert seen == ["swe-milestone/gz__base-offline"]
 
     def test_pip_uses_offline_base_via_resolver(self, tmp_path, monkeypatch):
         _write_config(tmp_path, "sk", "ecosystem: [pip]\n")
         seen = []
         self._patch_resolver(monkeypatch, seen)
-        assert image_for_repo("sk", tmp_path) == "sk/base-offline:PIN"
-        assert seen == ["sk/base-offline"]
+        assert image_for_repo("sk", tmp_path) == "swe-milestone/sk__base-offline:PIN"
+        assert seen == ["swe-milestone/sk__base-offline"]
 
 
 class TestCidrOverlap:

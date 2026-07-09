@@ -229,3 +229,16 @@ class TestPlanCLI:
             "navidrome_navidrome_v0.57.0_v0.58.0/base-offline:latest"
             "\tswe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base-offline:v1.0"
         ) in lines
+
+
+class TestConsumers:
+    def test_container_setup_repo_extraction_both_formats(self):
+        from harness.e2e.container_setup import _quarantine_env_from_image  # noqa: F401
+        # 直接验证解析函数对两种格式给出相同 repo_full(quarantine 查找的 key)
+        new = parse_local_ref(
+            "swe-milestone/zeromicro_go-zero_v1.6.0_v1.9.3__base-offline:v1.0"
+        )[0]
+        old = parse_local_ref(
+            "zeromicro_go-zero_v1.6.0_v1.9.3/base-offline:latest"
+        )[0]
+        assert new == old == "zeromicro_go-zero_v1.6.0_v1.9.3"
