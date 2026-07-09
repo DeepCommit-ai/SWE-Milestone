@@ -1,83 +1,98 @@
-# Versioning policy
+# Versioning
 
-A benchmark version number is a **comparability contract**: two scores may
-share a leaderboard only if they were produced against the same tasks, the
-same environments, and the same grading semantics. Everything below follows
-from one axiom:
+One axiom: **any change that could move a score bumps the benchmark version;
+anything else doesn't.** A version number is a comparability contract —
+same tasks, same environments, same grading.
 
-> Any change that could move a score bumps the benchmark version.
-> Any change that cannot, does not.
+## Two axes
 
-## Two version axes + a binding layer
+| Axis | Format | Covers |
+|---|---|---|
+| **Benchmark data version** | `vX.Y` — the image tag (`EVOCLAW_IMAGE_TAG`, default in `harness/e2e/image_version.py`) | tasks, tests, image environments, **grading semantics** |
+| **Harness version** | git commits / tags | everything score-neutral (refactors, logging, agent integrations) |
 
-| Axis | Format | Covers | Lives in |
-|---|---|---|---|
-| **Benchmark data version** | `vX.Y` (e.g. `v1.0`) | tasks, tests, Docker image environments, **grading semantics** | image tags; `EVOCLAW_IMAGE_TAG` (default in `harness/e2e/image_version.py`) |
-| **Harness version** | git tags / commits (3-part `vX.Y.Z` if tagged, to stay visually distinct) | everything score-neutral: refactors, logging, monitoring, agent integrations | git history |
-
-Docker images have **no version identity of their own** — they are the frozen
-form of the benchmark data, so their tag *is* the benchmark data version.
-
-The **binding layer** is the per-version manifest pair:
-
-- `manifests/images-<version>.tsv` — the image inventory (`short`,
-  `repo_full`, `milestone`; ~115 rows for v1.0). The ONLY place the inventory
-  is defined; pull/push/retag plans are generated from it
-  (`python3 -m harness.e2e.image_version {pull,push,retag}-plan`).
-- `manifests/digests-<version>.tsv` — the content freeze: each image's
-  registry manifest digest, captured after the release push. Diffing two
-  versions' digest files proves exactly which images changed.
-
-Anchors vs labels: the **digest** (and the git **commit SHA**) are content
-identity; tags are human-readable pointers. Provenance records should carry
-the anchor, not just the label.
+Images have no version identity of their own — their tag *is* the benchmark
+version. The binding layer is `manifests/images-<v>.tsv` (inventory; drives
+pull/push plans) + `manifests/digests-<v>.tsv` (content freeze — diff two
+versions to prove exactly which images changed). Digests and commit SHAs are
+identity; tags are labels.
 
 ## Bump rules
 
 | Change | Bump |
 |---|---|
-| Task/test edits, image environment changes (e.g. quarantine hardening) | benchmark version |
-| **Grading/judging logic change** — even with zero image changes | benchmark version (digest file notes "images identical to previous") |
-| Single-task fix | benchmark patch version (e.g. `v1.0.1`); only that image's digest changes |
-| Harness refactor / logging / new agent support / infra fixes | harness only |
+| Task / test / image-environment change | benchmark |
+| Grading logic change — even with zero image changes | benchmark |
+| Single-task fix | benchmark patch (`v1.0.1`) |
+| Anything score-neutral | harness only |
 
 There is no "backward compatible" benchmark change — only *comparable* and
-*not comparable*. Scores across benchmark versions must be labeled as such.
+*not comparable*; cross-version scores must be labeled.
 
-## Immutability discipline
+## Immutability
 
-1. **Published version tags are read-only.** Never overwrite, never delete —
-   deleting breaks reproduction of every historical score on that version.
-2. **Retag, never rebuild.** Docker builds are not reproducible (a rebuild
-   silently drifts the arena). For a new version, unchanged images get the
-   OLD digest retagged (`docker tag` — a free pointer operation; pushing a
-   retag uploads 0 bytes, layers dedupe); only changed images are rebuilt.
-3. **`:latest` and `:staging` are floating build tags** — pipeline-internal
-   only, never the basis of a published version, never trusted by an
-   explicitly pinned run (`resolve_image` never falls back when
-   `EVOCLAW_IMAGE_TAG` is set).
-4. **Containers launch with `--pull=never`** — a missing local image is a
-   loud failure, never a silent registry fetch mid-eval.
-5. **Results are append-only and stamped**: benchmark version, image ref (and
-   ideally digest), model/agent — recorded per trial; old records are facts
-   and are never rewritten. Pre-v1.0 trials recorded old-format image names;
-   the single legacy parse branch (`parse_local_ref`) exists solely so
-   resuming them keeps working.
+1. Published version tags are read-only: never overwrite, never delete.
+2. **Retag, never rebuild.** Builds are not reproducible; unchanged images
+   keep their old digest under the new tag (a free pointer op — pushing a
+   retag uploads 0 bytes).
+3. `:latest` / `:staging` are floating build tags, never a published basis;
+   an explicit `EVOCLAW_IMAGE_TAG` never falls back.
+4. Containers launch with `--pull=never`: a missing local image fails loud,
+   never a silent registry fetch.
+5. Results are append-only. Pre-v1.0 trials recorded old-format image names;
+   the single legacy branch in `parse_local_ref` keeps their resume working —
+   so don't `docker rmi` old-format local images while such trials remain.
 
-## Naming (v1.0 scheme)
+## Naming (v1.0)
 
 ```
 hub:    <org>/swe-milestone__<repo_full>__<milestone>:<version>
 local:  swe-milestone/<repo_full>__<milestone>:<version>
 ```
 
-The payload is byte-identical on both sides; conversion is mechanical
-(`/` ↔ `__` under the fixed `swe-milestone` prefix) with no lookup table.
-`base` and `base-offline` are ordinary milestones. `repo_full` and
-`milestone` never contain `__` (validated at load). Single authority:
-`harness/e2e/image_version.py`. See `docs/setup.md` for usage and
-`docs/release-v1.0-images.md` for the release runbook.
+Mechanical conversion (`/` ↔ `__`), no lookup table. `base`/`base-offline`
+are ordinary milestones; components never contain `__` (validated at load).
+Authority: `harness/e2e/image_version.py`; usage: [setup.md](setup.md).
+Pre-v1.0 hub images (`hyd2apse/<short>:<mid>-v0.9`) are frozen in place;
+no tooling reads them.
 
-Pre-v1.0 hub images (`hyd2apse/<short>:<milestone>-v0.9`) are frozen in
-place; no tooling reads them (fetch via the old script from git history if
-ever needed).
+## Release runbook (vX.Y)
+
+Run on the machine holding the source images. Example values: v0.9 → v1.0.
+
+```bash
+# 1. Inventory check — every manifest row has a local source (expect no output)
+python3 -m harness.e2e.image_version retag-plan --version v1.0 \
+    --from-version v0.9 --base-offline-from latest |
+while IFS=$'\t' read -r old new; do
+    docker image inspect "$old" >/dev/null 2>&1 || echo "MISSING $old"
+done
+
+# 2. Retag old -> new (pointer op; keep the old tags, see Immutability #5)
+python3 -m harness.e2e.image_version retag-plan --version v1.0 \
+    --from-version v0.9 --base-offline-from latest |
+while IFS=$'\t' read -r old new; do docker tag "$old" "$new" || exit 1; done
+
+# 3. Push everything (docker login first; non-zero exit on any failure)
+./scripts/push_images.sh
+
+# 4. Freeze digests — match the NEW hub repo (RepoDigests[0] can be a stale
+#    entry from an old-name pull); commit the resulting file
+python3 -m harness.e2e.image_version push-plan --version v1.0 |
+while IFS=$'\t' read -r local hub; do
+    repo="${hub%%:*}"
+    digest=$(docker image inspect \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' "$hub" 2>/dev/null |
+        grep "^${repo}@" | head -1)
+    printf '%s\t%s\n' "$local" "${digest:-PUSH-FIRST}"
+done > manifests/digests-v1.0.tsv
+
+# 5. Verify: plan sanity, spot-check registry digests, smoke one eval
+./scripts/pull_images.sh --dry-run
+docker manifest inspect <hub_ref>        # digest must equal the frozen value
+python3 scripts/verify_quarantine.py --repo <short>
+```
+
+After release: bump `DEFAULT_IMAGE_TAG` in `image_version.py` (if not already
+done with the code change); other machines align via `./scripts/pull_images.sh`
+(layer dedup makes it near-free) or step 2 above.

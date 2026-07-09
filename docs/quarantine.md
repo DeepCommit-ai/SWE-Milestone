@@ -342,7 +342,7 @@ Prerequisite: the repo's milestone images are present (`scripts/pull_images.sh`)
 The builder only tags **`:staging`/`:latest`** (floating build tags), but the
 harness pins the benchmark data version (§8). A rebuilt closure is **not
 live** until promoted to the pinned tag — release promotion is handled
-uniformly by `retag-plan` (see `docs/release-v1.0-images.md`); for a single
+uniformly by `retag-plan` (see the release runbook in `docs/versioning.md`); for a single
 repo on one machine:
 
 ```bash
