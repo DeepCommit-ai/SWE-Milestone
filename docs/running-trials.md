@@ -195,7 +195,7 @@ working slowly".
 TRIAL=my_experiment_001
 REPO=BurntSushi_ripgrep_14.1.1_15.0.0      # full repo dir name
 CONT="${REPO}-${TRIAL}"
-TRIAL_DIR=/path/to/EvoClaw-data/$REPO/e2e_trial/$TRIAL
+TRIAL_DIR=/path/to/SWE-Milestone-data/$REPO/e2e_trial/$TRIAL
 
 # 1. Worker alive?  (substring-match the trial; --resume-trial workers don't
 #    have --repo-name in cmdline, so grep the trial name not the repo flag)
@@ -305,7 +305,7 @@ fresh side-steps the pathological state.
 > "the trial itself is wrong" (bad config / wrong model / corrupted state),
 > not for "the agent's network call hung".
 
-> **EvoClaw benchmark protocol**: trials are resumed until all milestones are
+> **SWE-Milestone benchmark protocol**: trials are resumed until all milestones are
 > submitted and evaluated, unless three consecutive resumes yield no new
 > submissions. Reproducibility studies should follow the same setting.
 
@@ -411,7 +411,7 @@ shell-exported var still wins):
 
 | Variable | Description |
 |---|---|
-| `EVOCLAW_DATA_ROOT` | Where you downloaded EvoClaw-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
+| `EVOCLAW_DATA_ROOT` | Where you downloaded SWE-Milestone-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
 
 > **Quarantine (anti-cheat) is zero-touch.** It auto-applies to any repo that has
 > a `quarantine_configs/<repo>.yaml` policy — nothing to pass per run (a `🔒` marker

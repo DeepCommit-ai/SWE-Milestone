@@ -1,6 +1,6 @@
 # Quarantine — anti-cheat network isolation
 
-EvoClaw drops an agent into a repo at version **A** and asks it to implement the
+SWE-Milestone drops an agent into a repo at version **A** and asks it to implement the
 changes that turn it into version **B** (the milestones). The benchmark is only
 valid if the agent *writes* those changes. If it can instead **fetch version B's
 own source** (the "answer") and copy it, the score is meaningless.

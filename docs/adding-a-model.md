@@ -1,6 +1,6 @@
 # Adding a New Model to an Existing Agent
 
-This guide covers running a **new model** on one of the four agents EvoClaw
+This guide covers running a **new model** on one of the four agents SWE-Milestone
 already supports (`claude-code`, `codex`, `gemini-cli`, `openhands`).
 
 > Adding a new **agent framework** (a new adapter) is a different, larger task —
@@ -15,7 +15,7 @@ pricing row. Here's the whole process.
 
 ```yaml
 # trial_configs/<agent>_<model>.yaml
-data_root: /path/to/EvoClaw-data
+data_root: /path/to/SWE-Milestone-data
 trial_name: <agent>_<model>
 agent: claude-code            # claude-code | codex | gemini-cli | openhands
 model: <the endpoint's exact model id>
@@ -209,7 +209,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST \
 **2. Config** (`trial_configs/claude-code_opus-4.8.yaml`):
 
 ```yaml
-data_root: /path/to/EvoClaw-data
+data_root: /path/to/SWE-Milestone-data
 trial_name: claude-code_opus-4.8
 agent: claude-code
 model: claude-opus-4-8

@@ -9,8 +9,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/Hydrapse/EvoClaw.git
-cd EvoClaw
+git clone https://github.com/DeepCommit-ai/SWE-Milestone.git
+cd SWE-Milestone
 uv sync
 ```
 
@@ -20,13 +20,13 @@ Workspace data (metadata, SRS documents, test classifications) is hosted on Hugg
 
 ```bash
 git lfs install
-git clone https://huggingface.co/datasets/hyd2apse/EvoClaw-data
+git clone https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data
 ```
 
 The dataset contains one directory per repository:
 
 ```
-EvoClaw-data/
+SWE-Milestone-data/
 ├── navidrome_navidrome_v0.57.0_v0.58.0/
 ├── apache_dubbo_dubbo-3.3.3_dubbo-3.3.6/
 ├── BurntSushi_ripgrep_14.1.1_15.0.0/

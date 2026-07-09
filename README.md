@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" width="720" alt="EvoClaw Banner" />
+  <img src="assets/banner.png" width="720" alt="SWE-Milestone Banner" />
 </p>
 
 <p align="center">
@@ -7,9 +7,9 @@
 </p>
 
 <p align="center">
-  <a href="https://evo-claw.com"><img src="https://img.shields.io/badge/Website-evo--claw.com-blue.svg" alt="Website" /></a>
+  <a href="https://swe-milestone.com/"><img src="https://img.shields.io/badge/Website-swe--milestone.com-blue.svg" alt="Website" /></a>
   <a href="https://arxiv.org/abs/2603.13428"><img src="https://img.shields.io/badge/arXiv-2603.13428-b31b1b.svg" alt="arXiv" /></a>
-  <a href="https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Dataset-orange.svg" alt="HuggingFace Dataset" /></a>
+  <a href="https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Dataset-orange.svg" alt="HuggingFace Dataset" /></a>
   <a href="https://github.com/DeepCommit-ai/DeepCommit"><img src="https://img.shields.io/badge/Data%20Pipeline-DeepCommit-blue?logo=github&logoColor=white" alt="DeepCommit Data Pipeline" /></a>
   <a href="https://hub.docker.com/u/hyd2apse"><img src="https://img.shields.io/badge/Docker-hyd2apse-2496ED?logo=docker&logoColor=white" alt="DockerHub" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
@@ -18,35 +18,32 @@
 
 ---
 
-> [!NOTE]
-> 🆕 **[DeepCommit](https://github.com/DeepCommit-ai/DeepCommit)**, the agentic data pipeline that builds the EvoClaw benchmark from real-world commit histories, is now open-source!
-
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 
 <p align="center">
-  <img src="assets/evoclaw_concept.png" width="560" alt="Independent Coding Task vs. Continuous Software Evolution" />
+  <img src="assets/swe-milestone_concept.png" width="560" alt="Independent Coding Task vs. Continuous Software Evolution" />
 </p>
 
-**EvoClaw** is a general-purpose evaluation harness for **continuous tasks**. It drops an AI agent into a working environment and challenges it to complete an ordered sequence of milestones. As the agent works, EvoClaw silently extracts checkpoints, evaluates each milestone, and asynchronously unlocks downstream tasks, enabling fine-grained, per-milestone analysis without interrupting the agent's session. 
+**SWE-Milestone** is a general-purpose evaluation harness for **continuous tasks**. It drops an AI agent into a working environment and challenges it to complete an ordered sequence of milestones. As the agent works, SWE-Milestone silently extracts checkpoints, evaluates each milestone, and asynchronously unlocks downstream tasks, enabling fine-grained, per-milestone analysis without interrupting the agent's session. 
 
 <p align="center">
-  <img src="assets/evoclaw_illustration.png" width="820" alt="How EvoClaw works: Continuous Task Evaluation with DAG, Agent Loop, and Test-Based Grading" />
+  <img src="assets/swe-milestone_illustration.png" width="820" alt="How SWE-Milestone works: Continuous Task Evaluation with DAG, Agent Loop, and Test-Based Grading" />
 </p>
 
-Currently focused on **software evolution**, EvoClaw's architecture is designed to extend to other domains.
+Currently focused on **software evolution**, SWE-Milestone's architecture is designed to extend to other domains.
 
 ## ✨ Key Features
 
-- **Test Your Model**: Out of the box, EvoClaw ships with the [EvoClaw Benchmark](https://arxiv.org/abs/2603.13428) (long-horizon software evolution itineraries from 7 real-world repos) and 4 pre-configured agent frameworks ([Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/codex/), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenHands](https://github.com/All-Hands-AI/OpenHands)). Provide a model API key and start evaluating.
+- **Test Your Model**: Out of the box, SWE-Milestone ships with the [SWE-Milestone Benchmark](https://arxiv.org/abs/2603.13428) (long-horizon software evolution itineraries from 7 real-world repos) and 4 pre-configured agent frameworks ([Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/codex/), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenHands](https://github.com/All-Hands-AI/OpenHands)). Provide a model API key and start evaluating.
 
-- **Bring Your Own Agent**: The agent layer is decoupled from the evaluation engine (see below). Plug in your own agent by implementing a lightweight adapter. EvoClaw also provides a per-milestone analysis framework for detailed performance breakdowns.
+- **Bring Your Own Agent**: The agent layer is decoupled from the evaluation engine (see below). Plug in your own agent by implementing a lightweight adapter. SWE-Milestone also provides a per-milestone analysis framework for detailed performance breakdowns.
 
-- **Bring Your Own Data**: Supply your own task descriptions, test environments (Docker), test list for scoring, and task dependencies. EvoClaw handles orchestration, checkpoint-based evaluation, and reporting, enabling continuous task evaluation beyond coding.
+- **Bring Your Own Data**: Supply your own task descriptions, test environments (Docker), test list for scoring, and task dependencies. SWE-Milestone handles orchestration, checkpoint-based evaluation, and reporting, enabling continuous task evaluation beyond coding.
 
 ## 👋 Overview
 
 <p align="center">
-  <img src="assets/evoclaw_arch.png" width="820" alt="EvoClaw Architecture: Orchestrator, Agent Container, DAG Manager, Evaluation Cycle, and Analytics" />
+  <img src="assets/swe-milestone_arch.png" width="820" alt="SWE-Milestone Architecture: Orchestrator, Agent Container, DAG Manager, Evaluation Cycle, and Analytics" />
 </p>
 
 Each evaluation trial works as follows:
@@ -69,19 +66,19 @@ Each evaluation trial works as follows:
 **1. Installation**
 
 ```bash
-git clone https://github.com/Hydrapse/EvoClaw.git
-cd EvoClaw
+git clone https://github.com/DeepCommit-ai/SWE-Milestone.git
+cd SWE-Milestone
 uv sync
 ```
 
 **2. Data & Docker Images**
 
-Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data). Docker images are hosted on [DockerHub](https://hub.docker.com/u/hyd2apse).
+Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data). Docker images are hosted on [DockerHub](https://hub.docker.com/u/hyd2apse).
 
 ```bash
 # Download workspace data
 git lfs install
-git clone https://huggingface.co/datasets/EvoClaw-Bench/EvoClaw-data
+git clone https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data
 
 # Pull all images (login first — anonymous pulls are rate-limited, ~115 images)
 docker login
@@ -92,11 +89,11 @@ docker login
 
 **3. Host paths (configure once)**
 
-EvoClaw reads host-specific paths from `.env_private` (gitignored), auto-loaded by `run_all.py` on every launch — set them **once** and they persist across shells, no re-exporting. Copy the template and edit the one path that matters (where you downloaded the data):
+SWE-Milestone reads host-specific paths from `.env_private` (gitignored), auto-loaded by `run_all.py` on every launch — set them **once** and they persist across shells, no re-exporting. Copy the template and edit the one path that matters (where you downloaded the data):
 
 ```bash
 cp .env .env_private
-# edit .env_private →  EVOCLAW_DATA_ROOT=/abs/path/to/EvoClaw-data
+# edit .env_private →  EVOCLAW_DATA_ROOT=/abs/path/to/SWE-Milestone-data
 ```
 
 Trial configs then use `data_root: ${EVOCLAW_DATA_ROOT}` — no host path to repeat. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
@@ -166,7 +163,7 @@ Directly re-run the same `run_all.py` command to resume and continues from where
 python scripts/run_all.py --config trial_config.yaml
 ```
 
-> **Evaluation protocol**: The reported EvoClaw benchmark results follow this protocol: trials are resumed until all milestones are submitted and evaluated. Each resume reuses the same agent session by default to preserve the model's memory of prior work; after three consecutive resumes without new submissions, EvoClaw automatically rotates in a fresh session on the next resume so no repo blocks the trial indefinitely. We encourage reproducibility studies to follow the same setting.
+> **Evaluation protocol**: The reported SWE-Milestone benchmark results follow this protocol: trials are resumed until all milestones are submitted and evaluated. Each resume reuses the same agent session by default to preserve the model's memory of prior work; after three consecutive resumes without new submissions, SWE-Milestone automatically rotates in a fresh session on the next resume so no repo blocks the trial indefinitely. We encourage reproducibility studies to follow the same setting.
 
 > ⚠️ **Not every "no progress" is the agent's fault.** Rate-limit (HTTP 429), quota exhaustion, or auth (HTTP 401/403) errors also cause workers to exit with no submissions. Rotating the agent session won't help — the next request hits the same error. Check the session jsonl for `api_error_status: 429` / `"reached your usage limit"` / `401`; if present, fix the API key (top up or rotate) **before** resuming.
 
@@ -178,7 +175,7 @@ We welcome contributions! Whether it's adding support for new agents, new task d
 
 ## ✍️ Citation
 
-Welcome to cite our paper if you find EvoClaw useful!
+Welcome to cite our paper if you find SWE-Milestone useful!
 
 ```bibtex
 @misc{deng2026evoclawevaluatingaiagents,
