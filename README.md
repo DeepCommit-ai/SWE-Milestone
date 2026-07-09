@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>A Continuous Task Evaluation Playground for AI Harness</b>
+  <b>Evaluating AI agents on continuous software evolution, structured as a milestone DAG, across real release histories.</b>
 </p>
 
 <p align="center">
