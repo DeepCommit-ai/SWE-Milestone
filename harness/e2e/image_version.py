@@ -155,3 +155,101 @@ def resolve_image(image_base: str) -> str:
         return f"{image_base}:latest"
     # Let the caller fail with its normal image-not-found handling.
     return ref
+
+
+# ──────────────────────────────────────────────
+# Manifest (image inventory) + plan CLI
+# ──────────────────────────────────────────────
+
+from pathlib import Path
+
+
+def default_manifest_path(version: str) -> Path:
+    """<repo_root>/manifests/images-<version>.tsv (one file per benchmark version)."""
+    return Path(__file__).resolve().parents[2] / "manifests" / f"images-{version}.tsv"
+
+
+def load_manifest(path: Path) -> list[tuple[str, str, str]]:
+    """Parse the inventory TSV -> [(short, repo_full, milestone), ...].
+
+    Blank lines and '#' comments are skipped. Every row is validated through
+    validate_component so a bad future addition fails here, loudly, not at
+    docker-pull time.
+    """
+    rows = []
+    for lineno, raw in enumerate(Path(path).read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            raise ValueError(f"{path}:{lineno}: expected 3 tab-separated columns, got {len(parts)}")
+        short, repo_full, milestone = (p.strip() for p in parts)
+        rows.append((short, validate_component(repo_full), validate_component(milestone)))
+    if not rows:
+        raise ValueError(f"{path}: manifest is empty")
+    return rows
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    ap = argparse.ArgumentParser(
+        prog="python3 -m harness.e2e.image_version",
+        description="Emit hub<->local image plans from the version manifest. "
+        "Output: one '<src>\\t<dst>' pair per line (consumed by "
+        "scripts/pull_images.sh / push_images.sh).",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, hlp in (
+        ("pull-plan", "lines: <hub_ref>\\t<local_ref> (docker pull + tag)"),
+        ("push-plan", "lines: <local_ref>\\t<hub_ref> (docker tag + push)"),
+        ("retag-plan", "lines: <old_local>\\t<new_local> (v1.0 release migration)"),
+    ):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("--org", default=os.environ.get("DOCKERHUB_ORG", "hyd2apse"))
+        p.add_argument("--version", default=None,
+                       help="benchmark data version (default: EVOCLAW_IMAGE_TAG or "
+                            f"{DEFAULT_IMAGE_TAG})")
+        p.add_argument("--repo", action="append", default=[], metavar="SHORT",
+                       help="filter by short name (repeatable)")
+        p.add_argument("--manifest", type=Path, default=None)
+        if name == "retag-plan":
+            p.add_argument("--from-version", required=True,
+                           help="source tag of existing OLD-format local images")
+            p.add_argument("--base-offline-from", default=None,
+                           help="source tag for base-offline rows (default: --from-version; "
+                                "builders only produce :latest)")
+
+    args = ap.parse_args(argv)
+    version = args.version or os.environ.get("EVOCLAW_IMAGE_TAG") or DEFAULT_IMAGE_TAG
+    manifest = args.manifest or default_manifest_path(version)
+    rows = load_manifest(manifest)
+
+    known_shorts = {r[0] for r in rows}
+    unknown = [s for s in args.repo if s not in known_shorts]
+    if unknown:
+        print(f"error: unknown --repo {unknown}; known: {sorted(known_shorts)}",
+              file=sys.stderr)
+        return 2
+    if args.repo:
+        rows = [r for r in rows if r[0] in args.repo]
+
+    for _, rf, ms in rows:
+        local = local_ref(rf, ms, version)
+        hub = hub_ref(args.org, rf, ms, version)
+        if args.cmd == "pull-plan":
+            print(f"{hub}\t{local}")
+        elif args.cmd == "push-plan":
+            print(f"{local}\t{hub}")
+        else:  # retag-plan: OLD-format source -> new-format destination
+            src_tag = args.from_version
+            if ms == "base-offline" and args.base_offline_from:
+                src_tag = args.base_offline_from
+            print(f"{rf}/{ms}:{src_tag}\t{local}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
