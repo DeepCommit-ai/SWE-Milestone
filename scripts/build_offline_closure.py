@@ -4,6 +4,18 @@ docs/superpowers/specs/2026-06-23-offline-closure-builder-design.md."""
 import argparse, glob as _glob, subprocess, sys, yaml
 from pathlib import Path
 
+# Naming authority (single source): harness/e2e/image_version.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from harness.e2e.image_version import PREFIX, SEP, local_ref, resolve_image
+
+
+def _base_image(repo_lower: str) -> str:
+    """Pinned base-image ref for FROM/probe lines. resolve_image honors the
+    EVOCLAW_IMAGE_TAG pin (loud :latest fallback only on the default pin) —
+    fixes the old hardcoded :latest that bypassed version pinning."""
+    return resolve_image(local_ref(repo_lower, "base"))
+
+
 def assert_no_self_packages(staging_dir: Path, forbid_globs: list[str]) -> None:
     offending = []
     for g in forbid_globs or []:
@@ -19,7 +31,8 @@ def discover_milestone_images(repo_lower: str, _docker_images: str | None = None
         _docker_images = subprocess.run(
             ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
             capture_output=True, text=True, check=True).stdout
-    prefix = f"{repo_lower}/"
+    # New scheme: swe-milestone/<repo_lower>__<milestone>:<tag>
+    prefix = f"{PREFIX}/{repo_lower}{SEP}"
     seen = {}
     for line in _docker_images.splitlines():
         line = line.strip()
@@ -169,7 +182,7 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     cargo_home_cfg = "/usr/local/cargo/config.toml"
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS vendor_builder",
+        f"FROM {_base_image(repo_lower)} AS vendor_builder",
     ]
     for i, m in enumerate(milestones):
         lines.append(f"COPY --from={m} /testbed /tb/m{i}")
@@ -224,7 +237,7 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
         sync_manifests.append(extra_vendor_manifest)
     vendor = cargo_vendor_cmd(sync_manifests, vendor_dir)
     lines.append(f"RUN cd /tb/m0 && {vendor}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=vendor_builder {vendor_dir} {vendor_dir}")
     config = cargo_config_toml(vendor_dir)
     # Emit the config via a SINGLE-physical-line RUN: literal newlines in the
@@ -290,7 +303,7 @@ def cargo_pinned_channels(repo_lower: str, milestones: list[str],
     the highest is last (a stable, deterministic default pick).
     """
     chans = set()
-    base = f"{repo_lower}/base:latest"
+    base = f"{_base_image(repo_lower)}"
     for img in [base, *milestones]:
         ch = _probe(img)
         if ch:
@@ -389,7 +402,7 @@ def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
 
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # Install ALL pinned toolchains BEFORE any fetch: `cargo fetch` inside a workspace
     # honours its rust-toolchain.toml, so the pinned channel must exist or rustup
@@ -419,7 +432,7 @@ def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
     fetches = " && ".join(f"cd {d} && cargo fetch" for d in fetch_dirs)
     lines.append(f"RUN {fetches}")
 
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     # COPY the WHOLE warmed $CARGO_HOME (registry cache/index/src + git db/checkouts)
     # forward. Unlike vendor there is no config.toml redirect — the real registry
     # index is preserved, so `cargo build --offline` resolves from the cache.
@@ -1321,12 +1334,12 @@ def assemble_pip_dockerfile(repo_lower: str, reqs_basename: str,
     """
     return (
         "# syntax=docker/dockerfile:1\n"
-        f"FROM {repo_lower}/base:latest AS wheel_builder\n"
+        f"FROM {_base_image(repo_lower)} AS wheel_builder\n"
         f"COPY {reqs_basename} {reqs_in_image}\n"
         # ONLINE download of the whole union into the wheelhouse. One version per
         # package upstream, so no ResolutionImpossible.
         f"RUN pip download -r {reqs_in_image} -d {wheelhouse}\n"
-        f"FROM {repo_lower}/base:latest AS final\n"
+        f"FROM {_base_image(repo_lower)} AS final\n"
         f"COPY --from=wheel_builder {wheelhouse} {wheelhouse}\n"
         f"COPY {reqs_basename} {reqs_in_image}\n")
 
@@ -1427,7 +1440,7 @@ def run_pip_offline_gate(staging_tag: str, offline_build: str) -> None:
         sys.exit(1)
 
 def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
-    lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
+    lines = ["# syntax=docker/dockerfile:1", f"FROM {_base_image(repo_lower)} AS builder",
              "RUN command -v rsync || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)"]
     for i, m in enumerate(milestones):
         for j, cp in enumerate(cache_paths):
@@ -1437,7 +1450,7 @@ def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths:
         f"mkdir -p /staging{cp} && rsync -a /milestone_{i}_{j}{cp}/ /staging{cp}/"
         for i in range(len(milestones)) for j, cp in enumerate(cache_paths))
     lines.append(f"RUN mkdir -p /staging && {merge or 'true'}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     for cp in cache_paths:
         lines.append(f"COPY --from=builder /staging{cp} {cp}")
     return "\n".join(lines) + "\n"
@@ -1557,7 +1570,7 @@ def _go_fetch_stage(repo_lower: str, milestones: list[str], tc: str,
     milestone (small context). `modsrc_dir` is where in the milestone image the
     manifests live (/testbed; navidrome's go module also roots at /testbed).
     """
-    lines = [f"FROM {repo_lower}/base:latest AS go_fetch"]
+    lines = [f"FROM {_base_image(repo_lower)} AS go_fetch"]
     # Clean-replace the toolchain BEFORE downloading (right go resolves the graph;
     # GOTOOLCHAIN=local forbids an auto-toolchain fetch from proxy.golang.org).
     lines.append("RUN rm -rf /usr/local/go")
@@ -1820,7 +1833,7 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     m2_repo = (cache_paths or [_M2_REPO_DIR])[0]
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # COPY each milestone's FULL /testbed (the whole reactor — every module pom is
     # needed to build the multi-module model).
@@ -1831,7 +1844,7 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     # -DincludeScope=test (the test-scope deps go-offline misses, e.g. bcprov).
     for i in range(len(milestones)):
         lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo)}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=fetch_builder {m2_repo} {m2_repo}")
     # maven-build-cache-extension offline marker fix: the jar IS in the closure `.m2`,
     # but its `_remote.repositories` reads `…-1.2.0.jar>central=` (empty RHS) → `mvn -o`
@@ -1940,7 +1953,7 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
     cache_folder = str(PurePosixPath(yarn_cache).parent)
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # COPY only the two manifests from each milestone (small context, no source).
     for i, m in enumerate(milestones):
@@ -1954,7 +1967,7 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
                 f"--ignore-scripts --non-interactive")
         lines.append(
             f"RUN cd /m{i} && ( {base} --frozen-lockfile || {base} )")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=fetch_builder {yarn_cache} {yarn_cache}")
     # Bake any SRS-declared global npm tools (e.g. serve@14.2.5) into the final
     # image so milestones can use them without an offline install. Each tool is
@@ -2108,7 +2121,7 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     # Simplest correct layout: prepend the npm_fetch stage, then the full go union,
     # then the toolchain + _cacache COPY tail appended to the (already-open) final
     # stage.
-    npm_lines = [f"FROM {repo_lower}/base:latest AS npm_fetch"]
+    npm_lines = [f"FROM {_base_image(repo_lower)} AS npm_fetch"]
     for i, m in enumerate(milestones):
         npm_lines.append(
             f"COPY --from={m} /testbed/ui/package.json "
@@ -2470,8 +2483,8 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         print(f"Error: no milestone images for {repo_lower} (run pull_images.sh)",
               file=sys.stderr)
         sys.exit(1)
-    staging_tag = f"{repo_lower}/base-offline:staging"
-    latest_tag = f"{repo_lower}/base-offline:latest"
+    staging_tag = local_ref(repo_lower, "base-offline", "staging")
+    latest_tag = local_ref(repo_lower, "base-offline", "latest")
 
     # DUAL go+npm (navidrome): a multi-ecosystem repo the single-id `_ecosystem_of`
     # rejects. Detect the set {go, npm} and route to the self-contained dual path

@@ -6,6 +6,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_offline_closure as boc
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_naming(monkeypatch):
+    """Naming refactor: FROM lines resolve through resolve_image; pin it to
+    ':v1.0' regardless of host env/local images so tests stay hermetic."""
+    monkeypatch.delenv("EVOCLAW_IMAGE_TAG", raising=False)
+    monkeypatch.setattr(boc, "resolve_image", lambda base: f"{base}:v1.0")
+
+
+
 def _R(returncode=0, stdout="", stderr=""):
     """A stand-in for subprocess.CompletedProcess in monkeypatched tests."""
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
@@ -75,32 +84,32 @@ def test_assert_no_self_packages_clean(tmp_path):
     boc.assert_no_self_packages(tmp_path, ["org/apache/dubbo/*/3.3.[4-9]*"])  # no raise
 
 def test_discover_excludes_base_and_dedups():
-    fake = ("burntsushi_ripgrep_14.1.1_15.0.0/base:latest\n"
-            "burntsushi_ripgrep_14.1.1_15.0.0/base-offline:latest\n"
-            "burntsushi_ripgrep_14.1.1_15.0.0/m01:latest\n"
-            "burntsushi_ripgrep_14.1.1_15.0.0/m01:v0.9\n"
+    fake = ("swe-milestone/burntsushi_ripgrep_14.1.1_15.0.0__base:latest\n"
+            "swe-milestone/burntsushi_ripgrep_14.1.1_15.0.0__base-offline:latest\n"
+            "swe-milestone/burntsushi_ripgrep_14.1.1_15.0.0__m01:latest\n"
+            "swe-milestone/burntsushi_ripgrep_14.1.1_15.0.0__m01:v0.9\n"
             "other_repo/m01:latest\n")
     got = boc.discover_milestone_images("burntsushi_ripgrep_14.1.1_15.0.0", _docker_images=fake)
-    assert got == ["burntsushi_ripgrep_14.1.1_15.0.0/m01:latest"]
+    assert got == ["swe-milestone/burntsushi_ripgrep_14.1.1_15.0.0__m01:latest"]
 
 def test_render_union_dockerfile_structure():
     df = boc.render_union_dockerfile(
-        "r/x", ["r/x/m01:latest", "r/x/m02:latest"], ["/usr/local/cargo/registry/cache"])
-    assert "FROM r/x/base:latest AS final" in df
-    assert df.count("COPY --from=r/x/m01:latest") >= 1
-    assert df.count("COPY --from=r/x/m02:latest") >= 1
+        "r_x", ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"], ["/usr/local/cargo/registry/cache"])
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
+    assert df.count("COPY --from=swe-milestone/r_x__m01:latest") >= 1
+    assert df.count("COPY --from=swe-milestone/r_x__m02:latest") >= 1
     assert "rsync -a /milestone_" in df
     assert "COPY --from=builder /staging" in df
 
 def test_render_union_dockerfile_empty_cache_paths():
-    df = boc.render_union_dockerfile("r/x", ["r/x/m01:latest"], [])
+    df = boc.render_union_dockerfile("r_x", ["swe-milestone/r_x__m01:latest"], [])
     assert "AS builder" in df
     assert "AS final" in df
-    assert "COPY --from=r/x/m01" not in df
+    assert "COPY --from=swe-milestone/r_x__m01" not in df
     assert "RUN mkdir -p /staging" in df
 
 def test_render_union_dockerfile_rsync_mkpath_and_trailing_slash():
-    df = boc.render_union_dockerfile("r/x", ["r/x/m01:latest"], ["/usr/local/cargo/registry/cache"])
+    df = boc.render_union_dockerfile("r_x", ["swe-milestone/r_x__m01:latest"], ["/usr/local/cargo/registry/cache"])
     assert "mkdir -p /staging/usr/local/cargo/registry/cache && rsync -a /milestone_0_0/usr/local/cargo/registry/cache/ /staging/usr/local/cargo/registry/cache/" in df
 
 def test_cargo_vendor_sync_one_shot():
@@ -131,11 +140,11 @@ def test_pip_multi_version_raises():
 # ---- Task 4.2: cargo-vendor assembly ---------------------------------------
 
 def test_assemble_cargo_dockerfile_structure():
-    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
-    df = boc.assemble_cargo_dockerfile("r/x", ms)
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
+    df = boc.assemble_cargo_dockerfile("r_x", ms)
     # two-stage build off base:latest
-    assert "FROM r/x/base:latest AS vendor_builder" in df
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS vendor_builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     # one COPY --from per milestone, into /tb/m<i>
     for i, m in enumerate(ms):
         assert f"COPY --from={m} /testbed /tb/m{i}" in df
@@ -162,13 +171,13 @@ def test_assemble_cargo_dockerfile_structure():
 def test_assemble_cargo_dockerfile_single_milestone():
     """One milestone: it is the cwd, so the only --sync is the base A-baseline
     manifest (/testbed/Cargo.toml) — the milestone itself is m0/cwd, not --sync'd."""
-    df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest"])
+    df = boc.assemble_cargo_dockerfile("r_x", ["swe-milestone/r_x__m00:latest"])
     assert "cd /tb/m0 &&" in df
     assert "cargo vendor" in df
     # exactly one --sync: the base A-baseline manifest (vendor must span A→B).
     assert df.count("--sync") == 1
     assert "--sync /testbed/Cargo.toml" in df
-    assert "COPY --from=r/x/m00:latest /testbed /tb/m0" in df
+    assert "COPY --from=swe-milestone/r_x__m00:latest /testbed /tb/m0" in df
 
 
 def test_assemble_cargo_dockerfile_syncs_base_a_baseline():
@@ -179,9 +188,9 @@ def test_assemble_cargo_dockerfile_syncs_base_a_baseline():
     --versioned-dirs` holds BOTH the A and B versions of each crate. Without this,
     an agent starting from the A-baseline fails its first `cargo build` (the vendor
     only has B-version crates)."""
-    for ms in (["r/x/m00:latest"],
-               ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]):
-        df = boc.assemble_cargo_dockerfile("r/x", ms)
+    for ms in (["swe-milestone/r_x__m00:latest"],
+               ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]):
+        df = boc.assemble_cargo_dockerfile("r_x", ms)
         # The base stage's own /testbed (A-baseline) is synced — NOT a /tb/m* copy.
         assert "--sync /testbed/Cargo.toml" in df
         # cwd stays the first milestone workspace; the A-baseline is just one more
@@ -191,7 +200,7 @@ def test_assemble_cargo_dockerfile_syncs_base_a_baseline():
 
 def test_assemble_cargo_dockerfile_vendor_to_opt():
     """Vendor dir is /opt/vendor (image path), never under /testbed."""
-    df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest", "r/x/m01:latest"])
+    df = boc.assemble_cargo_dockerfile("r_x", ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest"])
     assert "/opt/vendor" in df
     # the cargo vendor invocation must target /opt/vendor as its positional arg
     assert "/opt/vendor\n" in df or "/opt/vendor " in df
@@ -201,12 +210,12 @@ def test_assemble_cargo_dockerfile_installs_rust_toolchain_when_set():
     """toolchain.rust set (nushell → 1.88.0) ⇒ a build-time online rustup install
     in the FINAL stage, with `rustup default` so cargo uses it outside /testbed."""
     df = boc.assemble_cargo_dockerfile(
-        "r/x", ["r/x/m00:latest"], toolchain={"rust": "1.88.0", "install_online": True})
+        "r_x", ["swe-milestone/r_x__m00:latest"], toolchain={"rust": "1.88.0", "install_online": True})
     assert "rustup toolchain install 1.88.0 --profile minimal" in df
     assert "rustup default 1.88.0" in df
     # the install must land in the FINAL stage (after `FROM ... AS final`), not the
     # throwaway vendor_builder — otherwise the published image lacks the toolchain.
-    final_idx = df.index("FROM r/x/base:latest AS final")
+    final_idx = df.index("FROM swe-milestone/r_x__base:v1.0 AS final")
     assert df.index("rustup toolchain install 1.88.0") > final_idx
 
 
@@ -214,7 +223,7 @@ def test_assemble_cargo_dockerfile_no_toolchain_no_rust_install():
     """No toolchain key (ripgrep) ⇒ NO rustup-install line is emitted (unchanged).
     Cover both the default (None) and an empty/`{}`/no-`rust` dict."""
     for tc in (None, {}, {"install_online": True}):
-        df = boc.assemble_cargo_dockerfile("r/x", ["r/x/m00:latest"], toolchain=tc)
+        df = boc.assemble_cargo_dockerfile("r_x", ["swe-milestone/r_x__m00:latest"], toolchain=tc)
         assert "rustup toolchain install" not in df
         assert "rustup default" not in df
 
@@ -234,11 +243,11 @@ def _rust_probe(channels):
 def test_cargo_pinned_channels_unions_base_milestones_and_configured():
     """Every distinct rust-toolchain.toml channel pinned by the A-baseline + each
     milestone is collected, UNIONed with the configured one, sorted ascending."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
-    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
-             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
-    got = boc.cargo_pinned_channels("r/x", ms, configured="1.88.0",
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
+    chans = {base: "1.86.0", "swe-milestone/r_x__m00:latest": "1.86.0",
+             "swe-milestone/r_x__m01:latest": "1.87.0", "swe-milestone/r_x__m02:latest": "1.88.0"}
+    got = boc.cargo_pinned_channels("r_x", ms, configured="1.88.0",
                                     _probe=_rust_probe(chans))
     assert got == ["1.86.0", "1.87.0", "1.88.0"]
 
@@ -246,10 +255,10 @@ def test_cargo_pinned_channels_unions_base_milestones_and_configured():
 def test_cargo_pinned_channels_adds_configured_even_if_unpinned():
     """A configured channel absent from every toolchain file is still installed
     (defensive: the config is the source of truth for the primary version)."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest"]
-    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0"}
-    got = boc.cargo_pinned_channels("r/x", ms, configured="1.90.0",
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest"]
+    chans = {base: "1.86.0", "swe-milestone/r_x__m00:latest": "1.86.0"}
+    got = boc.cargo_pinned_channels("r_x", ms, configured="1.90.0",
                                     _probe=_rust_probe(chans))
     assert got == ["1.86.0", "1.90.0"]
 
@@ -257,11 +266,11 @@ def test_cargo_pinned_channels_adds_configured_even_if_unpinned():
 def test_cargo_pinned_channels_dedups_and_probes_base():
     """The A-baseline (base:latest) is probed too (the agent starts there); dupes
     collapse to one entry."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest"]
     # base pins a channel NO milestone pins → it must still appear (agent A-start).
-    chans = {base: "1.85.0", "r/x/m00:latest": "1.88.0", "r/x/m01:latest": "1.88.0"}
-    got = boc.cargo_pinned_channels("r/x", ms, configured=None,
+    chans = {base: "1.85.0", "swe-milestone/r_x__m00:latest": "1.88.0", "swe-milestone/r_x__m01:latest": "1.88.0"}
+    got = boc.cargo_pinned_channels("r_x", ms, configured=None,
                                     _probe=_rust_probe(chans))
     assert got == ["1.85.0", "1.88.0"]
 
@@ -273,29 +282,29 @@ def test_probe_rust_channel_skips_comments_picks_assignment(monkeypatch):
             'profile = "default"\n'
             'channel = "1.88.0"\n')
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, toml))
-    assert boc._probe_rust_channel("r/x/m00:latest") == "1.88.0"
+    assert boc._probe_rust_channel("swe-milestone/r_x__m00:latest") == "1.88.0"
 
 
 def test_probe_rust_channel_absent_returns_empty(monkeypatch):
     """No toolchain file (probe fails) → empty string (caller unions away)."""
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(1, "", "no such file"))
-    assert boc._probe_rust_channel("r/x/m00:latest") == ""
+    assert boc._probe_rust_channel("swe-milestone/r_x__m00:latest") == ""
 
 
 def test_assemble_cargo_rawcache_structure():
     """Raw-cache assembly: fetch_builder warms $CARGO_HOME via `cargo fetch` per
     workspace (A-baseline + every milestone), the final stage COPYs the whole
     $CARGO_HOME forward, and there is NO vendor dir / config.toml redirect."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
-    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
-             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
+    chans = {base: "1.86.0", "swe-milestone/r_x__m00:latest": "1.86.0",
+             "swe-milestone/r_x__m01:latest": "1.87.0", "swe-milestone/r_x__m02:latest": "1.88.0"}
     df = boc.assemble_cargo_rawcache_dockerfile(
-        "r/x", ms, toolchain={"rust": "1.88.0", "install_online": True},
+        "r_x", ms, toolchain={"rust": "1.88.0", "install_online": True},
         _probe=_rust_probe(chans))
     # two stages off base:latest
-    assert "FROM r/x/base:latest AS fetch_builder" in df
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS fetch_builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     # one COPY --from per milestone into /tb/m<i>
     for i, m in enumerate(ms):
         assert f"COPY --from={m} /testbed /tb/m{i}" in df
@@ -315,11 +324,11 @@ def test_assemble_cargo_rawcache_no_locked():
     """The warm step must NOT pass --locked: nushell milestone Cargo.lock files are
     mid-migration checkpoints whose lock doesn't match Cargo.toml (cargo fetch
     --locked fails 8/13). Plain `cargo fetch` re-resolves+warms a superset."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest"]
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest"]
     df = boc.assemble_cargo_rawcache_dockerfile(
-        "r/x", ms, toolchain={"rust": "1.88.0"},
-        _probe=_rust_probe({base: "1.88.0", "r/x/m00:latest": "1.88.0"}))
+        "r_x", ms, toolchain={"rust": "1.88.0"},
+        _probe=_rust_probe({base: "1.88.0", "swe-milestone/r_x__m00:latest": "1.88.0"}))
     assert "cargo fetch --locked" not in df
     assert "cargo fetch" in df
 
@@ -329,30 +338,30 @@ def test_assemble_cargo_rawcache_installs_all_channels_default_profile():
     default (the workspaces pin profile=default; the agent may run clippy/rustfmt),
     in BOTH the fetch_builder (so `cargo fetch` honours each workspace's channel) and
     the final published stage. The configured rust is set as `rustup default`."""
-    base = "r/x/base:latest"
-    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
-    chans = {base: "1.86.0", "r/x/m00:latest": "1.86.0",
-             "r/x/m01:latest": "1.87.0", "r/x/m02:latest": "1.88.0"}
+    base = "swe-milestone/r_x__base:v1.0"
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
+    chans = {base: "1.86.0", "swe-milestone/r_x__m00:latest": "1.86.0",
+             "swe-milestone/r_x__m01:latest": "1.87.0", "swe-milestone/r_x__m02:latest": "1.88.0"}
     df = boc.assemble_cargo_rawcache_dockerfile(
-        "r/x", ms, toolchain={"rust": "1.88.0"}, _probe=_rust_probe(chans))
+        "r_x", ms, toolchain={"rust": "1.88.0"}, _probe=_rust_probe(chans))
     for c in ("1.86.0", "1.87.0", "1.88.0"):
         assert f"rustup toolchain install {c} --profile default" in df
     assert "rustup default 1.88.0" in df
     assert "--profile minimal" not in df
     # installs appear in BOTH stages (fetch_builder before the COPYs, final after).
-    fb_idx = df.index("FROM r/x/base:latest AS fetch_builder")
-    final_idx = df.index("FROM r/x/base:latest AS final")
+    fb_idx = df.index("FROM swe-milestone/r_x__base:v1.0 AS fetch_builder")
+    final_idx = df.index("FROM swe-milestone/r_x__base:v1.0 AS final")
     first_install = df.index("rustup toolchain install 1.86.0")
     last_install = df.rindex("rustup toolchain install 1.86.0")
     assert fb_idx < first_install < final_idx < last_install
     # fetch_builder installs the channels BEFORE copying/fetching the workspaces.
-    assert first_install < df.index("COPY --from=r/x/m00:latest")
+    assert first_install < df.index("COPY --from=swe-milestone/r_x__m00:latest")
 
 
 def test_assemble_cargo_rawcache_empty_milestones_exits():
     """No milestones → fail-closed (an empty cargo closure is never valid)."""
     with pytest.raises(SystemExit):
-        boc.assemble_cargo_rawcache_dockerfile("r/x", [], toolchain={"rust": "1.88.0"})
+        boc.assemble_cargo_rawcache_dockerfile("r_x", [], toolchain={"rust": "1.88.0"})
 
 
 # ---- cargo offline-build failure classifier -------------------------------
@@ -367,14 +376,14 @@ def test_classify_cargo_git_checkout_offline_is_gap():
            "Caused by:\n  Unable to update https://github.com/nushell/reedline?branch=main\n"
            "Caused by:\n  can't checkout from 'https://github.com/nushell/reedline': "
            "you are in the offline mode (--offline)\n")
-    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    kind, _ = boc.classify_cargo_offline_build_failure("swe-milestone/r_x__base-offline:staging", out)
     assert kind == "closure_gap"
 
 
 def test_classify_cargo_select_version_is_gap():
     """`failed to select a version` (a crate version absent from the cache) → gap."""
     out = "error: failed to select a version for the requirement `bstr = \"^1.12\"`"
-    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    kind, _ = boc.classify_cargo_offline_build_failure("swe-milestone/r_x__base-offline:staging", out)
     assert kind == "closure_gap"
 
 
@@ -383,7 +392,7 @@ def test_classify_cargo_no_matching_package_is_gap():
     out = ("error: no matching package named `futures-timer` found\n"
            "required by `rstest v0.23.0`\n  dependency `rstest = \"^0.23\"` of "
            "package `nu-lsp v0.106.1`")
-    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    kind, _ = boc.classify_cargo_offline_build_failure("swe-milestone/r_x__base-offline:staging", out)
     assert kind == "closure_gap"
 
 
@@ -395,7 +404,7 @@ def test_classify_cargo_network_attempt_is_gap():
            "'https://static.rust-lang.org/dist/channel-rust-1.87.0.toml.sha256'\n"
            "Caused by:\n  failed to lookup address information: "
            "Temporary failure in name resolution")
-    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    kind, _ = boc.classify_cargo_offline_build_failure("swe-milestone/r_x__base-offline:staging", out)
     assert kind == "closure_gap"
 
 
@@ -408,7 +417,7 @@ def test_classify_cargo_compile_error_is_source_state():
            "error: could not compile `nu-command` (lib) due to 1 previous error\n"
            "warning: build failed, waiting for other jobs to finish...")
     kind, detail = boc.classify_cargo_offline_build_failure(
-        "r/x/base-offline:staging", out)
+        "swe-milestone/r_x__base-offline:staging", out)
     assert kind == "source_state"
     assert "compile" in detail.lower()
 
@@ -418,7 +427,7 @@ def test_classify_cargo_type_error_is_source_state():
     missing-from-cache dependency → source_state."""
     out = ("error[E0599]: no method named `frobnicate` found for struct `Foo`\n"
            "error: could not compile `nu-protocol` (lib) due to 1 previous error")
-    kind, _ = boc.classify_cargo_offline_build_failure("r/x/base-offline:staging", out)
+    kind, _ = boc.classify_cargo_offline_build_failure("swe-milestone/r_x__base-offline:staging", out)
     assert kind == "source_state"
 
 
@@ -530,7 +539,7 @@ def test_audit_staging_image_empty_globs_is_noop(monkeypatch):
     called = []
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: called.append(a) or _R(0, ""))
-    boc.audit_staging_image("r/x/base-offline:staging", [])
+    boc.audit_staging_image("swe-milestone/r_x__base-offline:staging", [])
     assert called == []   # never shelled out
 
 
@@ -541,10 +550,10 @@ def test_audit_staging_image_clean_passes(monkeypatch):
         captured["cmd"] = cmd
         return _R(0, "")   # empty stdout = clean
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+    boc.audit_staging_image("swe-milestone/r_x__base-offline:staging", ["/c/grep-*.crate"])
     # ran `docker run ... ls -d <glob>` against the staging image
     assert captured["cmd"][:3] == ["docker", "run", "--rm"]
-    assert "r/x/base-offline:staging" in captured["cmd"]
+    assert "swe-milestone/r_x__base-offline:staging" in captured["cmd"]
     joined = " ".join(captured["cmd"])
     assert "ls -d" in joined and "/c/grep-*.crate" in joined
 
@@ -554,7 +563,7 @@ def test_audit_staging_image_match_exits(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, "/c/grep-1.0.crate\n"))
     with pytest.raises(SystemExit) as e:
-        boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+        boc.audit_staging_image("swe-milestone/r_x__base-offline:staging", ["/c/grep-*.crate"])
     assert e.value.code == 1
 
 
@@ -569,7 +578,7 @@ def test_run_offline_gate_create_cp_run_sequence(monkeypatch):
             return _R(0, "deadbeefcid\n")
         return _R(0, "")   # cp, rm, run all succeed
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                          "cargo build --offline")
     kinds = [c[:2] for c in calls]
     assert ["docker", "create"] in kinds
@@ -578,11 +587,11 @@ def test_run_offline_gate_create_cp_run_sequence(monkeypatch):
     assert ["docker", "run"] in kinds
     # docker create targets the MILESTONE (B-source), not the staging image
     create = next(c for c in calls if c[:2] == ["docker", "create"])
-    assert create[2] == "r/x/m01:latest"
+    assert create[2] == "swe-milestone/r_x__m01:latest"
     # the offline build runs against the STAGING image with --network none
     run = next(c for c in calls if c[:2] == ["docker", "run"])
     assert "--network" in run and "none" in run
-    assert "r/x/base-offline:staging" in run
+    assert "swe-milestone/r_x__base-offline:staging" in run
     assert "cargo build --offline" in " ".join(run)
     # and bind-mounts the copied milestone /testbed over /testbed
     assert any(isinstance(x, str) and x.endswith("/testbed:/testbed") for x in run)
@@ -603,7 +612,7 @@ def test_run_offline_gate_build_fail_closure_gap_exits(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     with pytest.raises(SystemExit) as e:
-        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+        boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                              "go build ./...")
     assert e.value.code == 1
 
@@ -626,7 +635,7 @@ def test_run_offline_gate_source_state_returns_not_exit(monkeypatch):
             return _R(101, SS)                      # the offline build
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    got = boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    got = boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                                "go build ./...")
     assert got == "SOURCE_STATE"
 
@@ -638,7 +647,7 @@ def test_run_offline_gate_pass_returns_pass(monkeypatch):
             return _R(0, "cid\n")
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    assert boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    assert boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                                 "go build ./...") == "PASS"
 
 
@@ -652,7 +661,7 @@ def test_classify_compile_error_is_source_state(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     kind, _ = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "core/foo.go:12:9: undefined: tests.MockBar\n")
     assert kind == "source_state"
     assert called["probe"] is False   # no token → no probe call
@@ -663,7 +672,7 @@ def test_classify_missing_from_cache_is_gap(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, ""))   # probe: no HIT → absent
     kind, detail = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "x.go:1:2: no required module provides package example.com/gone; to add it:\n")
     assert kind == "closure_gap"
     assert "example.com/gone" in detail
@@ -674,7 +683,7 @@ def test_classify_present_in_cache_is_source_state(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, "HIT\n"))
     kind, _ = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "x.go:1:2: no required module provides package github.com/go-redis/redis/v8;\n")
     assert kind == "source_state"
 
@@ -684,7 +693,7 @@ def test_run_offline_gate_create_fail_exits(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda cmd, *a, **k: _R(1, "", "no such image"))
     with pytest.raises(SystemExit):
-        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+        boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                              "cargo build --offline")
 
 
@@ -699,13 +708,13 @@ def test_cargo_abaseline_gate_pass_no_injection(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     assert boc.run_cargo_abaseline_gate(
-        "r/x/base-offline:staging", "cargo build --offline") is None
+        "swe-milestone/r_x__base-offline:staging", "cargo build --offline") is None
     # exactly one docker run; no create/cp (the staging /testbed IS the A-baseline).
     assert len(calls) == 1
     cmd = calls[0]
     assert cmd[:2] == ["docker", "run"]
     assert "--network" in cmd and "none" in cmd
-    assert "r/x/base-offline:staging" in cmd
+    assert "swe-milestone/r_x__base-offline:staging" in cmd
     joined = " ".join(cmd)
     assert "cd /testbed && cargo build --offline" in joined
     assert "docker create" not in joined and "docker cp" not in joined
@@ -718,7 +727,7 @@ def test_cargo_abaseline_gate_select_version_is_gap(monkeypatch):
            "candidate versions found which didn't match: 1.12.0\n")
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(101, "", GAP))
     with pytest.raises(SystemExit) as e:
-        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+        boc.run_cargo_abaseline_gate("swe-milestone/r_x__base-offline:staging", "cargo build --offline")
     assert e.value.code == 1
 
 
@@ -727,7 +736,7 @@ def test_cargo_abaseline_gate_not_in_vendored_is_gap(monkeypatch):
     GAP = "error: the crate `bstr v1.10.0` was not found in vendored sources\n"
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(101, GAP, ""))
     with pytest.raises(SystemExit) as e:
-        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+        boc.run_cargo_abaseline_gate("swe-milestone/r_x__base-offline:staging", "cargo build --offline")
     assert e.value.code == 1
 
 
@@ -738,7 +747,7 @@ def test_cargo_abaseline_gate_any_nonzero_is_gap(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(101, "", "error: some other build failure\n"))
     with pytest.raises(SystemExit) as e:
-        boc.run_cargo_abaseline_gate("r/x/base-offline:staging", "cargo build --offline")
+        boc.run_cargo_abaseline_gate("swe-milestone/r_x__base-offline:staging", "cargo build --offline")
     assert e.value.code == 1
 
 
@@ -764,7 +773,7 @@ def test_run_offline_gate_cleans_tmp(monkeypatch, tmp_path):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     with pytest.raises(SystemExit):
-        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest", "go build ./...")
+        boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest", "go build ./...")
     assert made["d"] in removed
 
 
@@ -773,7 +782,7 @@ def test_audit_staging_image_docker_failure_exits(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(1, "", "daemon down"))
     with pytest.raises(SystemExit) as e:
-        boc.audit_staging_image("r/x/base-offline:staging", ["/c/grep-*.crate"])
+        boc.audit_staging_image("swe-milestone/r_x__base-offline:staging", ["/c/grep-*.crate"])
     assert e.value.code == 1
 
 
@@ -800,31 +809,31 @@ def test_assemble_go_dockerfile_online_fetch_emits_go_fetch_stage():
     `go mod download all` per milestone, then the `final` stage COPYs the
     online-fetched module cache (over the raw-cache union) + the clean-replace
     toolchain. This is what closes the declared-but-uncompiled (17-module) gap."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     # fake probe: only the LAST milestone has the target go (B-end), as in go-zero
-    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    probe = lambda img: "go1.21.13" if img == "swe-milestone/r_x__m02:latest" else "go1.19.13"
     df = boc.assemble_go_dockerfile(
-        "r/x", ms, ["/go/pkg/mod/cache/download"], "1.21.13", _probe=probe)
+        "r_x", ms, ["/go/pkg/mod/cache/download"], "1.21.13", _probe=probe)
     # exactly one syntax directive at the very top
     assert df.count("# syntax=docker/dockerfile:1") == 1
     assert df.startswith("# syntax=docker/dockerfile:1\n")
     # go_fetch stage present, with the toolchain clean-replaced BEFORE the downloads
-    assert "FROM r/x/base:latest AS go_fetch" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS go_fetch" in df
     # raw-cache union still present (belt-and-suspenders + exact A-version bytes)
-    assert "FROM r/x/base:latest AS builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS builder" in df
     assert "rsync -a /milestone_" in df
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     # go.mod+go.sum COPY'd (the module graph; no source) per milestone, then
     # `go mod download all` per milestone in the go_fetch stage
-    assert "COPY --from=r/x/m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
-    assert "COPY --from=r/x/m02:latest /testbed/go.mod /testbed/go.sum /m1/" in df
+    assert "COPY --from=swe-milestone/r_x__m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
+    assert "COPY --from=swe-milestone/r_x__m02:latest /testbed/go.mod /testbed/go.sum /m1/" in df
     assert df.count("go mod download all") == len(ms)
     # final stage COPYs the online-fetched modcache (over the raw-cache union)
     assert ("COPY --from=go_fetch /go/pkg/mod/cache/download "
             "/go/pkg/mod/cache/download") in df
     # clean-replace toolchain in BOTH go_fetch and final (rm BEFORE the COPY each)
     assert df.count("RUN rm -rf /usr/local/go") == 2
-    assert df.count("COPY --from=r/x/m02:latest /usr/local/go /usr/local/go") == 2
+    assert df.count("COPY --from=swe-milestone/r_x__m02:latest /usr/local/go /usr/local/go") == 2
     assert "ENV GOTOOLCHAIN=local" in df
     # the .info-synth RUN was removed when the gate became build-scoped
     assert ".info" not in df and "find /go/pkg/mod/cache/download" not in df
@@ -841,17 +850,17 @@ def test_assemble_go_dockerfile_raw_cache_fallback_no_online_fetch():
     """online_fetch=False (the `go_mechanism: raw-cache` escape) restores the legacy
     raw-cache-union-only assembly: render_union + the appended clean-replace toolchain,
     with NO go_fetch stage and NO `go mod download`."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
-    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
+    probe = lambda img: "go1.21.13" if img == "swe-milestone/r_x__m02:latest" else "go1.19.13"
     df = boc.assemble_go_dockerfile(
-        "r/x", ms, ["/go/pkg/mod/cache/download"], "1.21.13",
+        "r_x", ms, ["/go/pkg/mod/cache/download"], "1.21.13",
         online_fetch=False, _probe=probe)
     assert "AS go_fetch" not in df and "go mod download" not in df
     # equals the rendered union + the single appended toolchain tail (no other change)
-    union = boc.render_union_dockerfile("r/x", ms, ["/go/pkg/mod/cache/download"])
+    union = boc.render_union_dockerfile("r_x", ms, ["/go/pkg/mod/cache/download"])
     assert df == union + (
         "RUN rm -rf /usr/local/go\n"
-        "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go\n"
+        "COPY --from=swe-milestone/r_x__m02:latest /usr/local/go /usr/local/go\n"
         "ENV GOTOOLCHAIN=local\n")
 
 
@@ -996,17 +1005,17 @@ def test_assemble_maven_dockerfile_online_fetch_union_plus_self_at_b_rm():
     (go-offline + resolve test-scope) into the shared `.m2`, then COPYs it forward
     and rm's self@B last — like the npm/pip/cargo 'fetch the union online' pattern,
     NOT the old raw-cache rsync union."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     caches = ["/root/.m2/repository"]
-    df = boc.assemble_maven_dockerfile("r/x", ms, caches, _DUBBO_FORBID)
+    df = boc.assemble_maven_dockerfile("r_x", ms, caches, _DUBBO_FORBID)
     # two stages: an online fetch_builder (FROM base) + a final (FROM base)
-    assert "FROM r/x/base:latest AS fetch_builder" in df
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS fetch_builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     # NO raw-cache rsync union anymore (that was the incomplete approach)
     assert "rsync -a /milestone_" not in df
     # the FULL /testbed of every milestone is COPY'd (reactor needs all module poms)
-    assert "COPY --from=r/x/m01:latest /testbed /tb/m0" in df
-    assert "COPY --from=r/x/m02:latest /testbed /tb/m1" in df
+    assert "COPY --from=swe-milestone/r_x__m01:latest /testbed /tb/m0" in df
+    assert "COPY --from=swe-milestone/r_x__m02:latest /testbed /tb/m1" in df
     # one online fetch RUN per milestone, each warming the shared local repo
     assert "RUN cd /tb/m0 && ( mvn -q dependency:go-offline" in df
     assert "RUN cd /tb/m1 && ( mvn -q dependency:go-offline" in df
@@ -1025,7 +1034,7 @@ def test_assemble_maven_dockerfile_rm_after_fetch_and_copy_so_audit_clean():
     final-stage cache COPY), so what the generic audit later greps for — including
     any 3.3.6 jar the online fetch may have pulled — has already been deleted."""
     df = boc.assemble_maven_dockerfile(
-        "r/x", ["r/x/m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
+        "r_x", ["swe-milestone/r_x__m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
     # the self@B rm is the final instruction in the Dockerfile
     last = [ln for ln in df.strip().splitlines() if ln.strip()][-1]
     assert last.startswith("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
@@ -1039,7 +1048,7 @@ def test_assemble_maven_dockerfile_deletes_build_cache_ext_offline_marker():
     jar), absent-tolerant, and lands AFTER the `.m2` COPY but BEFORE the self@B rm
     (so the self@B rm stays the last instruction)."""
     df = boc.assemble_maven_dockerfile(
-        "r/x", ["r/x/m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
+        "r_x", ["swe-milestone/r_x__m01:latest"], ["/root/.m2/repository"], _DUBBO_FORBID)
     delete = ("RUN find /root/.m2/repository/org/apache/maven/extensions/"
               "maven-build-cache-extension -name _remote.repositories -delete "
               "2>/dev/null || true")
@@ -1059,7 +1068,7 @@ def test_assemble_maven_dockerfile_deletes_build_cache_ext_offline_marker():
 def test_assemble_maven_dockerfile_empty_milestones_errors():
     """No milestones → fail-closed (can't build a closure with nothing to fetch)."""
     with pytest.raises(SystemExit):
-        boc.assemble_maven_dockerfile("r/x", [], ["/root/.m2/repository"],
+        boc.assemble_maven_dockerfile("r_x", [], ["/root/.m2/repository"],
                                       _DUBBO_FORBID)
 
 
@@ -1081,7 +1090,7 @@ def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_p
 
     events = []
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["dub/m01:latest", "dub/m02:latest"])
+                        lambda repo: ["swe-milestone/dub__m01:latest", "swe-milestone/dub__m02:latest"])
     built = {}
     def fake_build(df, tag, root):
         events.append(("build", tag))
@@ -1104,8 +1113,8 @@ def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_p
     # build BEFORE audit BEFORE (per-milestone) gate BEFORE tag
     assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
         < kinds.index("tag")
-    assert built["tag"] == "dub/base-offline:staging"
-    assert ("tag", "dub/base-offline:staging", "dub/base-offline:latest") in events
+    assert built["tag"] == "swe-milestone/dub__base-offline:staging"
+    assert ("tag", "swe-milestone/dub__base-offline:staging", "swe-milestone/dub__base-offline:latest") in events
     # the staging Dockerfile ONLINE-fetches each milestone's declared deps (go-offline
     # + resolve test-scope) into the shared `.m2` and rm's self@B (the forbid globs)
     assert "rsync -a /milestone_" not in built["df"]
@@ -1118,7 +1127,7 @@ def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_p
         "/root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*",
         "/root/.m2/repository/org/apache/dubbo/*/3.[4-9]*")
     # one offline gate per milestone (B-source mvn -o test-compile)
-    assert [e[1] for e in events if e[0] == "gate"] == ["dub/m01:latest", "dub/m02:latest"]
+    assert [e[1] for e in events if e[0] == "gate"] == ["swe-milestone/dub__m01:latest", "swe-milestone/dub__m02:latest"]
 
 
 # ---- maven offline-build failure classifier (self@B vs real closure gap) ------
@@ -1174,7 +1183,7 @@ def test_classify_maven_self_at_b_unresolved_is_source_state():
     eval the agent builds the sibling from the reactor; we excluded the answer jar
     by design. No docker probe needed (the classifier is pure-text for maven)."""
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
-    kind, detail = classify("r/x/base-offline:staging", _MVN_OFFLINE_SELF)
+    kind, detail = classify("swe-milestone/r_x__base-offline:staging", _MVN_OFFLINE_SELF)
     assert kind == "source_state"
     assert "dubbo-spring6-security" in detail or "self@B" in detail
 
@@ -1184,7 +1193,7 @@ def test_classify_maven_third_party_unresolved_is_closure_gap():
     a REAL closure gap → must BLOCK. This is the fail-OPEN the go classifier would
     have missed (it doesn't recognise maven's 'Cannot access ... offline' string)."""
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
-    kind, detail = classify("r/x/base-offline:staging", _MVN_OFFLINE_THIRDPARTY)
+    kind, detail = classify("swe-milestone/r_x__base-offline:staging", _MVN_OFFLINE_THIRDPARTY)
     assert kind == "closure_gap"
     assert "mutiny" in detail
 
@@ -1193,7 +1202,7 @@ def test_classify_maven_mixed_self_and_third_party_is_gap():
     """If BOTH a self@B and a third-party artifact are unresolved, the third-party
     one wins → closure_gap (fail-closed: any real missing dep blocks)."""
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
-    kind, _ = classify("r/x/base-offline:staging",
+    kind, _ = classify("swe-milestone/r_x__base-offline:staging",
                        _MVN_OFFLINE_SELF + _MVN_OFFLINE_THIRDPARTY)
     assert kind == "closure_gap"
 
@@ -1203,7 +1212,7 @@ def test_classify_maven_spotless_failure_is_source_state():
     SOURCE-STATE — it is not a missing dependency, so it must not BLOCK."""
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
     kind, _ = classify(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "[ERROR] The following files had format violations:\n"
         "[ERROR] Run 'mvn spotless:apply' to fix these violations.\n")
     assert kind == "source_state"
@@ -1214,7 +1223,7 @@ def test_classify_maven_compile_error_is_source_state():
     SOURCE-STATE (a mid-migration checkpoint), never a closure gap."""
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
     kind, _ = classify(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "[ERROR] /testbed/foo/Bar.java:[12,9] cannot find symbol\n"
         "[ERROR]   symbol:   method baz()\n")
     assert kind == "source_state"
@@ -1233,7 +1242,7 @@ def test_run_offline_gate_uses_injected_classifier(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
     with pytest.raises(SystemExit) as e:
-        boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+        boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                              "git clean -xfd && mvn -o test-compile",
                              classifier=classify)
     assert e.value.code == 1
@@ -1250,7 +1259,7 @@ def test_run_offline_gate_maven_self_at_b_is_source_state(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     classify = boc.classify_maven_offline_build_failure(_DUBBO_FORBID)
-    got = boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    got = boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                                "git clean -xfd && mvn -o test-compile",
                                classifier=classify)
     assert got == "SOURCE_STATE"
@@ -1299,7 +1308,7 @@ def test_classify_npm_no_versions_is_closure_gap():
     """`error Couldn't find any versions for` (yarn cache lacks the version a
     lockfile pins) is a REAL closure gap → BLOCK. Pure-text (no docker probe)."""
     kind, detail = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging", _YARN_OFFLINE_NO_VERSIONS)
+        "swe-milestone/r_x__base-offline:staging", _YARN_OFFLINE_NO_VERSIONS)
     assert kind == "closure_gap"
     assert "find any versions" in detail.lower() or "gap" in detail.lower()
 
@@ -1323,7 +1332,7 @@ def test_classify_npm_cant_make_request_offline_is_closure_gap():
     run exposed: the string doesn't contain `request to https://registry` so it was
     mis-labelled source_state; the classifier must now catch it."""
     kind, detail = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging", _YARN_OFFLINE_CANT_REQUEST)
+        "swe-milestone/r_x__base-offline:staging", _YARN_OFFLINE_CANT_REQUEST)
     assert kind == "closure_gap"
     assert "offline mode" in detail.lower() or "gap" in detail.lower()
 
@@ -1333,7 +1342,7 @@ def test_classify_npm_registry_request_is_closure_gap():
     network because the bytes weren't in the cache → closure gap → BLOCK. (This is
     the fail-OPEN the go classifier would miss — it doesn't know yarn's strings.)"""
     kind, detail = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging", _YARN_OFFLINE_REGISTRY_REQUEST)
+        "swe-milestone/r_x__base-offline:staging", _YARN_OFFLINE_REGISTRY_REQUEST)
     assert kind == "closure_gap"
 
 
@@ -1341,7 +1350,7 @@ def test_classify_npm_couldnt_find_package_is_closure_gap():
     """`Couldn't find package` (the package itself is absent from the cache) is a
     closure gap too."""
     kind, _ = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "error Couldn't find package \"@matrix-org/olm@^3.2.15\" required by "
         "\"matrix-react-sdk\" on the \"npm\" registry.\n")
     assert kind == "closure_gap"
@@ -1352,7 +1361,7 @@ def test_classify_npm_frozen_lockfile_is_source_state():
     package.json/node_modules — a mid-change source state; the cache HAS the bytes)
     is SOURCE-STATE, not a closure gap → must NOT block."""
     kind, _ = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging", _YARN_OFFLINE_FROZEN_LOCKFILE)
+        "swe-milestone/r_x__base-offline:staging", _YARN_OFFLINE_FROZEN_LOCKFILE)
     assert kind == "source_state"
 
 
@@ -1360,7 +1369,7 @@ def test_classify_npm_compile_error_is_source_state():
     """A webpack/tsc compile error (no yarn cache-miss/registry-request signature) is
     SOURCE-STATE — it is not a missing dependency, so it must not BLOCK."""
     kind, _ = boc.classify_npm_offline_build_failure(
-        "r/x/base-offline:staging", _YARN_BUILD_COMPILE_ERROR)
+        "swe-milestone/r_x__base-offline:staging", _YARN_BUILD_COMPILE_ERROR)
     assert kind == "source_state"
 
 
@@ -1376,7 +1385,7 @@ def test_run_offline_gate_uses_npm_classifier_gap_exits(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     with pytest.raises(SystemExit) as e:
         boc.run_offline_gate(
-            "r/x/base-offline:staging", "r/x/m01:latest",
+            "swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
             "cd /testbed && yarn install --offline --frozen-lockfile",
             classifier=boc.classify_npm_offline_build_failure)
     assert e.value.code == 1
@@ -1393,7 +1402,7 @@ def test_run_offline_gate_npm_frozen_lockfile_is_source_state(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     got = boc.run_offline_gate(
-        "r/x/base-offline:staging", "r/x/m01:latest",
+        "swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
         "cd /testbed && yarn install --offline --frozen-lockfile",
         classifier=boc.classify_npm_offline_build_failure)
     assert got == "SOURCE_STATE"
@@ -1405,16 +1414,16 @@ def test_assemble_npm_dockerfile_fetches_union_into_shared_cache():
     package.json+yarn.lock and runs one `yarn install --cache-folder <shared>` per
     milestone (prefer --frozen-lockfile, fall back to non-frozen), then the final
     stage COPYs the warmed cache back. NOT a raw rsync union."""
-    ms = ["ew/m01:latest", "ew/m02:latest"]
+    ms = ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"]
     df = boc.assemble_npm_dockerfile("ew", ms)
     cache = "/usr/local/share/.cache/yarn/v6"         # the versioned dir yarn fills
     cache_parent = "/usr/local/share/.cache/yarn"     # what --cache-folder must be
     # two stages off base:latest
-    assert "FROM ew/base:latest AS fetch_builder" in df
-    assert "FROM ew/base:latest AS final" in df
+    assert "FROM swe-milestone/ew__base:v1.0 AS fetch_builder" in df
+    assert "FROM swe-milestone/ew__base:v1.0 AS final" in df
     # ONLY the two manifests are COPY'd per milestone (no whole /testbed)
-    assert "COPY --from=ew/m01:latest /testbed/package.json /testbed/yarn.lock /m0/" in df
-    assert "COPY --from=ew/m02:latest /testbed/package.json /testbed/yarn.lock /m1/" in df
+    assert "COPY --from=swe-milestone/ew__m01:latest /testbed/package.json /testbed/yarn.lock /m0/" in df
+    assert "COPY --from=swe-milestone/ew__m02:latest /testbed/package.json /testbed/yarn.lock /m1/" in df
     assert "/testbed /m" not in df               # never the full /testbed tree
     # one cache-warming RUN per milestone, all writing the SAME shared cache folder
     assert sum(1 for ln in df.splitlines()
@@ -1460,7 +1469,7 @@ def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_p
 
     events = []
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["ew/m01:latest", "ew/m02:latest"])
+                        lambda repo: ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"])
     built = {}
     def fake_build(df, tag, root):
         events.append(("build", tag))
@@ -1487,8 +1496,8 @@ def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_p
     # build BEFORE audit BEFORE (per-milestone) gate BEFORE tag
     assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
         < kinds.index("tag")
-    assert built["tag"] == "ew/base-offline:staging"
-    assert ("tag", "ew/base-offline:staging", "ew/base-offline:latest") in events
+    assert built["tag"] == "swe-milestone/ew__base-offline:staging"
+    assert ("tag", "swe-milestone/ew__base-offline:staging", "swe-milestone/ew__base-offline:latest") in events
     # the staging Dockerfile is the ONLINE declared-deps FETCH (per-milestone
     # `yarn install --cache-folder <shared>`), NOT a raw rsync cache union, and has
     # no self@B rm and no toolchain step.
@@ -1498,13 +1507,13 @@ def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_p
     assert "rm -rf" not in built["df"]            # no self@B removal for element-web
     assert "GOTOOLCHAIN" not in built["df"] and "rustup" not in built["df"]
     # it equals assemble_npm_dockerfile exactly (the fetch assembly)
-    expected = boc.assemble_npm_dockerfile("ew", ["ew/m01:latest", "ew/m02:latest"])
+    expected = boc.assemble_npm_dockerfile("ew", ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"])
     assert built["df"] == expected
     # the generic audit got the (empty) forbid globs → clean no-op
     audit_ev = next(e for e in events if e[0] == "audit")
     assert audit_ev[2] == ()
     # one offline gate per milestone, each handed the npm/yarn classifier
-    assert [e[1] for e in events if e[0] == "gate"] == ["ew/m01:latest", "ew/m02:latest"]
+    assert [e[1] for e in events if e[0] == "gate"] == ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"]
     assert gate_classifiers == [boc.classify_npm_offline_build_failure,
                                 boc.classify_npm_offline_build_failure]
 
@@ -1512,7 +1521,7 @@ def test_build_closure_npm_branch_dispatches_fetch_audit_gate(monkeypatch, tmp_p
 def test_assemble_npm_dockerfile_global_npm_tools_baked_into_final():
     """global_npm_tools=[serve@14.2.5] → the final stage emits
     `RUN npm install -g serve@14.2.5` AFTER the yarn cache COPY."""
-    ms = ["ew/m01:latest"]
+    ms = ["swe-milestone/ew__m01:latest"]
     df = boc.assemble_npm_dockerfile("ew", ms, global_npm_tools=["serve@14.2.5"])
     # The global install line must be present and in the final stage (after the COPY).
     assert "RUN npm install -g serve@14.2.5" in df
@@ -1527,7 +1536,7 @@ def test_assemble_npm_dockerfile_global_npm_tools_baked_into_final():
 
 def test_assemble_npm_dockerfile_no_global_tools_unchanged():
     """Omitting global_npm_tools (None / not passed) produces no npm install -g line."""
-    ms = ["ew/m01:latest"]
+    ms = ["swe-milestone/ew__m01:latest"]
     df_no_tools = boc.assemble_npm_dockerfile("ew", ms)
     df_empty_tools = boc.assemble_npm_dockerfile("ew", ms, global_npm_tools=[])
     assert "npm install -g" not in df_no_tools
@@ -1538,7 +1547,7 @@ def test_assemble_npm_dockerfile_no_global_tools_unchanged():
 
 def test_assemble_npm_dockerfile_multiple_global_tools():
     """Multiple tools each get their own RUN npm install -g line."""
-    ms = ["ew/m01:latest"]
+    ms = ["swe-milestone/ew__m01:latest"]
     df = boc.assemble_npm_dockerfile("ew", ms,
                                      global_npm_tools=["serve@14.2.5", "http-server@14"])
     assert "RUN npm install -g serve@14.2.5" in df
@@ -1561,7 +1570,7 @@ def test_build_closure_npm_branch_passes_global_tools_from_config(monkeypatch, t
 
     built = {}
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["ew/m01:latest", "ew/m02:latest"])
+                        lambda repo: ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"])
     def fake_build(df, tag, root):
         built["df"] = df
     monkeypatch.setattr(boc, "_docker_build", fake_build)
@@ -1577,7 +1586,7 @@ def test_build_closure_npm_branch_passes_global_tools_from_config(monkeypatch, t
     assert "RUN npm install -g serve@14.2.5" in built["df"]
     # And it must equal assemble_npm_dockerfile called with the same global_tools.
     expected = boc.assemble_npm_dockerfile(
-        "ew", ["ew/m01:latest", "ew/m02:latest"], global_npm_tools=["serve@14.2.5"])
+        "ew", ["swe-milestone/ew__m01:latest", "swe-milestone/ew__m02:latest"], global_npm_tools=["serve@14.2.5"])
     assert built["df"] == expected
 
 
@@ -1593,7 +1602,7 @@ def test_build_closure_npm_branch_no_global_tools_key_no_install(monkeypatch, tm
 
     built = {}
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["ew/m01:latest"])
+                        lambda repo: ["swe-milestone/ew__m01:latest"])
     def fake_build(df, tag, root):
         built["df"] = df
     monkeypatch.setattr(boc, "_docker_build", fake_build)
@@ -1609,28 +1618,28 @@ def test_build_closure_npm_branch_no_global_tools_key_no_install(monkeypatch, tm
 
 def test_pick_go_toolchain_milestone_last_when_correct():
     """Last milestone (B-end) has the target go → it is picked (and probed)."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest", "swe-milestone/r_x__m03:latest"]
     probed = []
     def probe(img):
         probed.append(img)
-        return "go1.21.13" if img == "r/x/m03:latest" else "go1.19.13"
+        return "go1.21.13" if img == "swe-milestone/r_x__m03:latest" else "go1.19.13"
     got = boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
-    assert got == "r/x/m03:latest"
-    assert probed[0] == "r/x/m03:latest"   # last-first probing
+    assert got == "swe-milestone/r_x__m03:latest"
+    assert probed[0] == "swe-milestone/r_x__m03:latest"   # last-first probing
 
 
 def test_pick_go_toolchain_milestone_falls_back_when_last_wrong():
     """If the last milestone has the wrong go, an earlier one that matches is used."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest", "swe-milestone/r_x__m03:latest"]
     # only m02 has the target; m03 (last) regressed/lacks it
-    probe = lambda img: "go1.21.13" if img == "r/x/m02:latest" else "go1.19.13"
+    probe = lambda img: "go1.21.13" if img == "swe-milestone/r_x__m02:latest" else "go1.19.13"
     got = boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
-    assert got == "r/x/m02:latest"
+    assert got == "swe-milestone/r_x__m02:latest"
 
 
 def test_pick_go_toolchain_milestone_none_matches_exits():
     """No milestone reports the target go → fail-closed (would break offline gate)."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     probe = lambda img: "go1.19.13"
     with pytest.raises(SystemExit) as e:
         boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe)
@@ -1639,24 +1648,24 @@ def test_pick_go_toolchain_milestone_none_matches_exits():
 
 def test_pick_go_toolchain_milestone_accepts_go_prefixed_target():
     """target_go may be given as "go1.21.13" or "1.21.13"; both match."""
-    ms = ["r/x/m01:latest"]
+    ms = ["swe-milestone/r_x__m01:latest"]
     probe = lambda img: "go1.21.13"
-    assert boc.pick_go_toolchain_milestone(ms, "go1.21.13", _probe=probe) == "r/x/m01:latest"
-    assert boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe) == "r/x/m01:latest"
+    assert boc.pick_go_toolchain_milestone(ms, "go1.21.13", _probe=probe) == "swe-milestone/r_x__m01:latest"
+    assert boc.pick_go_toolchain_milestone(ms, "1.21.13", _probe=probe) == "swe-milestone/r_x__m01:latest"
 
 
 def test_probe_go_version_parses_token(monkeypatch):
     """_probe_go_version extracts the bare go token from `go version` output."""
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, "go version go1.21.13 linux/amd64\n"))
-    assert boc._probe_go_version("r/x/m01:latest") == "go1.21.13"
+    assert boc._probe_go_version("swe-milestone/r_x__m01:latest") == "go1.21.13"
 
 
 def test_probe_go_version_returns_empty_on_failure(monkeypatch):
     """Probe failure (no such image / no go) → "" (picker treats as non-match)."""
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(1, "", "no such image"))
-    assert boc._probe_go_version("r/x/nope:latest") == ""
+    assert boc._probe_go_version("swe-milestone/r_x__nope:latest") == ""
 
 
 # ---- Fix 1: @v-sound probe —————————————————————————————————————————————————
@@ -1683,7 +1692,7 @@ def test_go_cache_probe_parent_dir_only_is_miss(monkeypatch):
         return _R(0, "")
 
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    result = boc._go_cache_has_path("r/x/base-offline:staging",
+    result = boc._go_cache_has_path("swe-milestone/r_x__base-offline:staging",
                                     "github.com/go-redis/redis/v8")
     assert result is False   # must be False (miss): parent dir ≠ @v present
 
@@ -1698,7 +1707,7 @@ def test_go_cache_probe_at_v_present_is_hit(monkeypatch):
         return _R(0, "")
 
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    result = boc._go_cache_has_path("r/x/base-offline:staging",
+    result = boc._go_cache_has_path("swe-milestone/r_x__base-offline:staging",
                                     "github.com/go-redis/redis/v8")
     assert result is True   # @v present → source_state path
 
@@ -1712,7 +1721,7 @@ def test_go_cache_probe_shell_uses_at_v(monkeypatch):
         return _R(0, "")
 
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    boc._go_cache_has_path("r/x/base-offline:staging", "github.com/foo/bar")
+    boc._go_cache_has_path("swe-milestone/r_x__base-offline:staging", "github.com/foo/bar")
     sh_cmd = " ".join(captured.get("cmd", []))
     # Must contain the @v suffix in the directory test — NOT just `[ -d "$d" ]`
     assert '[ -d "$d/@v" ]' in sh_cmd
@@ -1725,7 +1734,7 @@ def test_classify_missing_from_cache_is_gap_at_v(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, ""))   # no HIT → miss
     kind, detail = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "x.go:1:2: no required module provides package github.com/go-redis/redis/v8;\n")
     assert kind == "closure_gap"
     assert "github.com/go-redis/redis/v8" in detail
@@ -1746,7 +1755,7 @@ def test_run_offline_gate_go_sets_goproxy_off(monkeypatch):
         return _R(0, "")
 
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                          "go build ./...", goproxy_off=True)
     joined = " ".join(docker_run_args)
     assert "-e" in docker_run_args and "GOPROXY=off" in docker_run_args
@@ -1765,7 +1774,7 @@ def test_run_offline_gate_non_go_no_goproxy(monkeypatch):
         return _R(0, "")
 
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    boc.run_offline_gate("r/x/base-offline:staging", "r/x/m01:latest",
+    boc.run_offline_gate("swe-milestone/r_x__base-offline:staging", "swe-milestone/r_x__m01:latest",
                          "cargo build --offline")  # no goproxy_off kwarg
     assert "GOPROXY=off" not in docker_run_args
 
@@ -1778,7 +1787,7 @@ def test_missing_gosum_providing_package_extracted(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, "HIT\n"))
     kind, detail = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "verifier/foo.go:5:2: missing go.sum entry for module providing package "
         "github.com/foo/bar/baz; to add:\n\tgo mod tidy\n")
     # Token extracted should be the package path, not the word "providing"
@@ -1791,7 +1800,7 @@ def test_missing_gosum_plain_module_still_works(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(0, "HIT\n"))
     kind, _ = boc.classify_offline_build_failure(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "missing go.sum entry for module github.com/some/dep\n")
     assert kind == "source_state"
 
@@ -1809,8 +1818,8 @@ def test_collect_pip_freezes_runs_each_image(monkeypatch):
         seen.append(img)
         return _R(0, f"numpy==2.4.1\n# from {img}\n")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
-    out = boc.collect_pip_freezes(["r/x/m01:latest", "r/x/m06:latest"])
-    assert seen == ["r/x/m01:latest", "r/x/m06:latest"]
+    out = boc.collect_pip_freezes(["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m06:latest"])
+    assert seen == ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m06:latest"]
     assert len(out) == 2
     assert "numpy==2.4.1" in out[0]
 
@@ -1820,20 +1829,20 @@ def test_collect_pip_freezes_fail_exits(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: _R(1, "", "no such image"))
     with pytest.raises(SystemExit):
-        boc.collect_pip_freezes(["r/x/m01:latest"])
+        boc.collect_pip_freezes(["swe-milestone/r_x__m01:latest"])
 
 
 def test_assemble_pip_dockerfile_two_stage_wheel_builder():
     """Multi-stage: wheel_builder does `pip download -r <reqs> -d /wheelhouse`
     off base:latest; final COPYs /wheelhouse + the reqs file back in."""
-    df = boc.assemble_pip_dockerfile("r/x", "union_reqs.txt")
+    df = boc.assemble_pip_dockerfile("r_x", "union_reqs.txt")
     # builder stage off base:latest
-    assert "FROM r/x/base:latest AS wheel_builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS wheel_builder" in df
     # copies the reqs from the build context and downloads into /wheelhouse (online)
     assert "COPY union_reqs.txt /tmp/union_reqs.txt" in df
     assert "pip download -r /tmp/union_reqs.txt -d /wheelhouse" in df
     # final stage off the SAME base, carrying the wheelhouse + reqs
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     assert "COPY --from=wheel_builder /wheelhouse /wheelhouse" in df
     # the reqs file must also exist in the final image (gate -r reads it)
     assert df.count("COPY union_reqs.txt /tmp/union_reqs.txt") == 2
@@ -1846,7 +1855,7 @@ def test_audit_wheelhouse_self_exclusion_empty_forbid_noop(monkeypatch):
     called = []
     monkeypatch.setattr(boc.subprocess, "run",
                         lambda *a, **k: called.append(a) or _R(0, ""))
-    boc.audit_wheelhouse_self_exclusion("r/x/base-offline:staging", [])
+    boc.audit_wheelhouse_self_exclusion("swe-milestone/r_x__base-offline:staging", [])
     assert called == []
 
 
@@ -1859,9 +1868,9 @@ def test_audit_wheelhouse_self_exclusion_clean_passes(monkeypatch):
         return _R(0, "")   # empty = no forbidden wheel
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     boc.audit_wheelhouse_self_exclusion(
-        "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+        "swe-milestone/r_x__base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
     assert captured["cmd"][:3] == ["docker", "run", "--rm"]
-    assert "r/x/base-offline:staging" in captured["cmd"]
+    assert "swe-milestone/r_x__base-offline:staging" in captured["cmd"]
     assert "/wheelhouse" in " ".join(captured["cmd"])
 
 
@@ -1872,7 +1881,7 @@ def test_audit_wheelhouse_self_exclusion_forbidden_wheel_exits(monkeypatch):
         lambda *a, **k: _R(0, "scikit_learn-1.6.0-cp310-cp310-linux_x86_64.whl\n"))
     with pytest.raises(SystemExit) as e:
         boc.audit_wheelhouse_self_exclusion(
-            "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+            "swe-milestone/r_x__base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
     assert e.value.code == 1
 
 
@@ -1901,7 +1910,7 @@ def test_audit_wheelhouse_self_exclusion_match_among_many(monkeypatch):
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, listing))
     with pytest.raises(SystemExit):
         boc.audit_wheelhouse_self_exclusion(
-            "r/x/base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
+            "swe-milestone/r_x__base-offline:staging", ["scikit-learn", "scikit_learn", "sklearn"])
 
 
 def test_run_pip_offline_gate_install_ok_no_exit(monkeypatch):
@@ -1913,12 +1922,12 @@ def test_run_pip_offline_gate_install_ok_no_exit(monkeypatch):
         return _R(0, "Successfully installed numpy-2.4.1\n")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     boc.run_pip_offline_gate(
-        "r/x/base-offline:staging",
+        "swe-milestone/r_x__base-offline:staging",
         "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt")
     run = captured["cmd"]
     assert run[:3] == ["docker", "run", "--rm"]
     assert "--network" in run and "none" in run
-    assert "r/x/base-offline:staging" in run
+    assert "swe-milestone/r_x__base-offline:staging" in run
     joined = " ".join(run)
     assert "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt" in joined
     # pip gate must NOT bind-mount a milestone /testbed (unlike the go/cargo gate)
@@ -1932,7 +1941,7 @@ def test_run_pip_offline_gate_install_fail_exits(monkeypatch):
         lambda *a, **k: _R(1, "", "ERROR: No matching distribution found for foo==1.0"))
     with pytest.raises(SystemExit) as e:
         boc.run_pip_offline_gate(
-            "r/x/base-offline:staging",
+            "swe-milestone/r_x__base-offline:staging",
             "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt")
     assert e.value.code == 1
 
@@ -1954,7 +1963,7 @@ def test_build_closure_pip_branch_wires_freeze_union_audit_gate(monkeypatch, tmp
     events = []
     # milestone discovery → two fake milestones
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["sk/m01:latest", "sk/m06:latest"])
+                        lambda repo: ["swe-milestone/sk__m01:latest", "swe-milestone/sk__m06:latest"])
     # freeze: base-like m01 lacks array-api; m06 has it + the editable comment + scikit
     def fake_collect(images):
         events.append(("freeze", list(images)))
@@ -1994,8 +2003,8 @@ def test_build_closure_pip_branch_wires_freeze_union_audit_gate(monkeypatch, tmp
     assert kinds.index("freeze") < kinds.index("build") < kinds.index("audit") \
         < kinds.index("gate") < kinds.index("tag")
     # staging built, :latest tagged
-    assert built["tag"] == "sk/base-offline:staging"
-    assert ("tag", "sk/base-offline:staging", "sk/base-offline:latest") in events
+    assert built["tag"] == "swe-milestone/sk__base-offline:staging"
+    assert ("tag", "swe-milestone/sk__base-offline:staging", "swe-milestone/sk__base-offline:latest") in events
     # the reqs handed to the wheel_builder: array-api-compat IN, scikit-learn OUT
     assert "array-api-compat==1.13.0" in built["reqs_text"]
     assert "array_api_strict==2.4.1" in built["reqs_text"]
@@ -2018,7 +2027,7 @@ def test_build_closure_pip_branch_multi_version_exits(monkeypatch, tmp_path):
         "  cache_paths: []\n"
         "  offline_build: 'pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt'\n")
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["sk/m01:latest", "sk/m06:latest"])
+                        lambda repo: ["swe-milestone/sk__m01:latest", "swe-milestone/sk__m06:latest"])
     monkeypatch.setattr(boc, "collect_pip_freezes",
                         lambda images: ["numpy==2.4.1\n", "numpy==2.5.0\n"])
     monkeypatch.setattr(boc, "_docker_build",
@@ -2036,7 +2045,7 @@ def test_build_closure_pip_branch_multi_version_exits(monkeypatch, tmp_path):
 # build && GOPROXY=off go build ./...`, classified by BOTH the npm and go
 # classifiers. No self@B in either cache → no removal, audit is a clean no-op.
 
-def _go_probe_124(target="r/x/m02:latest"):
+def _go_probe_124(target="swe-milestone/r_x__m02:latest"):
     """Fake go probe: only `target` reports go1.24.5 (the B-side toolchain bump);
     the rest report go1.24.4 — mirrors navidrome's milestone split."""
     return lambda img: "go1.24.5" if img == target else "go1.24.4"
@@ -2068,18 +2077,18 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     toolchain) AND the npm cacache warm in ONE multi-stage Dockerfile, with a single
     syntax directive and a final stage that COPYs the unioned go cache + the
     online-fetched go modcache + the go toolchain + the warmed _cacache."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     caches = ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"]
     df = boc.assemble_go_npm_dockerfile(
-        "r/x", ms, caches, "1.24.5", _probe=_go_probe_124())
+        "r_x", ms, caches, "1.24.5", _probe=_go_probe_124())
     # exactly ONE syntax directive, at the very top
     assert df.count("# syntax=docker/dockerfile:1") == 1
     assert df.startswith("# syntax=docker/dockerfile:1\n")
     # --- npm part: a npm_fetch stage that COPYs ONLY the UI manifests + warms cacache
-    assert "FROM r/x/base:latest AS npm_fetch" in df
-    assert ("COPY --from=r/x/m01:latest /testbed/ui/package.json "
+    assert "FROM swe-milestone/r_x__base:v1.0 AS npm_fetch" in df
+    assert ("COPY --from=swe-milestone/r_x__m01:latest /testbed/ui/package.json "
             "/testbed/ui/package-lock.json /ui_m0/") in df
-    assert ("COPY --from=r/x/m02:latest /testbed/ui/package.json "
+    assert ("COPY --from=swe-milestone/r_x__m02:latest /testbed/ui/package.json "
             "/testbed/ui/package-lock.json /ui_m1/") in df
     assert "npm ci --cache /root/.npm " in df          # npm, not yarn
     # 'yarn' must not appear as the npm tool (the go_fetch download is npm-free too)
@@ -2087,11 +2096,11 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     # the WHOLE /testbed is never COPY'd into the npm stage (manifests only)
     assert "/testbed /ui_m" not in df
     # --- go part: ONLINE go_fetch stage (full module graph) over the raw-cache union
-    assert "FROM r/x/base:latest AS go_fetch" in df
-    assert "COPY --from=r/x/m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS go_fetch" in df
+    assert "COPY --from=swe-milestone/r_x__m01:latest /testbed/go.mod /testbed/go.sum /m0/" in df
     assert df.count("go mod download all") == len(ms)
-    assert "FROM r/x/base:latest AS builder" in df
-    assert "FROM r/x/base:latest AS final" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS builder" in df
+    assert "FROM swe-milestone/r_x__base:v1.0 AS final" in df
     assert "rsync -a /milestone_" in df
     assert "/go/pkg/mod/cache/download" in df
     # the npm _cacache must NOT be rsync-union'd as a go cache path
@@ -2100,7 +2109,7 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     # --- go toolchain: clean-replace from the 1.24.5 milestone + GOTOOLCHAIN=local
     #     (now in BOTH go_fetch and final → two clean-replaces, two toolchain COPYs)
     assert df.count("RUN rm -rf /usr/local/go") == 2
-    assert df.count("COPY --from=r/x/m02:latest /usr/local/go /usr/local/go") == 2
+    assert df.count("COPY --from=swe-milestone/r_x__m02:latest /usr/local/go /usr/local/go") == 2
     assert "ENV GOTOOLCHAIN=local" in df
     # --- final stage COPYs the online-fetched go modcache + the warmed _cacache
     assert ("COPY --from=go_fetch /go/pkg/mod/cache/download "
@@ -2114,7 +2123,7 @@ def test_assemble_go_npm_dockerfile_emits_both_closures():
     final_rm = df.rindex("RUN rm -rf /usr/local/go")
     assert df.index("AS final") < final_rm
     assert df.index("COPY --from=go_fetch /go/pkg") < final_rm
-    assert final_rm < df.rindex("COPY --from=r/x/m02:latest /usr/local/go")
+    assert final_rm < df.rindex("COPY --from=swe-milestone/r_x__m02:latest /usr/local/go")
     assert df.rindex("ENV GOTOOLCHAIN=local") \
         < df.index("COPY --from=npm_fetch /root/.npm/_cacache")
     # NO self@B removal for navidrome (no rm -rf of any cache dir)
@@ -2128,10 +2137,10 @@ def test_assemble_go_npm_dockerfile_bakes_agent_readable_perms():
     a public CGO C lib the agent must `go build` against) and /root/.npm (npm closure
     under a 700 /root). Both via `a+rX` (read+traverse, NOT write) and tolerant of
     an absent path, baked AFTER the closures are COPY'd in."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     caches = ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"]
     df = boc.assemble_go_npm_dockerfile(
-        "r/x", ms, caches, "1.24.5", _probe=_go_probe_124())
+        "r_x", ms, caches, "1.24.5", _probe=_go_probe_124())
     # taglib: world read + dir-traverse only (a+rX, NOT 777/write), absent-tolerant
     assert "RUN chmod -R a+rX /tmp/taglib 2>/dev/null || true" in df
     assert "chmod -R 777 /tmp/taglib" not in df
@@ -2159,18 +2168,18 @@ def test_navidrome_config_offline_build_has_netgo_tag():
 def test_assemble_go_npm_dockerfile_no_milestones_exits():
     with pytest.raises(SystemExit):
         boc.assemble_go_npm_dockerfile(
-            "r/x", [], ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5")
+            "r_x", [], ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5")
 
 
 def test_assemble_go_npm_dockerfile_toolchain_fallback_scans():
     """If the LAST milestone lacks the target go, an earlier one that reports it is
     picked for the toolchain COPY (pick_go_toolchain_milestone scan)."""
-    ms = ["r/x/m01:latest", "r/x/m02:latest", "r/x/m03:latest"]
+    ms = ["swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest", "swe-milestone/r_x__m03:latest"]
     # only m02 has go1.24.5; m03 (last) regressed to go1.24.4
     df = boc.assemble_go_npm_dockerfile(
-        "r/x", ms, ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5",
-        _probe=_go_probe_124("r/x/m02:latest"))
-    assert "COPY --from=r/x/m02:latest /usr/local/go /usr/local/go" in df
+        "r_x", ms, ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5",
+        _probe=_go_probe_124("swe-milestone/r_x__m02:latest"))
+    assert "COPY --from=swe-milestone/r_x__m02:latest /usr/local/go /usr/local/go" in df
 
 
 # ---- DUAL go+npm gate classifier ----------------------------------------------
@@ -2196,7 +2205,7 @@ def test_classify_go_npm_npm_cache_miss_is_gap():
     """An `npm ci --offline` cache-miss (ENOTCACHED / only-if-cached) → closure_gap,
     tagged [npm]. The go classifier alone would miss npm's strings (fail-OPEN)."""
     kind, detail = boc.classify_go_npm_offline_build_failure(
-        "r/x/base-offline:staging", _NPM_CI_OFFLINE_GAP)
+        "swe-milestone/r_x__base-offline:staging", _NPM_CI_OFFLINE_GAP)
     assert kind == "closure_gap"
     assert "[npm]" in detail
 
@@ -2208,7 +2217,7 @@ def test_classify_go_npm_go_module_gap_is_gap(monkeypatch):
     # probe: no HIT → the module is absent from the cache
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, ""))
     kind, detail = boc.classify_go_npm_offline_build_failure(
-        "r/x/base-offline:staging", _GO_BUILD_GAP)
+        "swe-milestone/r_x__base-offline:staging", _GO_BUILD_GAP)
     assert kind == "closure_gap"
     assert "[go]" in detail
     assert "example.com/totally/absent" in detail
@@ -2223,7 +2232,7 @@ def test_classify_go_npm_go_compile_error_is_source_state(monkeypatch):
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_run)
     kind, detail = boc.classify_go_npm_offline_build_failure(
-        "r/x/base-offline:staging", _GO_BUILD_SOURCESTATE_COMPILE)
+        "swe-milestone/r_x__base-offline:staging", _GO_BUILD_SOURCESTATE_COMPILE)
     assert kind == "source_state"
     assert called["probe"] is False     # no token → no cache probe
 
@@ -2232,7 +2241,7 @@ def test_classify_go_npm_ui_build_error_is_source_state():
     """A UI tsc/vite build error (no npm cache-miss, no go module token) →
     source_state — a compile error is not a missing dependency."""
     kind, _ = boc.classify_go_npm_offline_build_failure(
-        "r/x/base-offline:staging", _UI_TSC_ERROR)
+        "swe-milestone/r_x__base-offline:staging", _UI_TSC_ERROR)
     assert kind == "source_state"
 
 
@@ -2241,7 +2250,7 @@ def test_classify_go_npm_npm_gap_wins_over_go_token(monkeypatch):
     returned (fail-closed: any real missing dep blocks; npm is checked first)."""
     monkeypatch.setattr(boc.subprocess, "run", lambda *a, **k: _R(0, "HIT\n"))
     kind, detail = boc.classify_go_npm_offline_build_failure(
-        "r/x/base-offline:staging", _NPM_CI_OFFLINE_GAP + _GO_BUILD_GAP)
+        "swe-milestone/r_x__base-offline:staging", _NPM_CI_OFFLINE_GAP + _GO_BUILD_GAP)
     assert kind == "closure_gap"
     assert "[npm]" in detail
 
@@ -2309,14 +2318,14 @@ def test_build_closure_dual_go_npm_dispatches_not_sysexit(monkeypatch, tmp_path)
 
     events = []
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+                        lambda repo: ["swe-milestone/nav__m01:latest", "swe-milestone/nav__m02:latest"])
     # assemble_go_npm_dockerfile picks the toolchain milestone via
     # pick_go_toolchain_milestone(... _probe=<default-bound _probe_go_version>); the
     # default arg is bound at def-time so reassigning boc._probe_go_version won't
     # take. Stub the picker itself (its probe/scan logic is unit-tested separately)
     # so the dispatch test exercises only the dual wiring.
     monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
-                        lambda ms, tg, _probe=None: "nav/m02:latest")
+                        lambda ms, tg, _probe=None: "swe-milestone/nav__m02:latest")
     built = {}
     def fake_build(df, tag, root):
         events.append(("build", tag))
@@ -2343,24 +2352,24 @@ def test_build_closure_dual_go_npm_dispatches_not_sysexit(monkeypatch, tmp_path)
     kinds = [e[0] for e in events]
     assert kinds.index("build") < kinds.index("audit") < kinds.index("gate") \
         < kinds.index("tag")
-    assert built["tag"] == "nav/base-offline:staging"
-    assert ("tag", "nav/base-offline:staging", "nav/base-offline:latest") in events
+    assert built["tag"] == "swe-milestone/nav__base-offline:staging"
+    assert ("tag", "swe-milestone/nav__base-offline:staging", "swe-milestone/nav__base-offline:latest") in events
     # the staging Dockerfile carries BOTH the go union+toolchain AND the npm warm
     df = built["df"]
-    assert "FROM nav/base:latest AS npm_fetch" in df
+    assert "FROM swe-milestone/nav__base:v1.0 AS npm_fetch" in df
     assert "npm ci --cache /root/.npm " in df
     assert "rsync -a /milestone_" in df and "/go/pkg/mod/cache/download" in df
     assert "RUN rm -rf /usr/local/go" in df and "ENV GOTOOLCHAIN=local" in df
-    assert "COPY --from=nav/m02:latest /usr/local/go /usr/local/go" in df  # 1.24.5
+    assert "COPY --from=swe-milestone/nav__m02:latest /usr/local/go /usr/local/go" in df  # 1.24.5
     assert "COPY --from=npm_fetch /root/.npm/_cacache /root/.npm/_cacache" in df
     # it equals assemble_go_npm_dockerfile exactly (the dual assembly); the picker
     # is stubbed above, so both this and the dispatch use the same toolchain pick.
     expected = boc.assemble_go_npm_dockerfile(
-        "nav", ["nav/m01:latest", "nav/m02:latest"],
+        "nav", ["swe-milestone/nav__m01:latest", "swe-milestone/nav__m02:latest"],
         ["/go/pkg/mod/cache/download", "/root/.npm/_cacache"], "1.24.5")
     assert df == expected
     # one DUAL gate per milestone: the dual command, goproxy_off=True, dual classifier
-    assert [e[1] for e in events if e[0] == "gate"] == ["nav/m01:latest", "nav/m02:latest"]
+    assert [e[1] for e in events if e[0] == "gate"] == ["swe-milestone/nav__m01:latest", "swe-milestone/nav__m02:latest"]
     for (m, ob, gpo, clf) in gate_calls:
         assert ob == boc._GO_NPM_OFFLINE_GATE
         assert gpo is True
@@ -2372,9 +2381,9 @@ def test_build_closure_dual_go_npm_gap_blocks_no_tag(monkeypatch, tmp_path):
     :latest is NEVER tagged."""
     _write_navidrome_cfg(tmp_path)
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+                        lambda repo: ["swe-milestone/nav__m01:latest", "swe-milestone/nav__m02:latest"])
     monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
-                        lambda ms, tg, _probe=None: "nav/m02:latest")
+                        lambda ms, tg, _probe=None: "swe-milestone/nav__m02:latest")
     monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
     monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
     # the gate fail-closes (a real gap) by sys.exit, as run_offline_gate would
@@ -2397,15 +2406,15 @@ def test_build_closure_dual_go_npm_source_state_still_tags(monkeypatch, tmp_path
     does NOT block: :latest is still tagged (closure has the bytes)."""
     _write_navidrome_cfg(tmp_path)
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["nav/m01:latest", "nav/m02:latest"])
+                        lambda repo: ["swe-milestone/nav__m01:latest", "swe-milestone/nav__m02:latest"])
     monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
-                        lambda ms, tg, _probe=None: "nav/m02:latest")
+                        lambda ms, tg, _probe=None: "swe-milestone/nav__m02:latest")
     monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
     monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
     # m01 source-state, m02 pass
     monkeypatch.setattr(
         boc, "run_offline_gate",
-        lambda tag, m, ob, **k: "SOURCE_STATE" if m == "nav/m01:latest" else "PASS")
+        lambda tag, m, ob, **k: "SOURCE_STATE" if m == "swe-milestone/nav__m01:latest" else "PASS")
     tagged = []
     def fake_sub_run(cmd, *a, **k):
         if cmd[:2] == ["docker", "tag"]:
@@ -2413,7 +2422,7 @@ def test_build_closure_dual_go_npm_source_state_still_tags(monkeypatch, tmp_path
         return _R(0, "")
     monkeypatch.setattr(boc.subprocess, "run", fake_sub_run)
     boc.build_closure("nav", tmp_path, push=False, keep=True)
-    assert ("nav/base-offline:staging", "nav/base-offline:latest") in tagged
+    assert ("swe-milestone/nav__base-offline:staging", "swe-milestone/nav__base-offline:latest") in tagged
 
 
 # ---- toolchain coverage gate: parsing + comparison (mocked docker outputs) ----
@@ -2527,100 +2536,100 @@ def _cov_sh(rustup="", goversion=""):
 
 def test_coverage_gate_rust_pin_present_passes():
     """Pinned channel present in the image's rustup list → PASS (no exit)."""
-    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest"]
     cat = _cov_cat(channels={m: '[toolchain]\nchannel = "1.86.0"\n' for m in ms})
     sh = _cov_sh(rustup="1.86.0-x86_64-unknown-linux-gnu (active, default)\n")
     # returns None (no raise)
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
 
 
 def test_coverage_gate_rust_pin_absent_exits():
     """A milestone pins 1.92.0 but the image only has 1.86/1.87/1.88 → shortfall →
     sys.exit(1)."""
-    ms = ["r/x/m00:latest"]
-    cat = _cov_cat(channels={"r/x/m00:latest": 'channel = "1.92.0"\n'})
+    ms = ["swe-milestone/r_x__m00:latest"]
+    cat = _cov_cat(channels={"swe-milestone/r_x__m00:latest": 'channel = "1.92.0"\n'})
     sh = _cov_sh(rustup=("1.86.0-x86_64-unknown-linux-gnu (active)\n"
                          "1.87.0-x86_64-unknown-linux-gnu\n"
                          "1.88.0-x86_64-unknown-linux-gnu (default)\n"))
     with pytest.raises(SystemExit) as e:
         boc.run_toolchain_coverage_gate(
-            "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
+            "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
     assert e.value.code == 1
 
 
 def test_coverage_gate_rust_file_absent_passes():
     """No rust-toolchain.toml in any milestone (ripgrep) → no requirement → PASS,
     even if the image's rustup list has only `stable`."""
-    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest"]
     cat = _cov_cat(channels={})   # absent everywhere
     sh = _cov_sh(rustup="stable-x86_64-unknown-linux-gnu (active, default)\n"
                         "1.88.0-x86_64-unknown-linux-gnu\n")
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh) is None
 
 
 def test_coverage_gate_rust_nonnumeric_channel_only_needs_a_toolchain():
     """A non-numeric channel ("stable") is NOT an exact pin: PASS as long as the
     image has SOME toolchain; only an EMPTY rustup list is a shortfall."""
-    ms = ["r/x/m00:latest"]
-    cat = _cov_cat(channels={"r/x/m00:latest": 'channel = "stable"\n'})
+    ms = ["swe-milestone/r_x__m00:latest"]
+    cat = _cov_cat(channels={"swe-milestone/r_x__m00:latest": 'channel = "stable"\n'})
     # has a toolchain (even a numeric one) → pass
     sh_ok = _cov_sh(rustup="1.88.0-x86_64-unknown-linux-gnu (active)\n")
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_ok) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_ok) is None
     # NO toolchain at all → shortfall
     sh_bad = _cov_sh(rustup="")
     with pytest.raises(SystemExit):
         boc.run_toolchain_coverage_gate(
-            "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_bad)
+            "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh_bad)
 
 
 def test_coverage_gate_go_directive_satisfied_passes():
     """go.mod `go 1.21` and image go1.21.13 → 1.21.13 >= 1.21 → PASS."""
-    ms = ["r/x/m00:latest"]
-    cat = _cov_cat(gomods={"r/x/m00:latest": "module x\n\ngo 1.21\n"})
+    ms = ["swe-milestone/r_x__m00:latest"]
+    cat = _cov_cat(gomods={"swe-milestone/r_x__m00:latest": "module x\n\ngo 1.21\n"})
     sh = _cov_sh(goversion="go version go1.21.13 linux/amd64")
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["go"], _cat=cat, _sh=sh) is None
 
 
 def test_coverage_gate_go_directive_too_new_exits():
     """go.mod `go 1.24` but image only go1.21.13 → 1.21.13 < 1.24 → shortfall →
     sys.exit(1)."""
-    ms = ["r/x/m00:latest"]
-    cat = _cov_cat(gomods={"r/x/m00:latest": "go 1.24\n"})
+    ms = ["swe-milestone/r_x__m00:latest"]
+    cat = _cov_cat(gomods={"swe-milestone/r_x__m00:latest": "go 1.24\n"})
     sh = _cov_sh(goversion="go version go1.21.13 linux/amd64")
     with pytest.raises(SystemExit) as e:
         boc.run_toolchain_coverage_gate(
-            "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
+            "swe-milestone/r_x__base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
     assert e.value.code == 1
 
 
 def test_coverage_gate_go_toolchain_line_enforced():
     """An exact `toolchain go1.24.5` line is enforced as a minimum: image go1.24.4
     < 1.24.5 → shortfall."""
-    ms = ["r/x/m00:latest"]
-    cat = _cov_cat(gomods={"r/x/m00:latest": "go 1.24.4\n\ntoolchain go1.24.5\n"})
+    ms = ["swe-milestone/r_x__m00:latest"]
+    cat = _cov_cat(gomods={"swe-milestone/r_x__m00:latest": "go 1.24.4\n\ntoolchain go1.24.5\n"})
     sh = _cov_sh(goversion="go version go1.24.4 linux/amd64")
     with pytest.raises(SystemExit) as e:
         boc.run_toolchain_coverage_gate(
-            "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
+            "swe-milestone/r_x__base-offline:latest", ms, ["go"], _cat=cat, _sh=sh)
     assert e.value.code == 1
     # but image go1.24.5 satisfies BOTH the `go` min and the exact toolchain.
     sh_ok = _cov_sh(goversion="go version go1.24.5 linux/amd64")
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["go"], _cat=cat, _sh=sh_ok) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["go"], _cat=cat, _sh=sh_ok) is None
 
 
 def test_coverage_gate_collects_all_shortfalls_then_exits():
     """Multiple milestones each missing a toolchain: ALL are reported (do NOT exit on
     the first miss) and then sys.exit(1) once — one rebuild fixes all."""
-    ms = ["r/x/m00:latest", "r/x/m01:latest", "r/x/m02:latest"]
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest", "swe-milestone/r_x__m02:latest"]
     cat = _cov_cat(
-        channels={"r/x/m00:latest": 'channel = "1.90.0"\n',     # missing
-                  "r/x/m01:latest": 'channel = "1.86.0"\n',     # present
-                  "r/x/m02:latest": 'channel = "1.91.0"\n'})    # missing
+        channels={"swe-milestone/r_x__m00:latest": 'channel = "1.90.0"\n',     # missing
+                  "swe-milestone/r_x__m01:latest": 'channel = "1.86.0"\n',     # present
+                  "swe-milestone/r_x__m02:latest": 'channel = "1.91.0"\n'})    # missing
     sh = _cov_sh(rustup="1.86.0-x86_64-unknown-linux-gnu (active, default)\n")
     captured = {}
     import sys as _sys
@@ -2639,21 +2648,21 @@ def test_coverage_gate_collects_all_shortfalls_then_exits():
     try:
         with pytest.raises(SystemExit) as e:
             boc.run_toolchain_coverage_gate(
-                "r/x/base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
+                "swe-milestone/r_x__base-offline:latest", ms, ["cargo"], _cat=cat, _sh=sh)
     finally:
         monkey.undo()
     assert e.value.code == 1
     report = "\n".join(printed)
     # BOTH missing milestones named; the present one is NOT a shortfall.
-    assert "r/x/m00:latest" in report and "1.90.0" in report
-    assert "r/x/m02:latest" in report and "1.91.0" in report
-    assert "r/x/m01:latest" not in report
+    assert "swe-milestone/r_x__m00:latest" in report and "1.90.0" in report
+    assert "swe-milestone/r_x__m02:latest" in report and "1.91.0" in report
+    assert "swe-milestone/r_x__m01:latest" not in report
 
 
 def test_coverage_gate_noop_for_pip_maven_npm():
     """A repo whose ecosystems include no rust/go (pip/maven/npm) → the gate reads no
     declaration and is a no-op (never probes, never exits), even with milestones."""
-    ms = ["r/x/m00:latest", "r/x/m01:latest"]
+    ms = ["swe-milestone/r_x__m00:latest", "swe-milestone/r_x__m01:latest"]
     probed = {"n": 0}
     def _cat(image, path):
         probed["n"] += 1
@@ -2662,11 +2671,11 @@ def test_coverage_gate_noop_for_pip_maven_npm():
         probed["n"] += 1
         return ""
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["pip"], _cat=_cat, _sh=_sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["pip"], _cat=_cat, _sh=_sh) is None
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["maven"], _cat=_cat, _sh=_sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["maven"], _cat=_cat, _sh=_sh) is None
     assert boc.run_toolchain_coverage_gate(
-        "r/x/base-offline:latest", ms, ["npm"], _cat=_cat, _sh=_sh) is None
+        "swe-milestone/r_x__base-offline:latest", ms, ["npm"], _cat=_cat, _sh=_sh) is None
     assert probed["n"] == 0   # never shelled out for a non-rust/go repo
 
 
@@ -2679,7 +2688,7 @@ def test_coverage_gate_wired_into_build_closure_before_tag(monkeypatch, tmp_path
         "  offline_build: 'cargo build --offline'\n")
     order = []
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda r: ["rg/m01:latest"])
+                        lambda r: ["swe-milestone/rg__m01:latest"])
     monkeypatch.setattr(boc, "assemble_cargo_dockerfile", lambda *a, **k: "DF")
     monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
     monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
@@ -2705,9 +2714,9 @@ def test_coverage_gate_wired_into_dual_go_npm_before_tag(monkeypatch, tmp_path):
     _write_navidrome_cfg(tmp_path)
     order = []
     monkeypatch.setattr(boc, "discover_milestone_images",
-                        lambda repo: ["nav/m01:latest"])
+                        lambda repo: ["swe-milestone/nav__m01:latest"])
     monkeypatch.setattr(boc, "pick_go_toolchain_milestone",
-                        lambda ms, tg, _probe=None: "nav/m01:latest")
+                        lambda ms, tg, _probe=None: "swe-milestone/nav__m01:latest")
     monkeypatch.setattr(boc, "assemble_go_npm_dockerfile", lambda *a, **k: "DF")
     monkeypatch.setattr(boc, "_docker_build", lambda df, tag, root: None)
     monkeypatch.setattr(boc, "audit_staging_image", lambda tag, globs: None)
