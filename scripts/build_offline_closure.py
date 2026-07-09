@@ -1,6 +1,6 @@
 """Unified offline closure builder. Union all milestone images' deps into a
-self-contained <repo>/base-offline:latest. See
-docs/superpowers/specs/2026-06-23-offline-closure-builder-design.md."""
+self-contained swe-milestone/<repo_full>__base-offline:latest image.
+See docs/quarantine.md (build + validation protocol)."""
 import argparse, glob as _glob, subprocess, sys, yaml
 from pathlib import Path
 

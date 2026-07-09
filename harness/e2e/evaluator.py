@@ -639,7 +639,7 @@ class PatchEvaluator:
         #   EvoClaw:    swe-milestone/{repo_full}__{milestone_id}:{tag}
         #               e.g. swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__milestone_006:v1.0
         #   AgentBench (legacy, images only exist under the OLD local scheme —
-        #   deliberately NOT migrated, see spec §2 non-goals):
+        #   deliberately NOT migrated, see docs/versioning.md):
         #               {repo}/{test_name}/{milestone_id}:{tag}
         # Note: Docker image names must be lowercase (OCI spec requirement)
         # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default in
@@ -700,7 +700,7 @@ class PatchEvaluator:
         cmd = [
             "docker",
             "run",
-            "--pull=never",  # hermetic eval: image must already be local (spec §3.3a)
+            "--pull=never",  # hermetic eval: image must already be local (docs/versioning.md)
             "-d",
             "--init",
             "--name",

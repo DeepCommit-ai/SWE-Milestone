@@ -109,3 +109,6 @@ version are immutable: never re-pushed, never deleted. Pre-v1.0 images remain
 on the hub under the old `hyd2apse/<short>:<milestone>-v0.9` scheme, frozen;
 the current tooling intentionally does not read them (use the old script from
 git history if you ever need them).
+
+Full versioning policy (what bumps the benchmark version, immutability rules,
+manifest/digest binding layer): see [docs/versioning.md](versioning.md).

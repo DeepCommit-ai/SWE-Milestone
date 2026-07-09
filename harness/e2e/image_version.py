@@ -1,6 +1,6 @@
 """Single naming + version authority for benchmark Docker images.
 
-Naming scheme (v1.0, spec: docs/superpowers/specs/2026-07-08-docker-image-naming-v1-design.md):
+Naming scheme (v1.0, policy: docs/versioning.md):
 
     local:  swe-milestone/<repo_full>__<milestone>:<tag>
     hub:    <org>/swe-milestone__<repo_full>__<milestone>:<tag>
@@ -23,7 +23,7 @@ The ONLY legacy branch in the project lives in parse_local_ref(): pre-v1.0
 trials recorded old-format names ("<repo_full>/<milestone>:<tag>") in
 trial_metadata.json, and `run_e2e.py --resume` replays them verbatim; the
 quarantine-config lookup must therefore still extract repo_full from old
-names. Hub-side v0.9 naming gets NO compatibility code (spec §7).
+names. Hub-side v0.9 naming gets NO compatibility code (docs/versioning.md).
 """
 
 import os

@@ -1,6 +1,6 @@
 # Releasing benchmark images v1.0 (operator runbook)
 
-Policy (spec 2026-07-08): published version tags are immutable (never
+Policy (docs/versioning.md): published version tags are immutable (never
 overwrite, never delete); unchanged content is RETAGGED, never rebuilt
 (builds are not reproducible — a rebuild silently changes the arena).
 
@@ -28,7 +28,7 @@ Content unchanged => digests unchanged. Pure pointer operation.
     while IFS=$'\t' read -r old new; do docker tag "$old" "$new" || exit 1; done
 
 Do NOT `docker rmi` the old-format tags yet: stopped pre-v1.0 trials
-resume with the recorded old names (spec §8).
+resume with the recorded old names (docs/versioning.md).
 
 ## 3. Push everything (115 images)
 
