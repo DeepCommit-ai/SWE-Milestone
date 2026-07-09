@@ -17,7 +17,7 @@ you can call `run_e2e` directly. Same `flock` + `--force` semantics apply.
 # Fresh start (or wipe-and-restart with --force)
 python -m harness.e2e.run_e2e \
   --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
-  --image navidrome_navidrome_v0.57.0_v0.58.0/base:latest \
+  --image swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0 \
   --srs-root /path/to/EvoClaw-data/navidrome_.../srs \
   --workspace-root /path/to/EvoClaw-data/navidrome_... \
   --agent claude-code --model claude-sonnet-4-6 \

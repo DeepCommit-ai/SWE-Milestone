@@ -303,7 +303,7 @@ python scripts/build_offline_closure.py --repo <repo_full_name>          # local
 python scripts/build_offline_closure.py --repo <repo_full_name> --push   # + DockerHub
 ```
 
-One command builds `<repo>/base-offline:staging` and runs **four fail-closed
+One command builds `swe-milestone/<repo_full>__base-offline:staging` and runs **four fail-closed
 gates**; `:latest` is tagged only if all pass, so the existence of a
 `base-offline` image is itself the proof it was validated:
 
@@ -324,12 +324,12 @@ gates**; `:latest` is tagged only if all pass, so the existence of a
    the staging image.
 
 How the closure is assembled: a networked multi-stage `docker build` starting
-`FROM <repo>/base:latest` unions every milestone's declared dependencies into
+`FROM swe-milestone/<repo_full>__base:<pin>` unions every milestone's declared dependencies into
 the shared cache (cargo `vendor` / go `go mod download all` / maven
 `dependency:go-offline` + test-scope resolve / yarn per-lockfile installs / pip
 freeze-union → `pip download` into an in-image `/wheelhouse`), then a final
-stage copies only the warmed cache forward. `base:latest` is never modified —
-`base-offline` is a strict layer on top (§8). Escape hatches for odd repos live
+stage copies only the warmed cache forward. The plain `__base` image is never
+modified — `__base-offline` is a strict layer on top (§8). Escape hatches for odd repos live
 in the `closure:` block (`cargo_mechanism: raw-cache`, `go_mechanism`,
 `global_npm_tools`, `extra_vendor_crates`). Never run `mvn install` during a
 build — it would bake the repo's own artifact into `.m2`; the builder's flow
@@ -339,13 +339,17 @@ Prerequisite: the repo's milestone images are present (`scripts/pull_images.sh`)
 
 ### Step 3 — promote the tag (easy to forget!)
 
-The builder only tags **`:latest`**, but the harness pins **`v0.9`** (§8). A
-rebuilt closure is **not live** until promoted:
+The builder only tags **`:staging`/`:latest`** (floating build tags), but the
+harness pins the benchmark data version (§8). A rebuilt closure is **not
+live** until promoted to the pinned tag — release promotion is handled
+uniformly by `retag-plan` (see `docs/release-v1.0-images.md`); for a single
+repo on one machine:
 
 ```bash
-# this machine
-docker tag <repo_full>/base-offline:latest <repo_full>/base-offline:v0.9
-# other machines: push (Step 2 --push, or docker push), then pull_images.sh there
+# this machine (example: version v1.0)
+docker tag swe-milestone/<repo_full>__base-offline:latest \
+           swe-milestone/<repo_full>__base-offline:v1.0
+# other machines: ./scripts/push_images.sh --repo <short>, then pull_images.sh there
 ```
 
 ### Step 4 — verify, then run
@@ -357,30 +361,39 @@ python scripts/run_all.py --config trial_config.yaml
 
 ## 8. Images and version pinning
 
-**Two images per repo.** `<repo>/base` is the original eval image (its cache
-covers only the A-version closure). `<repo>/base-offline` is built `FROM` it —
-same `/testbed`, same environment, plus the A→B union dependency cache (and a
+**Two images per repo.** `swe-milestone/<repo_full>__base` is the original
+eval image (its cache covers only the A-version closure).
+`swe-milestone/<repo_full>__base-offline` is built `FROM` it — same
+`/testbed`, same environment, plus the A→B union dependency cache (and a
 newer toolchain where B needs one). `image_for_repo()` selects at launch:
 policy file present → `base-offline`; no policy (or `--unprotected` baselines
 still launching a policy-less repo) → `base`. All 7 repos, **including
 scikit-learn**, use `base-offline` (the pip wheelhouse is baked in at
 `/wheelhouse`, not host-mounted).
 
-**Tag semantics.** `v0.9` is the benchmark **data-version pin** (env
-`EVOCLAW_IMAGE_TAG`, default `v0.9`); `:latest` is "most recent local build".
-`resolve_image()` (`harness/e2e/image_version.py`):
+**Tag semantics.** The tag is the benchmark **data-version pin** (env
+`EVOCLAW_IMAGE_TAG`, default `v1.0` — defined once in
+`harness/e2e/image_version.py`); `:latest` is "most recent local build".
+`resolve_image()`:
 
-1. `<image>:v0.9` exists locally → use it.
+1. `<image>:<pin>` exists locally → use it.
 2. Pin came from the default and only `:latest` exists → use it **with a loud
    warning** (content unverified).
 3. `EVOCLAW_IMAGE_TAG` set explicitly → never fall back; fail fast.
 
-**Distribution.** `scripts/pull_images.sh` pulls, per repo: the base image, the
-base-offline image (tagged locally as *both* `:latest` and `:v0.9`; a repo
-missing on the Hub is a warning, with a pointer to the builder), and all
-milestone images. Hub naming: `hyd2apse/<short>:base-offline-v0.9` etc. Note
-that pulling **re-points local tags at the Hub version** — that's what
-"aligning a machine" means, so make sure the Hub holds what you want first.
+Containers additionally launch with `--pull=never`: a missing local image is
+a loud failure, never a silent registry fetch mid-eval.
+
+**Distribution.** `scripts/pull_images.sh` executes the plan emitted by
+`python3 -m harness.e2e.image_version pull-plan` from the inventory
+`manifests/images-<version>.tsv`: every image (base, base-offline, all
+milestones — base-offline is not special) is pulled from
+`<org>/swe-milestone__<repo_full>__<milestone>:<version>` and retagged to the
+local `swe-milestone/<repo_full>__<milestone>:<version>`. A failed pull is a
+per-image WARN; the script continues, prints the full failure list, and exits
+non-zero. Note that pulling **re-points local tags at the Hub version** —
+that's what "aligning a machine" means, so make sure the Hub holds what you
+want first.
 
 **The rule that follows:** after any closure rebuild, promote (`retag`/`push`)
 per Step 3, or the harness will keep launching the previous generation.
