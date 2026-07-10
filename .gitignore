@@ -253,7 +253,7 @@ package-lock.json
 litellm_config.yaml
 litellm.log
 
-# EvoClaw trial config (user-specific) and auto-generated collect configs
+# SWE-Milestone trial config (user-specific) and auto-generated collect configs
 trial_config.yaml
 # Ignore ad-hoc trial_configs files by default; whitelist curated reference
 # configs below. NOTE: use `trial_configs/*` (not `trial_configs/`) so git
