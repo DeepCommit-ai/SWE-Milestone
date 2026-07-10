@@ -1,4 +1,4 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: /data2/gangda/SWE-Milestone-data
 trial_name: gemini-cli_gemini-3.5-flash
 agent: gemini-cli
 

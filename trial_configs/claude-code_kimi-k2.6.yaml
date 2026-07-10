@@ -1,4 +1,4 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: /data2/gangda/SWE-Milestone-data
 trial_name: claude-code_kimi-k2.6
 agent: claude-code
 # Kimi's coding endpoint speaks native Anthropic /v1/messages.

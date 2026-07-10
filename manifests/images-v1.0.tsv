@@ -1,4 +1,4 @@
-# EvoClaw benchmark image inventory — benchmark data version v1.0
+# SWE-Milestone benchmark image inventory — benchmark data version v1.0
 # columns: short<TAB>repo_full<TAB>milestone
 # base / base-offline are ordinary milestones. Future: append a digest column
 # after the v1.0 push to freeze content identity (spec §5.2).

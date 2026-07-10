@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-DATA_ROOT="${SWE_MILESTONE_DATA_ROOT:-$PROJECT_ROOT/EvoClaw-data}"
-LOG_ROOT="${SWE_MILESTONE_LOG_ROOT:-$PROJECT_ROOT/EvoClaw-log}"
+DATA_ROOT="${SWE_MILESTONE_DATA_ROOT:-$PROJECT_ROOT/SWE-Milestone-data}"
+LOG_ROOT="${SWE_MILESTONE_LOG_ROOT:-$PROJECT_ROOT/SWE-Milestone-log}"
 
 usage() {
     cat <<'EOF'
 Usage:
-  Single repo (migrate from EvoClaw-data to EvoClaw-log):
+  Single repo (migrate from SWE-Milestone-data to SWE-Milestone-log):
     migrate_trial.sh <src_dir> <new_name> [trial_type]
 
   All repos (batch migrate):
@@ -20,7 +20,7 @@ Usage:
     migrate_trial.sh --rename <trial_dir> <new_name>
 
 Arguments:
-  src_dir      Source trial directory in EvoClaw-data
+  src_dir      Source trial directory in SWE-Milestone-data
   trial_dir    Existing trial directory to rename in place
   old_name     Trial folder name to find across all repos (used with --all)
   new_name     New trial name
@@ -29,7 +29,7 @@ Arguments:
 Examples:
   # Single repo
   ./migrate_trial.sh \
-    /data2/gangda/EvoClaw-data/nushell_.../e2e_trial/claude-code_glm-5_001 \
+    /data2/gangda/SWE-Milestone-data/nushell_.../e2e_trial/claude-code_glm-5_001 \
     _claude-code_glm-5_run_001 e2e_trial
 
   # All repos
@@ -37,7 +37,7 @@ Examples:
 
   # Rename in place
   ./migrate_trial.sh --rename \
-    /data2/gangda/EvoClaw-log/nushell_.../e2e_trial/_old_name \
+    /data2/gangda/SWE-Milestone-log/nushell_.../e2e_trial/_old_name \
     _new_name
 EOF
     exit 1

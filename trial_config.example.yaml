@@ -1,4 +1,4 @@
-# EvoClaw Trial Configuration
+# SWE-Milestone Trial Configuration
 # Copy this file to trial_config.yaml and edit.
 #
 # Usage:
@@ -7,7 +7,7 @@
 # Monitor progress:
 #   ./scripts/monitor.sh <trial_name>
 
-# Path to EvoClaw-data (cloned from HuggingFace).
+# Path to SWE-Milestone-data (cloned from Hugging Face).
 # Recommended: leave this as ${SWE_MILESTONE_DATA_ROOT} and set the real path ONCE in
 # .env_private (auto-loaded). Or hardcode an absolute path here.
 data_root: ${SWE_MILESTONE_DATA_ROOT}

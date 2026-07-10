@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Monitor EvoClaw trial progress across all repos.
+# Monitor SWE-Milestone trial progress across all repos.
 #
 # Usage:
 #   ./scripts/monitor.sh <trial_name>                          # monitor a trial
@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONFIG_DIR="$PROJECT_ROOT/.evoclaw"
+CONFIG_DIR="$PROJECT_ROOT/.swe-milestone"
 
 # ─────────────────────────────────────────────
 # Parse arguments
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --full              Full wide table with all columns"
             echo ""
             echo "Filters:"
-            echo "  --data-root PATH    Path to EvoClaw-data (default: from trial_config.yaml)"
+            echo "  --data-root PATH    Path to SWE-Milestone-data (default: from trial_config.yaml)"
             echo "  --repos REPO ...    Only show these repos"
             echo "  -- ...              Extra args passed to collect_results.py"
             exit 0
@@ -103,7 +103,7 @@ if [[ ${#TRIAL_NAMES[@]} -eq 0 ]]; then
     # Auto-detect: find all trial directories across repos
     FOUND_TRIALS=()
     for repo_dir in "$DATA_ROOT"/*/; do
-        # Treat dir as a repo if it has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
+        # Treat dir as a repo if it has metadata.json (SWE-Milestone-data) or trial dirs (SWE-Milestone-log)
         if [[ ! -f "$repo_dir/metadata.json" ]] \
            && [[ ! -d "$repo_dir/e2e_trial" ]] \
            && [[ ! -d "$repo_dir/mstone_trial" ]]; then
@@ -167,7 +167,7 @@ done
 # ─────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 
-# Discover repos: has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
+# Discover repos: has metadata.json (SWE-Milestone-data) or trial dirs (SWE-Milestone-log)
 REPO_ENTRIES=""
 for repo_dir in "$DATA_ROOT"/*/; do
     if [[ ! -f "$repo_dir/metadata.json" ]] \

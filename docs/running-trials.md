@@ -33,7 +33,7 @@ python scripts/run_all.py --config trial_config.yaml
 
 `run_all.py` spawns one detached `run_e2e` per repo (each in its own session via
 `setsid()`) and exits. **No `nohup` needed.** Each worker writes to
-`.evoclaw/<repo>.log`.
+`.swe-milestone/<repo>.log`.
 
 > **Resource note:** All 7 repos in parallel = up to **35 Docker containers**
 > (1 agent + up to 4 concurrent eval per repo). Use `--repos a b c` to narrow

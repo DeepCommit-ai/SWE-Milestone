@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch EvoClaw E2E trials across repos as detached processes.
+"""Launch SWE-Milestone E2E trials across repos as detached processes.
 
 Reads a trial_config.yaml, resolves the final trial_name based on flags +
 existing trial dirs, and spawns one detached run_e2e per repo. Exits
@@ -231,7 +231,7 @@ def build_cmd(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Launch EvoClaw trials (detached, fire-and-forget)",
+        description="Launch SWE-Milestone trials (detached, fire-and-forget)",
     )
     parser.add_argument("--config", type=Path, required=True, help="Path to trial_config.yaml")
     parser.add_argument("--repos", nargs="+", default=None, help="Override repo filters (substring match)")
@@ -398,7 +398,7 @@ def main():
     )
 
     print("=" * 60)
-    print("  EvoClaw Run All  (fire-and-forget)")
+    print("  SWE-Milestone Run All  (fire-and-forget)")
     print("=" * 60)
     print(f"  Data root:    {data_root}")
     print(f"  Trial name:   {trial_name}")
@@ -414,7 +414,7 @@ def main():
     print("=" * 60)
 
     # Generate collect config for monitor.sh
-    log_dir = project_root / ".evoclaw"
+    log_dir = project_root / ".swe-milestone"
     log_dir.mkdir(parents=True, exist_ok=True)
     collect_config = generate_collect_config(
         config_dir=log_dir,

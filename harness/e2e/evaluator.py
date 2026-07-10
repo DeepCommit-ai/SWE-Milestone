@@ -52,7 +52,7 @@ def load_repo_config(repo_name: str, workspace_root: Optional[Path] = None) -> d
 
     Args:
         repo_name: Repository name (e.g., 'microsoft_markitdown_v0.1.1_v0.1.3')
-        workspace_root: Path to the workspace root (e.g., .../EvoClaw-data/repo_name)
+        workspace_root: Path to the workspace root (e.g., .../SWE-Milestone-data/repo_name)
 
     Returns:
         Dictionary with config values, or empty dict if not found
@@ -593,11 +593,11 @@ class PatchEvaluator:
         self.keep_container = keep_container
 
         # Extract repo name from workspace_root path
-        # EvoClaw path structure: .../EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0
+        # SWE-Milestone path structure: .../SWE-Milestone-data/navidrome_navidrome_v0.57.0_v0.58.0
         # AgentBench path structure: .../harness_workspace/repo_name/test_name
         # Detect which structure by checking if workspace_root itself has metadata.json
         if (workspace_root / "metadata.json").exists():
-            # EvoClaw: workspace_root IS the repo directory
+            # SWE-Milestone: workspace_root IS the repo directory
             self.repo_name = workspace_root.name
             self.test_name = None
         else:
@@ -636,7 +636,7 @@ class PatchEvaluator:
         print(f"📋 Docker CPUs: {self.docker_cpus}")
 
         # Docker image name (single naming authority: image_version.py):
-        #   EvoClaw:    swe-milestone/{repo_full}__{milestone_id}:{tag}
+        #   SWE-Milestone: swe-milestone/{repo_full}__{milestone_id}:{tag}
         #               e.g. swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__milestone_006:v1.0
         #   AgentBench (legacy, images only exist under the OLD local scheme —
         #   deliberately NOT migrated, see docs/versioning.md):

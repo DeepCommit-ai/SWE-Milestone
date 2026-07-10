@@ -1,7 +1,7 @@
 [project]
-name = "evoclaw"
+name = "swe-milestone"
 version = "0.1.0"
-description = "EvoClaw: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
+description = "SWE-Milestone: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

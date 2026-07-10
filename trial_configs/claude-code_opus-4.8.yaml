@@ -1,4 +1,4 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: /data2/gangda/SWE-Milestone-data
 trial_name: claude-code_opus-4.8
 agent: claude-code
 

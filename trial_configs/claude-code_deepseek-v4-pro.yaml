@@ -1,4 +1,4 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: /data2/gangda/SWE-Milestone-data
 trial_name: claude-code_deepseek-v4-pro
 agent: claude-code
 
