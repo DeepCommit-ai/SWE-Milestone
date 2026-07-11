@@ -441,7 +441,7 @@ echo ">>> Done with {mode.name}"
             pre_script=pre_script,
             test_cmd=test_cmd,
             post_script=post_script,
-            timeout_seconds=1800,  # 30 minutes for full test suite
+            timeout_seconds=mode.run_timeout_seconds or 1800,  # default 30 min; e2e modes may raise via test_config
         )
         combined_output = "\n".join(part for part in (run_stdout, run_stderr) if part)
         mode_outputs.append((f"mode '{mode.name}' output", combined_output))
@@ -460,18 +460,33 @@ echo ">>> Done with {mode.name}"
     merged_tests: List[Dict[str, Any]] = []
     merged_summary = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 
+    dropped_reports: List[tuple] = []
     for report_path, fw in mode_reports:
         try:
             parsed = parse_test_report(report_path, fw)
-            if parsed and "tests" in parsed:
-                merged_tests.extend(parsed["tests"])
+            tests = parsed.get("tests") if parsed else None
+            if tests:
+                merged_tests.extend(tests)
                 summary = parsed.get("summary", {})
                 for key in merged_summary:
                     merged_summary[key] += summary.get(key, 0)
                 if verbose:
                     logger.info(f"Parsed {report_path.name} ({fw}): {summary.get('total', 0)} tests")
+            else:
+                dropped_reports.append((report_path.name, "parsed to 0 tests"))
         except Exception as e:
-            logger.warning(f"Failed to parse {report_path} with {fw}: {e}")
+            dropped_reports.append((report_path.name, f"parse error: {e}"))
+
+    # A mode whose report exists but contributes nothing silently shrinks the
+    # test universe (its scored tests become "missing") — say so loudly. The
+    # usual cause is a truncated report from a run killed at the mode timeout.
+    for name, why in dropped_reports:
+        msg = (
+            f"🚨 report {name} dropped from merge ({why}) — test universe shrank; "
+            f"check the mode's run_timeout_seconds / output truncation"
+        )
+        logger.error(msg)
+        print(msg)
 
     # Build merged report
     merged_report = {
