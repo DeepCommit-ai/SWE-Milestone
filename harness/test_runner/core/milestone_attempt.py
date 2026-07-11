@@ -16,7 +16,12 @@ from typing import Any, Dict, List, Optional
 from .classifier import TestClassifier
 from .docker import DockerRunner
 from .report_parser import FRAMEWORK_CONFIG, convert_to_summary, get_file_extension
-from .test_executor import build_test_cmd, materialize_report, run_test
+from .test_executor import (
+    build_test_cmd,
+    extract_first_fatal_error,
+    materialize_report,
+    run_test,
+)
 from .types import MilestoneTestConfig
 
 logger = logging.getLogger(__name__)
@@ -312,6 +317,35 @@ def _infer_framework_from_modes(config: MilestoneTestConfig) -> str:
     return "pytest"
 
 
+def _safe_read_text(path: Path, max_bytes: int = 1_000_000) -> str:
+    """Read up to `max_bytes` of a report/log file for diagnostics."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _first_fatal_diagnostic(sources: List[tuple], tail_lines: int = 15) -> str:
+    """
+    Build a diagnostic suffix from `(label, raw_text)` sources: the first
+    fatal error found, else the tail of the first non-empty output. Keeps the
+    real cause (e.g. a compile error tee'd into eval_*.log) visible in the
+    top-level exception instead of only two layers down in artifacts.
+    """
+    for label, text in sources:
+        if not text:
+            continue
+        snippet = extract_first_fatal_error(text)
+        if snippet:
+            return f"\nFirst fatal error ({label}):\n{snippet}"
+    for label, text in sources:
+        if text and text.strip():
+            tail = "\n".join(text.splitlines()[-tail_lines:])
+            return f"\nLast output lines ({label}):\n{tail}"
+    return ""
+
+
 def run_single_state_tests(
     runner: object,
     *,
@@ -356,6 +390,8 @@ def run_single_state_tests(
 
     # Track (output_path, framework) tuples for per-mode parsing
     mode_reports: List[tuple] = []
+    # Track (label, raw stdout+stderr) per mode for failure diagnostics
+    mode_outputs: List[tuple] = []
 
     for mode in config.modes:
         # Use per-mode framework if specified, otherwise use default
@@ -399,7 +435,7 @@ echo ">>> Done with {mode.name}"
         # Use a generous timeout for the entire test run (30 minutes by default)
         # Note: `timeout` param is per-test timeout in seconds, but run_test needs
         # overall timeout. Use 30 minutes as a reasonable default for full test suite.
-        run_test(  # type: ignore[arg-type]
+        _, run_stdout, run_stderr = run_test(  # type: ignore[arg-type]
             runner,  # pyright: ignore[reportArgumentType]
             output_dir=output_dir,
             pre_script=pre_script,
@@ -407,13 +443,18 @@ echo ">>> Done with {mode.name}"
             post_script=post_script,
             timeout_seconds=1800,  # 30 minutes for full test suite
         )
+        combined_output = "\n".join(part for part in (run_stdout, run_stderr) if part)
+        mode_outputs.append((f"mode '{mode.name}' output", combined_output))
 
         output_path = output_dir / output_file
         if output_path.exists():
             mode_reports.append((output_path, mode_framework))
 
     if not mode_reports:
-        raise RuntimeError(f"No valid test report files generated under {output_dir}")
+        raise RuntimeError(
+            f"No valid test report files generated under {output_dir}"
+            + _first_fatal_diagnostic(mode_outputs)
+        )
 
     # Parse each report with its own framework and merge results
     merged_tests: List[Dict[str, Any]] = []
@@ -443,6 +484,13 @@ echo ">>> Done with {mode.name}"
         json.dump(merged_report, f, indent=2)
 
     if not merged_tests:
-        raise RuntimeError(f"No valid test report files generated under {output_dir}")
+        report_texts = [
+            (report_path.name, _safe_read_text(report_path))
+            for report_path, _ in mode_reports
+        ]
+        raise RuntimeError(
+            f"No valid test report files generated under {output_dir}"
+            + _first_fatal_diagnostic(report_texts + mode_outputs)
+        )
 
     return merged_path

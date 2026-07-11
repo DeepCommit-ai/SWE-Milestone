@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -19,6 +20,41 @@ from .report_parser import parse_test_report, merge_test_reports
 logger = logging.getLogger(__name__)
 
 OUTPUT_MOUNT_PATH = "/output"
+
+# First-match-wins scan for the fatal line in raw build/test output, covering
+# the benchmark's frameworks (cargo, go, maven/gradle, pytest, node).
+_FATAL_LINE_PATTERNS = [
+    re.compile(r"^error(\[E\d+\])?: "),  # rustc/cargo
+    re.compile(r"panicked at"),  # rust panic
+    re.compile(r"^\S.*\.go:\d+:\d+: "),  # go compile error
+    re.compile(r"^# \S+"),  # go build failure package header
+    re.compile(r"^\[ERROR\]"),  # maven
+    re.compile(r"^Traceback \(most recent call last\)"),  # python
+    re.compile(r"^(?:[A-Za-z_.]+)?(?:Error|Exception): "),  # python exception
+    re.compile(r"Cannot find module"),  # node
+]
+
+
+def extract_first_fatal_error(
+    text: str,
+    *,
+    context_lines: int = 8,
+    max_chars: int = 1500,
+) -> Optional[str]:
+    """
+    Return the first fatal error found in raw build/test output, with up to
+    `context_lines` following lines for context, or None if nothing matches.
+
+    Used to surface the real cause (e.g. a compile error buried in an
+    eval_*.log) when no valid test report can be produced.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        for pattern in _FATAL_LINE_PATTERNS:
+            if pattern.search(line):
+                snippet = "\n".join(lines[i : i + 1 + context_lines])
+                return snippet[:max_chars]
+    return None
 
 
 def get_default_test_cmd(
