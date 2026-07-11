@@ -72,12 +72,16 @@ def _has_code_extension(path: str, extensions: FrozenSet[str]) -> bool:
     return path[dot:].lower() in extensions
 
 
-# Skip reasons that mean "prune was requested but did not run to completion",
-# so the additive overlay may have resurrected the GT solution — the cell's
-# score is untrustworthy and must never count as resolved (codex F1, red-team
-# vector 1). "" (completed / nothing to prune) is the only trusted empty state.
+# Reasons the pruner could NOT run at all, so the additive overlay may have
+# resurrected the GT solution — the cell's score is untrustworthy and must
+# never count as resolved (codex F1, red-team vector 1). These are genuine
+# mechanism failures, NOT a heuristic safety gate: there is deliberately no
+# "snapshot looks suspicious -> skip pruning" reason here. tar-absence always
+# means agent deletion, so a near-empty tar prunes the base source and scores
+# an honest zero rather than being protected. "" (pruned fine / nothing to
+# prune) is the only trusted empty state.
 FAIL_CLOSED_SKIP_REASONS: FrozenSet[str] = frozenset(
-    {"snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable", "config-invalid"}
+    {"ls-tree-failed", "tar-unreadable", "config-invalid"}
 )
 
 

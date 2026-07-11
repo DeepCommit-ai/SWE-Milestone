@@ -341,16 +341,18 @@ def test_evaluation_result_fail_loud_defaults():
 
 
 def test_scoring_untrusted_property():
-    """F1 (codex critical): a fail-closed skip reason makes the result
+    """F1 (codex critical): a mechanism-failure skip reason makes the result
     scoring-untrusted, so the orchestrator's threshold recompute cannot flip
     resolved back to True."""
     assert _mk_result().scoring_untrusted is False
-    assert _mk_result(residue_prune_skipped_reason="snapshot-integrity-failed").scoring_untrusted is True
     assert _mk_result(residue_prune_skipped_reason="ls-tree-failed").scoring_untrusted is True
     assert _mk_result(residue_prune_skipped_reason="tar-unreadable").scoring_untrusted is True
     assert _mk_result(residue_prune_skipped_reason="config-invalid").scoring_untrusted is True
     # a completed prune (or nothing to prune) is trusted
     assert _mk_result(residue_prune_skipped_reason="").scoring_untrusted is False
+    # the integrity gate is GONE: mass-missing is no longer a fail-closed reason
+    # (a near-empty tar prunes and scores honestly, it is not "protected").
+    assert "snapshot-integrity-failed" not in _fail_closed_reasons()
 
 
 def test_orchestrator_ands_scoring_untrusted():
@@ -371,18 +373,25 @@ def test_extension_normalization():
     assert normalize_extensions([]) == frozenset()  # empty -> prune nothing (not default)
 
 
-def test_fail_closed_reasons_cover_incomplete_prune():
-    """F1/vector-1: every 'enabled but prune did not complete' reason must
-    force resolved False. Pin the set so a new skip reason can't silently
-    reopen the additive-resurrection hole."""
+def _fail_closed_reasons():
+    from harness.e2e.residue_prune import FAIL_CLOSED_SKIP_REASONS
+
+    return FAIL_CLOSED_SKIP_REASONS
+
+
+def test_fail_closed_reasons_are_mechanism_failures_only():
+    """The fail-closed set covers only mechanism failures — NOT a heuristic
+    integrity gate (which was removed). Pin it so nobody re-adds a
+    'snapshot suspicious -> skip+protect' path (the fail-open hole)."""
+    assert _fail_closed_reasons() == frozenset({"ls-tree-failed", "tar-unreadable", "config-invalid"})
+
+
+def test_compare_results_consults_fail_closed_set():
     from harness.e2e import evaluator as ev_mod
     import inspect
 
     src = inspect.getsource(ev_mod.PatchEvaluator.compare_results)
-    # the three non-trustworthy skip states must all be in the fail-closed set
-    assert "fail_closed_reasons" in src
-    for reason in ("snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable"):
-        assert reason in src, f"{reason} missing from fail-closed handling"
+    assert "FAIL_CLOSED_SKIP_REASONS" in src
 
 
 def test_evaluation_result_fail_loud_populated():
@@ -395,11 +404,11 @@ def test_evaluation_result_fail_loud_populated():
         keep_list_hits=["core/mock_library_service.go"],
         snapshot_integrity_ok=True,
         snapshot_missing_count=1,
-        residue_prune_skipped_reason="snapshot-integrity-failed",
+        residue_prune_skipped_reason="ls-tree-failed",
     ).to_dict()
     assert d["base_tag"] == "milestone-m1-start"
     assert d["fallback_triggered"] is True
     assert d["residue_prune"]["pruned_files_count"] == 2
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
-    assert d["residue_prune"]["skipped_reason"] == "snapshot-integrity-failed"
+    assert d["residue_prune"]["skipped_reason"] == "ls-tree-failed"
     assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1}

@@ -1081,28 +1081,28 @@ class PatchEvaluator:
         base_files = self._git_ls_tree(base_tag)
         start_files = base_files if base_suffix == "start" else self._git_ls_tree(start_tag)
         if base_files is None or start_files is None:
-            # F5: distinguishable skip reason — a silent no-op here would look
-            # identical to "nothing to prune" and hide a fleet-wide failure.
+            # Cannot list the tree -> cannot compute what the agent deleted.
+            # HARD ERROR: never fall through to additive scoring (that is the
+            # fail-open hole). The eval fails for this cell instead.
             meta["residue_prune_skipped_reason"] = "ls-tree-failed"
-            print("⚠️  residue prune skipped: cannot list git trees in container (ls-tree-failed)")
-            return True, ""
+            return False, "residue prune: cannot list git trees in container (ls-tree-failed)"
 
         capture_excluded = self._load_capture_excluded(start_files)
 
-        # Phase 1a gate (FAIL-CLOSED): mass-missing snapshot == capture failure.
+        # Snapshot integrity is DIAGNOSTIC ONLY — there is no safety gate. By
+        # design, tar-absence always means the agent deleted the file, so a
+        # near-empty tar prunes the base source and scores an honest low, rather
+        # than being "protected" by a gate a malicious agent could trigger. We
+        # still record the missing count so a genuine capture loss (deepseek
+        # style) is visible for investigation / re-capture.
         integrity = check_snapshot_integrity(start_files, tar_files, self._prune_filter)
         meta["snapshot_integrity_ok"] = integrity.ok
         meta["snapshot_missing_count"] = integrity.missing_count
         if not integrity.ok:
-            meta["residue_prune_skipped_reason"] = "snapshot-integrity-failed"
             print(
-                f"⚠️  snapshot integrity: {integrity.missing_count}/{integrity.expected_count} expected "
-                f"files missing from tar (sample: {integrity.missing_sample[:3]}) — residue prune SKIPPED, "
-                f"cell marked NOT resolved (fail-closed)"
+                f"ℹ️  snapshot integrity: {integrity.missing_count}/{integrity.expected_count} expected "
+                f"files missing from tar — recorded; pruning proceeds (if this is capture loss, re-capture)"
             )
-            # Fail-closed: the caller reads snapshot_integrity_ok and forces
-            # resolved=False. We skip deletions (can't trust "absent==deleted").
-            return True, ""
 
         # START provenance guard is active in phase 1b: GT-added files survive.
         prune_set = compute_prune_set(
@@ -1796,17 +1796,16 @@ class PatchEvaluator:
         if pass_to_pass_missing > 0:
             print(f"⚠️  PASS_TO_PASS Missing: {pass_to_pass_missing} tests not found (skipped modules or ID mismatch)")
 
-        # F1 fail-closed: when residue prune is ENABLED but did not run to
-        # completion for ANY reason (integrity gate failed, ls-tree failed, tar
-        # unreadable), the additive overlay may have resurrected the GT solution
-        # (near-empty-tar attack, red-team vector 1). Such a cell must never
-        # count as resolved — it needs isolation/re-capture, not a silent score.
-        # "" (pruned fine or nothing to prune) and "safety-abort" (already
-        # returned an error) are the only trustworthy states.
+        # F1 fail-closed: when residue prune was ENABLED but its MECHANISM could
+        # not run (config invalid, ls-tree failed, tar unreadable), the additive
+        # overlay may still hold the GT solution. Such a cell must never count as
+        # resolved. This is NOT the removed integrity gate — there is no
+        # "snapshot looks suspicious -> skip+protect" path; a near-empty tar
+        # prunes and scores honestly. Belt-and-suspenders: ls-tree/tar failures
+        # already return an error before reaching here.
         skip_reason = self._eval_meta.get("residue_prune_skipped_reason", "")
-        fail_closed_reasons = {"snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable"}
-        if skip_reason in fail_closed_reasons and resolved:
-            print(f"🚫 resolved forced False: residue prune did not complete ({skip_reason}, fail-closed)")
+        if skip_reason in FAIL_CLOSED_SKIP_REASONS and resolved:
+            print(f"🚫 resolved forced False: residue prune mechanism failed ({skip_reason}, fail-closed)")
             resolved = False
 
         return EvaluationResult(
