@@ -11,11 +11,13 @@ Covers the pure decision layer:
 import pytest
 
 from harness.e2e.residue_prune import (
+    DEFAULT_PRUNE_EXTENSIONS,
     ResiduePruneSafetyError,
     assert_prune_set_safe,
     check_snapshot_integrity,
     compute_prune_set,
     is_prunable,
+    normalize_keep_list,
     normalize_tar_members,
 )
 from harness.utils.src_filter import SrcFileFilter
@@ -32,6 +34,9 @@ def make_filter(**overrides):
     )
     cfg.update(overrides)
     return SrcFileFilter(**cfg)
+
+
+GO_ONLY = frozenset({".go"})
 
 
 # ---------------------------------------------------------------- is_prunable
@@ -85,6 +90,21 @@ def test_keep_list_blocks_prunable_file():
     assert is_prunable("core/mock_library_service.go", f, keep_list=keep) is False
 
 
+# ---- F3: per-range extension whitelist (language scoping) ----
+
+
+def test_extensions_param_scopes_language():
+    # navidrome phase 1: prune only Go, never its ui/src TS front-end.
+    f = make_filter()
+    assert is_prunable("ui/src/actions/library.ts", f, keep_list=frozenset()) is True  # default whitelist
+    assert is_prunable("ui/src/actions/library.ts", f, keep_list=frozenset(), extensions=GO_ONLY) is False
+    assert is_prunable("core/library.go", f, keep_list=frozenset(), extensions=GO_ONLY) is True
+
+
+def test_default_extensions_is_multilang():
+    assert ".go" in DEFAULT_PRUNE_EXTENSIONS and ".ts" in DEFAULT_PRUNE_EXTENSIONS
+
+
 # ---------------------------------------------------------- compute_prune_set
 
 
@@ -121,6 +141,48 @@ def test_compute_prune_set_respects_keep_list():
     keep = frozenset({"core/mock_library_service.go"})
     pruned = compute_prune_set(base_files, tar_files, start_files, f, keep_list=keep)
     assert pruned == ["core/deleted_by_agent.go"]
+
+
+def test_compute_prune_set_extension_scoped():
+    # F3: with extensions={.go}, a deleted .ts survives even inside src.
+    f = make_filter()
+    base_files = {"core/gone.go", "ui/src/gone.ts"}
+    start_files = set(base_files)
+    pruned = compute_prune_set(base_files, set(), start_files, f, keep_list=frozenset(), extensions=GO_ONLY)
+    assert pruned == ["core/gone.go"]
+
+
+def test_compute_prune_set_honors_capture_excluded():
+    """F2 (drift): a path the capture filter dropped from the tar (test/exclude
+    at capture time) must not be pruned even if the current eval filter calls
+    it source. Its tar-absence is by-design filtering, not agent deletion.
+    """
+    f = make_filter()
+    base_files = {"core/foo_check.go", "core/deleted_by_agent.go"}
+    start_files = set(base_files)
+    # eval-side filter (drifted): foo_check.go now looks like source.
+    assert is_prunable("core/foo_check.go", f, keep_list=frozenset()) is True
+    pruned = compute_prune_set(
+        base_files,
+        tar_files=set(),
+        start_files=start_files,
+        src_filter=f,
+        keep_list=frozenset(),
+        capture_excluded=frozenset({"core/foo_check.go"}),
+    )
+    assert pruned == ["core/deleted_by_agent.go"]  # foo_check.go protected by witness
+
+
+def test_assert_safe_raises_on_capture_excluded():
+    # F2: V3b aborts if a capture-excluded path reaches the prune set.
+    f = make_filter()
+    with pytest.raises(ResiduePruneSafetyError):
+        assert_prune_set_safe(
+            ["core/foo_check.go"],
+            f,
+            keep_list=frozenset(),
+            capture_excluded=frozenset({"core/foo_check.go"}),
+        )
 
 
 # ------------------------------------------------------- normalize_tar_members
@@ -184,6 +246,35 @@ def test_snapshot_integrity_flags_mass_missing():
     assert all(p.startswith("core/pkg/") for p in report.missing_sample)
 
 
+def test_snapshot_integrity_relative_threshold():
+    """F1: threshold is relative — a tiny tree missing a few isn't flagged,
+    but a large tree missing a large fraction is (absolute floor still applies)."""
+    f = make_filter()
+    # small tree, 3 missing of 12: absolute floor (10) keeps it ok
+    small_ref = {f"core/f{i}.go" for i in range(12)}
+    small_tar = {f"core/f{i}.go" for i in range(9)}
+    assert check_snapshot_integrity(small_ref, small_tar, f).ok is True
+    # large tree, 20% missing: relative rule flags it even though we could set
+    # an absolute floor high
+    big_ref = {f"core/f{i}.go" for i in range(200)}
+    big_tar = {f"core/f{i}.go" for i in range(160)}  # 40 missing = 20%
+    assert check_snapshot_integrity(big_ref, big_tar, f).ok is False
+
+
+# ---- L4: keep-list normalization ----
+
+
+def test_normalize_keep_list():
+    raw = ["./core/mock.go", "core/x.go/", "  db/y.go  ", "core/x.go"]
+    assert normalize_keep_list(raw) == frozenset({"core/mock.go", "core/x.go", "db/y.go"})
+
+
+def test_keep_list_protects_after_normalization():
+    f = make_filter()
+    keep = normalize_keep_list(["./core/mock_library_service.go"])
+    assert is_prunable("core/mock_library_service.go", f, keep_list=keep) is False
+
+
 # ------------------------------------------------ EvaluationResult new fields
 
 
@@ -227,8 +318,23 @@ def test_evaluation_result_fail_loud_defaults():
         "pruned_files_count": 0,
         "pruned_files": [],
         "keep_list_hits": [],
+        "skipped_reason": "",
     }
     assert d["snapshot_integrity"] == {"ok": None, "missing_count": 0}
+
+
+def test_fail_closed_reasons_cover_incomplete_prune():
+    """F1/vector-1: every 'enabled but prune did not complete' reason must
+    force resolved False. Pin the set so a new skip reason can't silently
+    reopen the additive-resurrection hole."""
+    from harness.e2e import evaluator as ev_mod
+    import inspect
+
+    src = inspect.getsource(ev_mod.PatchEvaluator.compare_results)
+    # the three non-trustworthy skip states must all be in the fail-closed set
+    assert "fail_closed_reasons" in src
+    for reason in ("snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable"):
+        assert reason in src, f"{reason} missing from fail-closed handling"
 
 
 def test_evaluation_result_fail_loud_populated():
@@ -241,9 +347,11 @@ def test_evaluation_result_fail_loud_populated():
         keep_list_hits=["core/mock_library_service.go"],
         snapshot_integrity_ok=True,
         snapshot_missing_count=1,
+        residue_prune_skipped_reason="snapshot-integrity-failed",
     ).to_dict()
     assert d["base_tag"] == "milestone-m1-start"
     assert d["fallback_triggered"] is True
     assert d["residue_prune"]["pruned_files_count"] == 2
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
+    assert d["residue_prune"]["skipped_reason"] == "snapshot-integrity-failed"
     assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1}

@@ -878,6 +878,9 @@ class E2EOrchestrator:
             with tarfile.open(snapshot_file) as tf:
                 tar_files = normalize_tar_members(tf.getnames())
             report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+            # F2 witness: paths the capture filter dropped as tests/excludes.
+            # The eval side reads this to survive filter drift (residue prune).
+            filtered_out = sorted(p for p in tag_files if not self.src_filter.should_include_in_snapshot(p))
             sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
             sidecar.write_text(
                 json.dumps(
@@ -887,6 +890,7 @@ class E2EOrchestrator:
                         "expected_count": report.expected_count,
                         "missing_count": report.missing_count,
                         "missing_sample": report.missing_sample,
+                        "filtered_out": filtered_out,
                     },
                     indent=2,
                 )

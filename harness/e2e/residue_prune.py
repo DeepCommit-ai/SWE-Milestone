@@ -21,7 +21,11 @@ from harness.utils.src_filter import SrcFileFilter
 # v2 predicate: only unambiguous agent-written code sources may be pruned.
 # Non-code assets in src dirs (.sql/.pcss/SPI/meson.build/...) are
 # environment/GT material and must survive (false-damage audit, spec §8.3).
-CODE_SOURCE_EXTENSIONS: FrozenSet[str] = frozenset(
+#
+# This is the DEFAULT (multi-language) whitelist. Callers pass a per-range
+# `extensions` set to scope which languages a range actually prunes — phase 1
+# navidrome uses {".go"} so its ui/src TypeScript is never pruned (review F3).
+DEFAULT_PRUNE_EXTENSIONS: FrozenSet[str] = frozenset(
     {
         ".go",
         ".rs",
@@ -30,6 +34,7 @@ CODE_SOURCE_EXTENSIONS: FrozenSet[str] = frozenset(
         ".scala",
         ".groovy",
         ".py",
+        ".pyi",
         ".pyx",
         ".pxd",
         ".ts",
@@ -43,8 +48,14 @@ CODE_SOURCE_EXTENSIONS: FrozenSet[str] = frozenset(
         ".cc",
         ".cpp",
         ".hpp",
+        ".cxx",
+        ".hxx",
+        ".hh",
     }
 )
+
+# Back-compat alias (old name).
+CODE_SOURCE_EXTENSIONS = DEFAULT_PRUNE_EXTENSIONS
 
 # Cap for stored file lists in reports (full counts are always exact).
 _SAMPLE_CAP = 20
@@ -54,11 +65,28 @@ class ResiduePruneSafetyError(Exception):
     """A path in the prune set violates the never-delete classes (V3b)."""
 
 
-def _has_code_extension(path: str) -> bool:
+def _has_code_extension(path: str, extensions: FrozenSet[str]) -> bool:
     dot = path.rfind(".")
     if dot == -1:
         return False
-    return path[dot:].lower() in CODE_SOURCE_EXTENSIONS
+    return path[dot:].lower() in extensions
+
+
+def normalize_keep_list(entries: Iterable[str]) -> FrozenSet[str]:
+    """Normalize keep-list entries to repo-relative paths (review L4).
+
+    Strips whitespace, leading './', and trailing '/', so metadata written as
+    './core/x.go' or 'core/x.go/' still matches the git-relative path.
+    """
+    out = set()
+    for e in entries:
+        e = e.strip()
+        if e.startswith("./"):
+            e = e[2:]
+        e = e.rstrip("/")
+        if e:
+            out.add(e)
+    return frozenset(out)
 
 
 def normalize_tar_members(names: Iterable[str]) -> Set[str]:
@@ -78,12 +106,18 @@ def normalize_tar_members(names: Iterable[str]) -> Set[str]:
     return normalized
 
 
-def is_prunable(path: str, src_filter: SrcFileFilter, keep_list: FrozenSet[str]) -> bool:
+def is_prunable(
+    path: str,
+    src_filter: SrcFileFilter,
+    keep_list: FrozenSet[str],
+    extensions: FrozenSet[str] = DEFAULT_PRUNE_EXTENSIONS,
+) -> bool:
     """v2 predicate: may `path` be deleted when absent from the agent tar?
 
     True only for unambiguous agent-authoritative code sources:
     is_src_file (excludes tests + exclude_patterns) AND not generated AND
-    not a modifiable test AND code-source extension AND not on the keep-list.
+    not a modifiable test AND extension in the per-range whitelist AND not on
+    the keep-list.
     """
     if path in keep_list:
         return False
@@ -93,7 +127,7 @@ def is_prunable(path: str, src_filter: SrcFileFilter, keep_list: FrozenSet[str])
         return False
     if src_filter.is_modifiable_test_file(path):
         return False
-    if not _has_code_extension(path):
+    if not _has_code_extension(path, extensions):
         return False
     return True
 
@@ -104,6 +138,8 @@ def compute_prune_set(
     start_files: Optional[Set[str]],
     src_filter: SrcFileFilter,
     keep_list: FrozenSet[str],
+    extensions: FrozenSet[str] = DEFAULT_PRUNE_EXTENSIONS,
+    capture_excluded: Optional[FrozenSet[str]] = None,
 ) -> List[str]:
     """Compute the files to delete from the assembled eval tree.
 
@@ -116,6 +152,12 @@ def compute_prune_set(
             guard (phase 2 semantics).
         src_filter: the range's snapshot-side filter (same class, same metadata).
         keep_list: exact repo-relative paths that must never be pruned.
+        extensions: per-range code-source extension whitelist (language scope).
+        capture_excluded: paths the CAPTURE-TIME filter dropped from the tar
+            (tests/excludes). Their tar-absence is by-design filtering, not
+            agent deletion, so they must never be pruned — this is the
+            independent witness that survives eval-vs-capture filter drift
+            (review F2). None = no witness available (legacy tars).
 
     Returns:
         Sorted list of paths to delete.
@@ -123,18 +165,30 @@ def compute_prune_set(
     candidates = base_files - tar_files
     if start_files is not None:
         candidates &= start_files
-    return sorted(p for p in candidates if is_prunable(p, src_filter, keep_list))
+    if capture_excluded:
+        candidates -= capture_excluded
+    return sorted(p for p in candidates if is_prunable(p, src_filter, keep_list, extensions))
 
 
 def assert_prune_set_safe(
-    prune_set: Iterable[str], src_filter: SrcFileFilter, keep_list: FrozenSet[str]
+    prune_set: Iterable[str],
+    src_filter: SrcFileFilter,
+    keep_list: FrozenSet[str],
+    extensions: FrozenSet[str] = DEFAULT_PRUNE_EXTENSIONS,
+    capture_excluded: Optional[FrozenSet[str]] = None,
 ) -> None:
     """V3b runtime assertion: abort instead of deleting a protected file.
 
-    Independently re-checks every path against the never-delete classes.
+    Independently re-checks every path against the never-delete classes. The
+    capture_excluded witness is checked FIRST and is independent of the eval
+    filter, so it catches capture-vs-eval filter drift that the filter-based
+    checks (which share the eval filter) structurally cannot (review F2).
     Raises ResiduePruneSafetyError on the first violation.
     """
+    capture_excluded = capture_excluded or frozenset()
     for path in prune_set:
+        if path in capture_excluded:
+            raise ResiduePruneSafetyError(f"capture-excluded (filter drift) in prune set: {path}")
         if path in keep_list:
             raise ResiduePruneSafetyError(f"keep-list entry in prune set: {path}")
         if src_filter.is_test_file(path):
@@ -145,7 +199,7 @@ def assert_prune_set_safe(
             raise ResiduePruneSafetyError(f"generated file in prune set: {path}")
         if src_filter.is_excluded(path):
             raise ResiduePruneSafetyError(f"excluded file in prune set: {path}")
-        if not _has_code_extension(path):
+        if not _has_code_extension(path, extensions):
             raise ResiduePruneSafetyError(f"non-code asset in prune set: {path}")
 
 
@@ -164,6 +218,7 @@ def check_snapshot_integrity(
     tar_files: Set[str],
     src_filter: SrcFileFilter,
     max_missing: int = 10,
+    max_missing_frac: float = 0.10,
 ) -> SnapshotIntegrityReport:
     """Sanity-check a snapshot against a reference tree (phase 1a).
 
@@ -172,12 +227,21 @@ def check_snapshot_integrity(
     capture side) minus the agent's own deletions. Mass absence means the
     capture pipeline lost files — the prune inference "absent == deleted by
     agent" does not hold and pruning must be skipped for this cell.
+
+    ok is False when EITHER an absolute floor (`max_missing`) OR a relative
+    fraction (`max_missing_frac` of the expected set) is exceeded (review F1) —
+    a large tree missing 20% is flagged even though it clears the absolute
+    floor, while a small tree missing a couple of files is not. NOTE: the
+    caller must treat ok=False as fail-closed (do not silently grade), not
+    merely "skip pruning" — see evaluator._maybe_prune_residue.
     """
     expected = {p for p in reference_files if src_filter.should_include_in_snapshot(p)}
     missing = sorted(expected - tar_files)
+    over_absolute = len(missing) > max_missing
+    over_relative = len(expected) > 0 and (len(missing) / len(expected)) > max_missing_frac
     return SnapshotIntegrityReport(
         expected_count=len(expected),
         missing_count=len(missing),
         missing_sample=missing[:_SAMPLE_CAP],
-        ok=len(missing) <= max_missing,
+        ok=not (over_absolute and over_relative),
     )

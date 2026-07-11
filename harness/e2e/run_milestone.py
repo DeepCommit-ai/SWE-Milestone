@@ -1116,6 +1116,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 with tarfile.open(snapshot_path) as tf:
                     tar_files = normalize_tar_members(tf.getnames())
                 report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+                filtered_out = sorted(p for p in tag_files if not self.src_filter.should_include_in_snapshot(p))
                 sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
                 sidecar.write_text(
                     json.dumps(
@@ -1125,6 +1126,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                             "expected_count": report.expected_count,
                             "missing_count": report.missing_count,
                             "missing_sample": report.missing_sample,
+                            "filtered_out": filtered_out,
                         },
                         indent=2,
                     )

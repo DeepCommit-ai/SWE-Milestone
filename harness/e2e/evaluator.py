@@ -27,17 +27,19 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional, Set
+from typing import Dict, List, Any, Tuple, Optional, Set, FrozenSet
 from dataclasses import dataclass, field
 
 import yaml
 
 from harness.e2e.image_version import local_ref, resolve_image
 from harness.e2e.residue_prune import (
+    DEFAULT_PRUNE_EXTENSIONS,
     ResiduePruneSafetyError,
     assert_prune_set_safe,
     check_snapshot_integrity,
     compute_prune_set,
+    normalize_keep_list,
     normalize_tar_members,
 )
 from harness.utils.rust_test_filter import (
@@ -210,6 +212,7 @@ class EvaluationResult:
     keep_list_hits: List[str] = field(default_factory=list)
     snapshot_integrity_ok: Optional[bool] = None  # None = check not run
     snapshot_missing_count: int = 0
+    residue_prune_skipped_reason: str = ""  # "", ls-tree-failed, snapshot-integrity-failed, safety-abort, tar-unreadable
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to structured dictionary matching reference format."""
@@ -251,6 +254,7 @@ class EvaluationResult:
             "pruned_files_count": self.pruned_files_count,
             "pruned_files": self.pruned_files,
             "keep_list_hits": self.keep_list_hits,
+            "skipped_reason": self.residue_prune_skipped_reason,
         }
         result["snapshot_integrity"] = {
             "ok": self.snapshot_integrity_ok,
@@ -657,7 +661,12 @@ class PatchEvaluator:
                 # per-range facts — enablement flag + keep-list; the mechanism
                 # lives here. Filter reuses the same fields as the snapshot side.
                 self.residue_prune_enabled = bool(metadata.get("residue_prune", False))
-                self.prune_keep_list = frozenset(metadata.get("prune_keep_list", []))
+                self.prune_keep_list = normalize_keep_list(metadata.get("prune_keep_list", []))
+                # F3: per-range language scope. Metadata may pin prune_extensions
+                # (phase 1 navidrome -> [".go"] so its ui/src TS is never pruned);
+                # absent -> the multi-language default.
+                pe = metadata.get("prune_extensions")
+                self.prune_extensions = frozenset(pe) if pe else DEFAULT_PRUNE_EXTENSIONS
                 if metadata.get("repo_src_dirs") and metadata.get("test_dirs"):
                     self._prune_filter: Optional[SrcFileFilter] = SrcFileFilter(
                         src_dirs=metadata["repo_src_dirs"],
@@ -675,12 +684,25 @@ class PatchEvaluator:
             self.docker_cpus = 16
             self.residue_prune_enabled = False
             self.prune_keep_list = frozenset()
+            self.prune_extensions = DEFAULT_PRUNE_EXTENSIONS
             self._prune_filter = None
 
-        # A/B override for re-evaluation experiments: SWE_MILESTONE_RESIDUE_PRUNE=1/0
+        # A/B override for re-evaluation experiments: SWE_MILESTONE_RESIDUE_PRUNE=1/0.
+        # M4: only a range that already declares the capability may be flipped, and
+        # unparseable values raise rather than silently disabling.
         env_prune = os.environ.get("SWE_MILESTONE_RESIDUE_PRUNE")
         if env_prune is not None:
-            self.residue_prune_enabled = env_prune.strip() == "1"
+            val = env_prune.strip().lower()
+            if val in ("1", "true", "yes", "on"):
+                want = True
+            elif val in ("0", "false", "no", "off"):
+                want = False
+            else:
+                raise ValueError(f"SWE_MILESTONE_RESIDUE_PRUNE: unparseable value {env_prune!r}")
+            if want and self._prune_filter is None:
+                print("⚠️  SWE_MILESTONE_RESIDUE_PRUNE=on but metadata lacks repo_src_dirs/test_dirs — ignored")
+            else:
+                self.residue_prune_enabled = want
         if self.residue_prune_enabled and self._prune_filter is None:
             print("⚠️  residue_prune requested but metadata lacks repo_src_dirs/test_dirs — disabled")
             self.residue_prune_enabled = False
@@ -695,6 +717,7 @@ class PatchEvaluator:
             "keep_list_hits": [],
             "snapshot_integrity_ok": None,
             "snapshot_missing_count": 0,
+            "residue_prune_skipped_reason": "",
         }
         # Ensure test_dir ends with / for consistent path handling
         if not self.test_dir.endswith("/"):
@@ -941,7 +964,16 @@ class PatchEvaluator:
         return has_warning and not has_real_error
 
     def _git_ls_tree(self, tag_name: str) -> Optional[Set[str]]:
-        """List every file of a tag's tree inside the container (repo-relative)."""
+        """List every file of a tag's tree inside the container (repo-relative).
+
+        Runs as the eval container's default user (root) — the same way
+        _checkout_to_tag / git clean already run on this tree — NOT the
+        capture-side fakeroot user (the eval container is a fresh root
+        container from the milestone image; forcing fakeroot hits dubious
+        ownership and returns None, silently disabling pruning). quotePath=false
+        + -z keep non-ASCII paths byte-accurate against the tar member names
+        (review L1); safe.directory guards against any ownership quirk.
+        """
         cmd = [
             "docker",
             "exec",
@@ -949,15 +981,40 @@ class PatchEvaluator:
             "git",
             "-C",
             "/testbed",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "safe.directory=/testbed",
             "ls-tree",
             "-r",
+            "-z",
             "--name-only",
             tag_name,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return None
-        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return {p for p in result.stdout.split("\0") if p}
+
+    def _load_capture_excluded(self) -> Optional[FrozenSet[str]]:
+        """Load the capture-time filtered-out set from the tar's integrity sidecar.
+
+        This is the independent witness that survives eval-vs-capture filter
+        drift (review F2): a path the capture pipeline dropped from the tar as a
+        test/exclude must never be pruned, even if the current eval filter now
+        classifies it as source. None => no sidecar (legacy tar) => no witness.
+        """
+        sidecar = self.patch_file.parent / (self.patch_file.stem + ".integrity.json")
+        if not sidecar.exists():
+            return None
+        try:
+            data = json.loads(sidecar.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        filtered = data.get("filtered_out")
+        if filtered is None:
+            return None
+        return frozenset(filtered)
 
     def _maybe_prune_residue(self, base_suffix: str) -> Tuple[bool, str]:
         """Delete residue source files after tar extraction (spec §2, phase 1b).
@@ -966,11 +1023,21 @@ class PatchEvaluator:
         existed at START was deleted by the agent and must not be resurrected by
         the base checkout. Tests, modifiable tests, generated files, non-code
         assets and keep-list entries are never deleted (V3b assertion enforces
-        this at runtime). A failed snapshot-integrity gate skips pruning for the
-        cell instead of turning a capture failure into unfair deletions.
+        this at runtime).
+
+        FAIL-CLOSED (review F1): a failed snapshot-integrity gate does NOT
+        silently fall back to additive scoring (that would let a near-empty tar
+        resurrect the whole GT solution). It records the failure, skips the
+        deletions, and the caller forces resolved=False for the cell.
         """
         meta = self._eval_meta
         meta["residue_prune_enabled"] = self.residue_prune_enabled
+        meta["residue_prune_skipped_reason"] = ""
+        # L3: reset per-pass counters up front so an early return never leaves
+        # stale counts from a previous (END) pass in a START-fallback report.
+        meta["pruned_files_count"] = 0
+        meta["pruned_files"] = []
+        meta["keep_list_hits"] = []
         if not self.residue_prune_enabled:
             return True, ""
 
@@ -981,27 +1048,45 @@ class PatchEvaluator:
             with tarfile.open(self.patch_file) as tf:
                 tar_files = normalize_tar_members(tf.getnames())
         except (tarfile.TarError, OSError) as e:
+            meta["residue_prune_skipped_reason"] = "tar-unreadable"
             return False, f"residue prune: cannot list snapshot tar: {e}"
 
         base_files = self._git_ls_tree(base_tag)
         start_files = base_files if base_suffix == "start" else self._git_ls_tree(start_tag)
         if base_files is None or start_files is None:
-            print("⚠️  residue prune skipped: cannot list git trees in container")
+            # F5: distinguishable skip reason — a silent no-op here would look
+            # identical to "nothing to prune" and hide a fleet-wide failure.
+            meta["residue_prune_skipped_reason"] = "ls-tree-failed"
+            print("⚠️  residue prune skipped: cannot list git trees in container (ls-tree-failed)")
             return True, ""
 
-        # Phase 1a gate: mass-missing snapshot == capture failure -> do not prune.
+        capture_excluded = self._load_capture_excluded()
+
+        # Phase 1a gate (FAIL-CLOSED): mass-missing snapshot == capture failure.
         integrity = check_snapshot_integrity(start_files, tar_files, self._prune_filter)
         meta["snapshot_integrity_ok"] = integrity.ok
         meta["snapshot_missing_count"] = integrity.missing_count
         if not integrity.ok:
+            meta["residue_prune_skipped_reason"] = "snapshot-integrity-failed"
             print(
                 f"⚠️  snapshot integrity: {integrity.missing_count}/{integrity.expected_count} expected "
-                f"files missing from tar (sample: {integrity.missing_sample[:3]}) — residue prune SKIPPED"
+                f"files missing from tar (sample: {integrity.missing_sample[:3]}) — residue prune SKIPPED, "
+                f"cell marked NOT resolved (fail-closed)"
             )
+            # Fail-closed: the caller reads snapshot_integrity_ok and forces
+            # resolved=False. We skip deletions (can't trust "absent==deleted").
             return True, ""
 
         # START provenance guard is active in phase 1b: GT-added files survive.
-        prune_set = compute_prune_set(base_files, tar_files, start_files, self._prune_filter, self.prune_keep_list)
+        prune_set = compute_prune_set(
+            base_files,
+            tar_files,
+            start_files,
+            self._prune_filter,
+            self.prune_keep_list,
+            extensions=self.prune_extensions,
+            capture_excluded=capture_excluded,
+        )
         meta["keep_list_hits"] = sorted((base_files - tar_files) & set(self.prune_keep_list))
         meta["pruned_files_count"] = 0
         meta["pruned_files"] = []
@@ -1010,13 +1095,21 @@ class PatchEvaluator:
             return True, ""
 
         try:
-            assert_prune_set_safe(prune_set, self._prune_filter, self.prune_keep_list)
+            assert_prune_set_safe(
+                prune_set,
+                self._prune_filter,
+                self.prune_keep_list,
+                extensions=self.prune_extensions,
+                capture_excluded=capture_excluded,
+            )
         except ResiduePruneSafetyError as e:
             # Fail loud: a protected class in the prune set means filter/config drift.
+            meta["residue_prune_skipped_reason"] = "safety-abort"
             return False, f"residue prune safety abort (V3b): {e}"
 
-        rm_cmd = ["docker", "exec", "-i", self.container_name, "xargs", "-d", "\n", "rm", "-f", "--"]
-        rm_input = "\n".join(f"/testbed/{p}" for p in prune_set) + "\n"
+        # L6: xargs -0 (null-separated) is portable and safe for any path.
+        rm_cmd = ["docker", "exec", "-i", self.container_name, "xargs", "-0", "rm", "-f", "--"]
+        rm_input = "".join(f"/testbed/{p}\0" for p in prune_set)
         result = subprocess.run(rm_cmd, input=rm_input, capture_output=True, text=True)
         if result.returncode != 0:
             return False, f"residue prune: rm failed: {result.stderr}"
@@ -1110,13 +1203,15 @@ class PatchEvaluator:
         print("\n📦 Using END tag as base")
         success, error = self._checkout_to_tag("end")
         if not success:
+            # L7: END checkout failed -> the working tree is whatever the image
+            # ships (START); prune/graft must use the START base, not END.
             print(f"⚠️  Failed to checkout to END tag: {error}")
             print("   Falling back to current state (START tag)")
             self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-start"
             self._eval_meta["fallback_triggered"] = True
-        else:
-            self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-end"
+            return self._apply_tar_to_container(gt_tag_suffix="start")
 
+        self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-end"
         return self._apply_tar_to_container(gt_tag_suffix="end")
 
     def _apply_tar_with_fallback(self) -> Tuple[bool, str]:
@@ -1674,6 +1769,19 @@ class PatchEvaluator:
         if pass_to_pass_missing > 0:
             print(f"⚠️  PASS_TO_PASS Missing: {pass_to_pass_missing} tests not found (skipped modules or ID mismatch)")
 
+        # F1 fail-closed: when residue prune is ENABLED but did not run to
+        # completion for ANY reason (integrity gate failed, ls-tree failed, tar
+        # unreadable), the additive overlay may have resurrected the GT solution
+        # (near-empty-tar attack, red-team vector 1). Such a cell must never
+        # count as resolved — it needs isolation/re-capture, not a silent score.
+        # "" (pruned fine or nothing to prune) and "safety-abort" (already
+        # returned an error) are the only trustworthy states.
+        skip_reason = self._eval_meta.get("residue_prune_skipped_reason", "")
+        fail_closed_reasons = {"snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable"}
+        if skip_reason in fail_closed_reasons and resolved:
+            print(f"🚫 resolved forced False: residue prune did not complete ({skip_reason}, fail-closed)")
+            resolved = False
+
         return EvaluationResult(
             milestone_id=self.milestone_id,
             patch_is_None=(self.patch_file is None),
@@ -1705,6 +1813,7 @@ class PatchEvaluator:
             keep_list_hits=self._eval_meta["keep_list_hits"],
             snapshot_integrity_ok=self._eval_meta["snapshot_integrity_ok"],
             snapshot_missing_count=self._eval_meta["snapshot_missing_count"],
+            residue_prune_skipped_reason=self._eval_meta["residue_prune_skipped_reason"],
         )
 
     def cleanup(self) -> None:
