@@ -25,17 +25,26 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import yaml
 
 from harness.e2e.image_version import local_ref, resolve_image
+from harness.e2e.residue_prune import (
+    ResiduePruneSafetyError,
+    assert_prune_set_safe,
+    check_snapshot_integrity,
+    compute_prune_set,
+    normalize_tar_members,
+)
 from harness.utils.rust_test_filter import (
     get_rust_files_from_tar,
     process_rust_files_in_container,
 )
+from harness.utils.src_filter import SrcFileFilter
 from harness.utils.test_id_normalizer import TestIdNormalizer
 from harness.test_runner.core.milestone_attempt import run_single_state_tests
 from harness.test_runner.core.report_parser import convert_to_summary
@@ -192,6 +201,16 @@ class EvaluationResult:
     none_to_pass_required: int
     none_to_pass_achieved: int
 
+    # Fail-loud eval metadata (docs/residue-prune-spec.md, phases 1a/1b)
+    base_tag: str = ""  # full tag the eval tree was based on, e.g. milestone-M1-end
+    fallback_triggered: bool = False  # END base failed -> graded on START base
+    residue_prune_enabled: bool = False
+    pruned_files_count: int = 0
+    pruned_files: List[str] = field(default_factory=list)
+    keep_list_hits: List[str] = field(default_factory=list)
+    snapshot_integrity_ok: Optional[bool] = None  # None = check not run
+    snapshot_missing_count: int = 0
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to structured dictionary matching reference format."""
         result = {
@@ -224,6 +243,18 @@ class EvaluationResult:
                 "pass_to_pass_failed": len(self.pass_to_pass_failure),
                 "pass_to_pass_missing": self.pass_to_pass_missing,
             },
+        }
+        result["base_tag"] = self.base_tag
+        result["fallback_triggered"] = self.fallback_triggered
+        result["residue_prune"] = {
+            "enabled": self.residue_prune_enabled,
+            "pruned_files_count": self.pruned_files_count,
+            "pruned_files": self.pruned_files,
+            "keep_list_hits": self.keep_list_hits,
+        }
+        result["snapshot_integrity"] = {
+            "ok": self.snapshot_integrity_ok,
+            "missing_count": self.snapshot_missing_count,
         }
         return result
 
@@ -622,11 +653,49 @@ class PatchEvaluator:
                 self.test_timeout = metadata.get("test_timeout") or metadata.get("pytest_timeout", 50)
                 # docker_cpus: number of CPUs for Docker container (default: 16)
                 self.docker_cpus = metadata.get("docker_cpus", 16)
+                # Residue prune (docs/residue-prune-spec.md): metadata carries the
+                # per-range facts — enablement flag + keep-list; the mechanism
+                # lives here. Filter reuses the same fields as the snapshot side.
+                self.residue_prune_enabled = bool(metadata.get("residue_prune", False))
+                self.prune_keep_list = frozenset(metadata.get("prune_keep_list", []))
+                if metadata.get("repo_src_dirs") and metadata.get("test_dirs"):
+                    self._prune_filter: Optional[SrcFileFilter] = SrcFileFilter(
+                        src_dirs=metadata["repo_src_dirs"],
+                        test_dirs=metadata["test_dirs"],
+                        exclude_patterns=metadata.get("exclude_patterns", []),
+                        generated_patterns=metadata.get("generated_patterns", []),
+                        modifiable_test_patterns=metadata.get("modifiable_test_patterns", []),
+                    )
+                else:
+                    self._prune_filter = None
         else:
             self.test_dir = "test/"
             self.test_workdir = "/testbed"
             self.test_timeout = 50
             self.docker_cpus = 16
+            self.residue_prune_enabled = False
+            self.prune_keep_list = frozenset()
+            self._prune_filter = None
+
+        # A/B override for re-evaluation experiments: SWE_MILESTONE_RESIDUE_PRUNE=1/0
+        env_prune = os.environ.get("SWE_MILESTONE_RESIDUE_PRUNE")
+        if env_prune is not None:
+            self.residue_prune_enabled = env_prune.strip() == "1"
+        if self.residue_prune_enabled and self._prune_filter is None:
+            print("⚠️  residue_prune requested but metadata lacks repo_src_dirs/test_dirs — disabled")
+            self.residue_prune_enabled = False
+
+        # Fail-loud eval metadata threaded into EvaluationResult (spec phase 1a)
+        self._eval_meta: Dict[str, Any] = {
+            "base_tag": "",
+            "fallback_triggered": False,
+            "residue_prune_enabled": self.residue_prune_enabled,
+            "pruned_files_count": 0,
+            "pruned_files": [],
+            "keep_list_hits": [],
+            "snapshot_integrity_ok": None,
+            "snapshot_missing_count": 0,
+        }
         # Ensure test_dir ends with / for consistent path handling
         if not self.test_dir.endswith("/"):
             self.test_dir = self.test_dir + "/"
@@ -871,6 +940,92 @@ class PatchEvaluator:
         # Only treat as warning-only if we found warnings but no real errors
         return has_warning and not has_real_error
 
+    def _git_ls_tree(self, tag_name: str) -> Optional[Set[str]]:
+        """List every file of a tag's tree inside the container (repo-relative)."""
+        cmd = [
+            "docker",
+            "exec",
+            self.container_name,
+            "git",
+            "-C",
+            "/testbed",
+            "ls-tree",
+            "-r",
+            "--name-only",
+            tag_name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    def _maybe_prune_residue(self, base_suffix: str) -> Tuple[bool, str]:
+        """Delete residue source files after tar extraction (spec §2, phase 1b).
+
+        Source files are agent-authoritative: a snapshot-absent source file that
+        existed at START was deleted by the agent and must not be resurrected by
+        the base checkout. Tests, modifiable tests, generated files, non-code
+        assets and keep-list entries are never deleted (V3b assertion enforces
+        this at runtime). A failed snapshot-integrity gate skips pruning for the
+        cell instead of turning a capture failure into unfair deletions.
+        """
+        meta = self._eval_meta
+        meta["residue_prune_enabled"] = self.residue_prune_enabled
+        if not self.residue_prune_enabled:
+            return True, ""
+
+        base_tag = f"milestone-{self.milestone_id}-{base_suffix}"
+        start_tag = f"milestone-{self.milestone_id}-start"
+
+        try:
+            with tarfile.open(self.patch_file) as tf:
+                tar_files = normalize_tar_members(tf.getnames())
+        except (tarfile.TarError, OSError) as e:
+            return False, f"residue prune: cannot list snapshot tar: {e}"
+
+        base_files = self._git_ls_tree(base_tag)
+        start_files = base_files if base_suffix == "start" else self._git_ls_tree(start_tag)
+        if base_files is None or start_files is None:
+            print("⚠️  residue prune skipped: cannot list git trees in container")
+            return True, ""
+
+        # Phase 1a gate: mass-missing snapshot == capture failure -> do not prune.
+        integrity = check_snapshot_integrity(start_files, tar_files, self._prune_filter)
+        meta["snapshot_integrity_ok"] = integrity.ok
+        meta["snapshot_missing_count"] = integrity.missing_count
+        if not integrity.ok:
+            print(
+                f"⚠️  snapshot integrity: {integrity.missing_count}/{integrity.expected_count} expected "
+                f"files missing from tar (sample: {integrity.missing_sample[:3]}) — residue prune SKIPPED"
+            )
+            return True, ""
+
+        # START provenance guard is active in phase 1b: GT-added files survive.
+        prune_set = compute_prune_set(base_files, tar_files, start_files, self._prune_filter, self.prune_keep_list)
+        meta["keep_list_hits"] = sorted((base_files - tar_files) & set(self.prune_keep_list))
+        meta["pruned_files_count"] = 0
+        meta["pruned_files"] = []
+        if not prune_set:
+            print(f"✂️  residue prune: nothing to prune on {base_tag}")
+            return True, ""
+
+        try:
+            assert_prune_set_safe(prune_set, self._prune_filter, self.prune_keep_list)
+        except ResiduePruneSafetyError as e:
+            # Fail loud: a protected class in the prune set means filter/config drift.
+            return False, f"residue prune safety abort (V3b): {e}"
+
+        rm_cmd = ["docker", "exec", "-i", self.container_name, "xargs", "-d", "\n", "rm", "-f", "--"]
+        rm_input = "\n".join(f"/testbed/{p}" for p in prune_set) + "\n"
+        result = subprocess.run(rm_cmd, input=rm_input, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, f"residue prune: rm failed: {result.stderr}"
+
+        meta["pruned_files_count"] = len(prune_set)
+        meta["pruned_files"] = prune_set
+        print(f"✂️  residue prune: removed {len(prune_set)} residue source file(s) (base={base_tag})")
+        return True, ""
+
     def _apply_tar_to_container(self, gt_tag_suffix: str = "end") -> Tuple[bool, str]:
         """Extract tar archive to container and process Rust test regions.
 
@@ -901,6 +1056,12 @@ class PatchEvaluator:
             return False, f"Failed to extract tar archive:\n{result.stderr}\n{result.stdout}"
 
         print(f"Successfully extracted tar archive: {self.patch_file.name}")
+
+        # Residue prune (docs/residue-prune-spec.md): enforce source-file
+        # authority before env patches re-create excluded files.
+        prune_ok, prune_error = self._maybe_prune_residue(base_suffix=gt_tag_suffix)
+        if not prune_ok:
+            return False, prune_error
 
         # Run apply_patches.sh if it exists in the container (to reapply compilation fixes)
         patch_check_cmd = [
@@ -951,6 +1112,10 @@ class PatchEvaluator:
         if not success:
             print(f"⚠️  Failed to checkout to END tag: {error}")
             print("   Falling back to current state (START tag)")
+            self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-start"
+            self._eval_meta["fallback_triggered"] = True
+        else:
+            self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-end"
 
         return self._apply_tar_to_container(gt_tag_suffix="end")
 
@@ -982,6 +1147,7 @@ class PatchEvaluator:
             compile_ok, compile_error = self._check_compilation()
             if compile_ok:
                 print("✅ Code compiles successfully on END tag base")
+                self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-end"
                 return True, ""
             else:
                 print(f"⚠️  Compilation failed on END tag base:")
@@ -991,6 +1157,8 @@ class PatchEvaluator:
 
         # Step 2: Fallback to START tag
         print("\n📦 Fallback: Using START tag (baseline) as base")
+        self._eval_meta["base_tag"] = f"milestone-{self.milestone_id}-start"
+        self._eval_meta["fallback_triggered"] = True
         success, error = self._checkout_to_tag("start")
         if not success:
             return False, f"Failed to checkout to START tag: {error}"
@@ -1529,6 +1697,14 @@ class PatchEvaluator:
             pass_to_pass_required=len(pass_to_pass_ids),
             none_to_pass_required=len(none_to_pass_ids),
             none_to_pass_achieved=len(none_to_pass_success),
+            base_tag=self._eval_meta["base_tag"],
+            fallback_triggered=self._eval_meta["fallback_triggered"],
+            residue_prune_enabled=self._eval_meta["residue_prune_enabled"],
+            pruned_files_count=self._eval_meta["pruned_files_count"],
+            pruned_files=self._eval_meta["pruned_files"],
+            keep_list_hits=self._eval_meta["keep_list_hits"],
+            snapshot_integrity_ok=self._eval_meta["snapshot_integrity_ok"],
+            snapshot_missing_count=self._eval_meta["snapshot_missing_count"],
         )
 
     def cleanup(self) -> None:

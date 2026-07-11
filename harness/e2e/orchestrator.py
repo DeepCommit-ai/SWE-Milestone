@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 import shutil
 import subprocess
+import tarfile
 import time
 import traceback
 import concurrent.futures
@@ -14,6 +16,7 @@ from harness.e2e.dag import DAGManager
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
 from harness.e2e.config import E2EConfig
 from harness.e2e.container_setup import ContainerSetup
+from harness.e2e.residue_prune import check_snapshot_integrity, normalize_tar_members
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
 
@@ -838,6 +841,64 @@ class E2EOrchestrator:
 
         return filtered_count
 
+    def _check_snapshot_capture_integrity(self, agent_tag: str, snapshot_file: Path) -> None:
+        """Capture-side snapshot integrity check (residue-prune spec, phase 1a).
+
+        Compares the agent tag's tree (filtered by should_include_in_snapshot)
+        against the filtered tar. Mass absence means the capture pipeline lost
+        files (archive scoping, filter drift). Diagnostics only — writes a
+        sidecar JSON and warns; never breaks the pipeline. Note: files the
+        agent never committed are absent from the tag tree too and can only be
+        caught by the eval-side check against the START tree.
+        """
+        try:
+            res = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "fakeroot",
+                    "-e",
+                    "HOME=/home/fakeroot",
+                    "-w",
+                    "/testbed",
+                    self.container_name,
+                    "git",
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    agent_tag,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                return
+            tag_files = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+            with tarfile.open(snapshot_file) as tf:
+                tar_files = normalize_tar_members(tf.getnames())
+            report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+            sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "tag": agent_tag,
+                        "ok": report.ok,
+                        "expected_count": report.expected_count,
+                        "missing_count": report.missing_count,
+                        "missing_sample": report.missing_sample,
+                    },
+                    indent=2,
+                )
+            )
+            if not report.ok:
+                logger.warning(
+                    f"⚠️  snapshot capture integrity: {report.missing_count}/{report.expected_count} "
+                    f"includable files of {agent_tag} missing from tar (sample: {report.missing_sample[:3]})"
+                )
+        except Exception as e:  # diagnostics must never break the pipeline
+            logger.warning(f"snapshot capture integrity check failed: {e}")
+
     def _handle_submission(self, mid: str, agent_tag: str, executor, pending_futures, attempt: int = 0) -> bool:
         """Process a detected submission (Async).
 
@@ -930,6 +991,11 @@ class E2EOrchestrator:
 
         # Filter out test files and excluded files from snapshot
         self._filter_tar_archive(snapshot_file)
+
+        # Snapshot capture integrity (residue-prune spec, phase 1a capture side):
+        # the filtered tar should contain every snapshot-includable file of the
+        # agent tag tree; mass absence = files lost by the capture pipeline.
+        self._check_snapshot_capture_integrity(agent_tag, snapshot_file)
 
         # EARLY UNBLOCK MODE: If enabled, unlock dependent tasks immediately
         # after source extraction, without waiting for evaluation to complete.

@@ -37,6 +37,7 @@ from harness.e2e.agent_runner import AgentRunner
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
 from harness.e2e.test_masking import mask_tests_by_names
 from harness.e2e.log_parser import get_parser, TrialStats
+from harness.e2e.residue_prune import check_snapshot_integrity, normalize_tar_members
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
 
@@ -1086,6 +1087,55 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         filtered_count = self._filter_tar_archive(snapshot_path)
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} test/excluded files")
+
+        # Snapshot capture integrity (residue-prune spec, phase 1a capture side):
+        # diagnostics only — sidecar JSON + warning, never breaks extraction.
+        try:
+            res = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "fakeroot",
+                    "-e",
+                    "HOME=/home/fakeroot",
+                    "-w",
+                    "/testbed",
+                    self.container_name,
+                    "git",
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    tag_name,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0:
+                tag_files = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+                with tarfile.open(snapshot_path) as tf:
+                    tar_files = normalize_tar_members(tf.getnames())
+                report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+                sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
+                sidecar.write_text(
+                    json.dumps(
+                        {
+                            "tag": tag_name,
+                            "ok": report.ok,
+                            "expected_count": report.expected_count,
+                            "missing_count": report.missing_count,
+                            "missing_sample": report.missing_sample,
+                        },
+                        indent=2,
+                    )
+                )
+                if not report.ok:
+                    logger.warning(
+                        f"⚠️  snapshot capture integrity: {report.missing_count}/{report.expected_count} "
+                        f"includable files of {tag_name} missing from tar"
+                    )
+        except Exception as e:  # diagnostics must never break the pipeline
+            logger.warning(f"snapshot capture integrity check failed: {e}")
 
         return snapshot_path
 
