@@ -173,6 +173,23 @@ def test_compute_prune_set_honors_capture_excluded():
     assert pruned == ["core/deleted_by_agent.go"]  # foo_check.go protected by witness
 
 
+def test_capture_witness_from_config_covers_agent_deleted_test():
+    """F4 (codex): the witness is rebuilt from the capture filter config against
+    the START tree, so it protects a GT test the agent DELETED (which the old
+    agent-tree-derived file list would have missed)."""
+    from harness.e2e.residue_prune import capture_excluded_from_config, capture_filter_config
+
+    f = make_filter()
+    cfg = capture_filter_config(f)
+    # START tree has a test file the agent later deleted (absent from its tar).
+    start = {"core/foo_check.go", "core/impl.go", "plugins/host_scheduler_test.go"}
+    witness = capture_excluded_from_config(cfg, start)
+    # the *_test.go is a capture-time test -> in witness -> protected
+    assert "plugins/host_scheduler_test.go" in witness
+    # plain source -> not in witness
+    assert "core/impl.go" not in witness
+
+
 def test_assert_safe_raises_on_capture_excluded():
     # F2: V3b aborts if a capture-excluded path reaches the prune set.
     f = make_filter()
@@ -321,6 +338,37 @@ def test_evaluation_result_fail_loud_defaults():
         "skipped_reason": "",
     }
     assert d["snapshot_integrity"] == {"ok": None, "missing_count": 0}
+
+
+def test_scoring_untrusted_property():
+    """F1 (codex critical): a fail-closed skip reason makes the result
+    scoring-untrusted, so the orchestrator's threshold recompute cannot flip
+    resolved back to True."""
+    assert _mk_result().scoring_untrusted is False
+    assert _mk_result(residue_prune_skipped_reason="snapshot-integrity-failed").scoring_untrusted is True
+    assert _mk_result(residue_prune_skipped_reason="ls-tree-failed").scoring_untrusted is True
+    assert _mk_result(residue_prune_skipped_reason="tar-unreadable").scoring_untrusted is True
+    assert _mk_result(residue_prune_skipped_reason="config-invalid").scoring_untrusted is True
+    # a completed prune (or nothing to prune) is trusted
+    assert _mk_result(residue_prune_skipped_reason="").scoring_untrusted is False
+
+
+def test_orchestrator_ands_scoring_untrusted():
+    """F1: the orchestrator resolution recompute must AND in the safety flag."""
+    from harness.e2e import orchestrator as orch_mod
+    import inspect
+
+    src = inspect.getsource(orch_mod._run_evaluation_once)
+    assert "scoring_untrusted" in src, "orchestrator does not consult scoring_untrusted"
+
+
+def test_extension_normalization():
+    """F6: extensions normalize (lowercase, require leading dot); absent != empty."""
+    from harness.e2e.residue_prune import normalize_extensions
+
+    assert normalize_extensions(["GO", ".Rs", "py"]) == frozenset({".go", ".rs", ".py"})
+    assert normalize_extensions(None) is None  # absent -> caller uses default
+    assert normalize_extensions([]) == frozenset()  # empty -> prune nothing (not default)
 
 
 def test_fail_closed_reasons_cover_incomplete_prune():

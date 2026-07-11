@@ -16,7 +16,11 @@ from harness.e2e.dag import DAGManager
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
 from harness.e2e.config import E2EConfig
 from harness.e2e.container_setup import ContainerSetup
-from harness.e2e.residue_prune import check_snapshot_integrity, normalize_tar_members
+from harness.e2e.residue_prune import (
+    capture_filter_config as _capture_filter_config,
+    check_snapshot_integrity,
+    normalize_tar_members,
+)
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
 
@@ -71,10 +75,21 @@ def _run_evaluation_once(
     else:
         n2p_rate = 1.0  # If no N2P tests, assume 100% success
 
-    # Check all thresholds - milestone is resolved only if all pass
+    # Check all thresholds - milestone is resolved only if all pass.
+    # F1 fail-closed: never let the threshold recompute overturn a scoring-
+    # untrusted verdict (residue prune requested but did not complete -> the
+    # eval tree may be the additive GT solution). AND in the safety flag.
     is_resolved = (
-        f2p_rate >= fail_to_pass_threshold and p2p_rate >= pass_to_pass_threshold and n2p_rate >= none_to_pass_threshold
+        f2p_rate >= fail_to_pass_threshold
+        and p2p_rate >= pass_to_pass_threshold
+        and n2p_rate >= none_to_pass_threshold
+        and not eval_res.scoring_untrusted
     )
+    if eval_res.scoring_untrusted:
+        logger.warning(
+            f"🚫 {milestone_id}: residue prune did not complete "
+            f"({eval_res.residue_prune_skipped_reason}) — resolution locked False (fail-closed)"
+        )
 
     # Actual test result: did tests actually pass 100%? (ignoring thresholds)
     # This is used for eval_status reporting, independent of DAG resolution
@@ -810,9 +825,18 @@ class E2EOrchestrator:
             with tarfile.open(tar_path, "r") as src_tar:
                 with tarfile.open(temp_tar_path, "w") as dst_tar:
                     for member in src_tar.getmembers():
-                        # Skip directories, only filter files
-                        if not member.isfile():
+                        # Keep directory entries as-is.
+                        if member.isdir():
                             dst_tar.addfile(member)
+                            continue
+
+                        # F2 (codex): reject non-regular members outright. A
+                        # symlink/hardlink/device named like a GT test would
+                        # otherwise slip through the path filter and, on eval-side
+                        # extraction, replace the GT test with attacker content.
+                        if not member.isfile():
+                            filtered_count += 1
+                            logger.debug(f"  Dropped non-regular member: {member.name} (type={member.type!r})")
                             continue
 
                         # Check if file should be included in snapshot
@@ -830,14 +854,17 @@ class E2EOrchestrator:
             # Replace original with filtered version
             temp_tar_path.replace(tar_path)
             if filtered_count > 0:
-                logger.info(f"Filtered out {filtered_count} test/excluded files from snapshot")
+                logger.info(f"Filtered out {filtered_count} test/excluded/non-regular members from snapshot")
 
         except Exception as e:
             logger.error(f"Error filtering tar archive: {e}")
             # Clean up temp file if it exists
             if temp_tar_path.exists():
                 temp_tar_path.unlink()
-            # Don't raise - continue with unfiltered tar
+            # F2 (codex): do NOT fall through to an unfiltered tar — that would
+            # ship GT test files (and any special members) into the eval tree.
+            # Signal failure so the caller can refuse to grade this snapshot.
+            raise
 
         return filtered_count
 
@@ -864,8 +891,11 @@ class E2EOrchestrator:
                     "/testbed",
                     self.container_name,
                     "git",
+                    "-c",
+                    "core.quotePath=false",
                     "ls-tree",
                     "-r",
+                    "-z",
                     "--name-only",
                     agent_tag,
                 ],
@@ -874,13 +904,10 @@ class E2EOrchestrator:
             )
             if res.returncode != 0:
                 return
-            tag_files = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+            tag_files = {p for p in res.stdout.split("\0") if p}
             with tarfile.open(snapshot_file) as tf:
                 tar_files = normalize_tar_members(tf.getnames())
             report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
-            # F2 witness: paths the capture filter dropped as tests/excludes.
-            # The eval side reads this to survive filter drift (residue prune).
-            filtered_out = sorted(p for p in tag_files if not self.src_filter.should_include_in_snapshot(p))
             sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
             sidecar.write_text(
                 json.dumps(
@@ -890,7 +917,12 @@ class E2EOrchestrator:
                         "expected_count": report.expected_count,
                         "missing_count": report.missing_count,
                         "missing_sample": report.missing_sample,
-                        "filtered_out": filtered_out,
+                        # F2 witness (codex F4): record the capture-time filter
+                        # config, not a file list. The eval side rebuilds the
+                        # filter and applies it to the START tree, so it protects
+                        # even GT tests the agent deleted (absent from the tag
+                        # tree) — and survives eval-side test_dirs drift.
+                        "capture_filter": _capture_filter_config(self.src_filter),
                     },
                     indent=2,
                 )

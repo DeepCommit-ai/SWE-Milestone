@@ -72,6 +72,70 @@ def _has_code_extension(path: str, extensions: FrozenSet[str]) -> bool:
     return path[dot:].lower() in extensions
 
 
+# Skip reasons that mean "prune was requested but did not run to completion",
+# so the additive overlay may have resurrected the GT solution — the cell's
+# score is untrustworthy and must never count as resolved (codex F1, red-team
+# vector 1). "" (completed / nothing to prune) is the only trusted empty state.
+FAIL_CLOSED_SKIP_REASONS: FrozenSet[str] = frozenset(
+    {"snapshot-integrity-failed", "ls-tree-failed", "tar-unreadable", "config-invalid"}
+)
+
+
+def capture_filter_config(src_filter: SrcFileFilter) -> dict:
+    """Serialize the fields that define a SrcFileFilter's classification.
+
+    Recorded in the snapshot integrity sidecar so the eval side can rebuild the
+    EXACT capture-time filter and derive the drift-proof prune witness from the
+    START tree (codex F4), rather than trusting a stored file list.
+    """
+    return {
+        "src_dirs": [d.rstrip("/") for d in src_filter.src_dirs],
+        "test_dirs": list(src_filter.test_dirs),
+        "exclude_patterns": list(src_filter.exclude_patterns),
+        "generated_patterns": list(src_filter.generated_patterns),
+        "modifiable_test_patterns": list(src_filter.modifiable_test_patterns),
+    }
+
+
+def capture_excluded_from_config(
+    config: dict, start_files: Set[str]
+) -> FrozenSet[str]:
+    """Rebuild the capture-time filter from `config` and return the START-tree
+    paths it would exclude from a snapshot (tests/excludes). These are the files
+    whose tar-absence is by-design filtering, not agent deletion — the eval side
+    must never prune them (codex F4).
+    """
+    cap = SrcFileFilter(
+        src_dirs=config.get("src_dirs", []),
+        test_dirs=config.get("test_dirs", []),
+        exclude_patterns=config.get("exclude_patterns", []),
+        generated_patterns=config.get("generated_patterns", []),
+        modifiable_test_patterns=config.get("modifiable_test_patterns", []),
+    )
+    return frozenset(p for p in start_files if not cap.should_include_in_snapshot(p))
+
+
+def normalize_extensions(entries: Optional[Iterable[str]]) -> Optional[FrozenSet[str]]:
+    """Normalize a per-range extension whitelist (review F6).
+
+    None (absent) -> None so the caller falls back to the default; an explicit
+    (possibly empty) list -> a frozenset with each entry lowercased and given a
+    leading dot. Empty list therefore means "prune nothing", distinct from
+    absent.
+    """
+    if entries is None:
+        return None
+    out = set()
+    for e in entries:
+        e = e.strip().lower()
+        if not e:
+            continue
+        if not e.startswith("."):
+            e = "." + e
+        out.add(e)
+    return frozenset(out)
+
+
 def normalize_keep_list(entries: Iterable[str]) -> FrozenSet[str]:
     """Normalize keep-list entries to repo-relative paths (review L4).
 

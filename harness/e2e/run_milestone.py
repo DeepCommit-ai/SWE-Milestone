@@ -37,7 +37,11 @@ from harness.e2e.agent_runner import AgentRunner
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
 from harness.e2e.test_masking import mask_tests_by_names
 from harness.e2e.log_parser import get_parser, TrialStats
-from harness.e2e.residue_prune import check_snapshot_integrity, normalize_tar_members
+from harness.e2e.residue_prune import (
+    capture_filter_config as _capture_filter_config,
+    check_snapshot_integrity,
+    normalize_tar_members,
+)
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
 
@@ -1103,8 +1107,11 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                     "/testbed",
                     self.container_name,
                     "git",
+                    "-c",
+                    "core.quotePath=false",
                     "ls-tree",
                     "-r",
+                    "-z",
                     "--name-only",
                     tag_name,
                 ],
@@ -1112,11 +1119,10 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 text=True,
             )
             if res.returncode == 0:
-                tag_files = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+                tag_files = {p for p in res.stdout.split("\0") if p}
                 with tarfile.open(snapshot_path) as tf:
                     tar_files = normalize_tar_members(tf.getnames())
                 report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
-                filtered_out = sorted(p for p in tag_files if not self.src_filter.should_include_in_snapshot(p))
                 sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
                 sidecar.write_text(
                     json.dumps(
@@ -1126,7 +1132,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                             "expected_count": report.expected_count,
                             "missing_count": report.missing_count,
                             "missing_sample": report.missing_sample,
-                            "filtered_out": filtered_out,
+                            "capture_filter": _capture_filter_config(self.src_filter),
                         },
                         indent=2,
                     )
@@ -1164,9 +1170,17 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         with tarfile.open(tar_path, "r") as src:
             with tarfile.open(temp_path, "w") as dst:
                 for member in src.getmembers():
-                    # Always include directories
-                    if not member.isfile():
+                    # Keep directory entries as-is.
+                    if member.isdir():
                         dst.addfile(member)
+                        continue
+
+                    # F2 (codex): reject non-regular members (symlink/hardlink/
+                    # device) — a symlink named like a GT test would slip through
+                    # the path filter and replace the GT test at eval time.
+                    if not member.isfile():
+                        filtered_count += 1
+                        logger.debug(f"Dropped non-regular member: {member.name} (type={member.type!r})")
                         continue
 
                     # Check if file should be included in snapshot
