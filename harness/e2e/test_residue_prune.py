@@ -412,3 +412,73 @@ def test_evaluation_result_fail_loud_populated():
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
     assert d["residue_prune"]["skipped_reason"] == "ls-tree-failed"
     assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1}
+
+
+# ---------------------------------------------------------------------------
+# Capture-side loss detection (spec §11.4-H rewrite, 2026-07-11)
+# ---------------------------------------------------------------------------
+
+from harness.e2e.residue_prune import (  # noqa: E402
+    capture_scope_covered,
+    classify_capture_loss,
+    parse_status_porcelain_z,
+)
+
+SNAPSHOT_PATHS = ["core/", "server", "go.mod", "go.sum"]
+
+
+def _z(*entries):
+    return "\0".join(entries) + "\0"
+
+
+def test_porcelain_z_basic_entries():
+    out = _z(" M core/a.go", "?? core/new.go", "A  server/b.go")
+    assert parse_status_porcelain_z(out) == ["core/a.go", "core/new.go", "server/b.go"]
+
+
+def test_porcelain_z_skips_deletions():
+    # A deleted-but-uncommitted file is not lost work: the tar keeps the
+    # tagged version. Both index (D ) and worktree ( D) deletions drop.
+    out = _z("D  core/gone.go", " D core/gone2.go", " M core/kept.go")
+    assert parse_status_porcelain_z(out) == ["core/kept.go"]
+
+
+def test_porcelain_z_rename_consumes_original_path():
+    # R entries carry one extra NUL field (the original path) — it must be
+    # consumed, NOT parsed as a standalone entry.
+    out = _z("R  core/new_name.go", "core/old_name.go", "?? core/x.go")
+    assert parse_status_porcelain_z(out) == ["core/new_name.go", "core/x.go"]
+
+
+def test_porcelain_z_empty_and_garbage():
+    assert parse_status_porcelain_z("") == []
+    assert parse_status_porcelain_z("\0") == []
+    assert parse_status_porcelain_z("xy") == []  # too short / no separator
+
+
+def test_capture_scope_covered_dir_prefix_and_exact_file():
+    assert capture_scope_covered("core/a/b.go", SNAPSHOT_PATHS)
+    assert capture_scope_covered("server/main.go", SNAPSHOT_PATHS)
+    assert capture_scope_covered("go.mod", SNAPSHOT_PATHS)
+    assert not capture_scope_covered("docs/README.md", SNAPSHOT_PATHS)
+    # Prefix must be component-wise: "server2/x.go" is NOT under "server".
+    assert not capture_scope_covered("server2/x.go", SNAPSHOT_PATHS)
+    assert not capture_scope_covered("go.mod.bak", SNAPSHOT_PATHS)
+
+
+def test_classify_capture_loss_buckets():
+    f = make_filter()
+    paths = [
+        "core/uncommitted.go",       # in scope -> lost_in
+        "scripts/helper.py",         # outside scope -> lost_out
+        "core/foo_test.go",          # test file -> dropped (by-design filtering)
+        "core/wire_gen.go",          # excluded -> dropped
+    ]
+    lost_in, lost_out = classify_capture_loss(paths, f, ["core/", "server/"])
+    assert lost_in == ["core/uncommitted.go"]
+    assert lost_out == ["scripts/helper.py"]
+
+
+def test_classify_capture_loss_empty():
+    f = make_filter()
+    assert classify_capture_loss([], f, SNAPSHOT_PATHS) == ([], [])

@@ -10,7 +10,7 @@ import concurrent.futures
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from harness.e2e.dag import DAGManager
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
@@ -19,7 +19,9 @@ from harness.e2e.container_setup import ContainerSetup
 from harness.e2e.residue_prune import (
     capture_filter_config as _capture_filter_config,
     check_snapshot_integrity,
+    classify_capture_loss,
     normalize_tar_members,
+    parse_status_porcelain_z,
 )
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
@@ -819,6 +821,7 @@ class E2EOrchestrator:
             return 0
 
         filtered_count = 0
+        non_regular: List[str] = []
         temp_tar_path = tar_path.with_suffix(".filtered.tar")
 
         try:
@@ -836,7 +839,7 @@ class E2EOrchestrator:
                         # extraction, replace the GT test with attacker content.
                         if not member.isfile():
                             filtered_count += 1
-                            logger.debug(f"  Dropped non-regular member: {member.name} (type={member.type!r})")
+                            non_regular.append(member.name)
                             continue
 
                         # Check if file should be included in snapshot
@@ -853,6 +856,13 @@ class E2EOrchestrator:
 
             # Replace original with filtered version
             temp_tar_path.replace(tar_path)
+            if non_regular:
+                # Never silent: a range legitimately relying on symlinks would
+                # otherwise lose them without a trace (§11 decision 2026-07-11).
+                logger.warning(
+                    f"⚠️  Dropped {len(non_regular)} non-regular tar member(s) "
+                    f"(symlink/hardlink/device) from snapshot: {non_regular[:5]}"
+                )
             if filtered_count > 0:
                 logger.info(f"Filtered out {filtered_count} test/excluded/non-regular members from snapshot")
 
@@ -868,39 +878,28 @@ class E2EOrchestrator:
 
         return filtered_count
 
-    def _check_snapshot_capture_integrity(self, agent_tag: str, snapshot_file: Path) -> None:
-        """Capture-side snapshot integrity check (residue-prune spec, phase 1a).
+    def _check_snapshot_capture_integrity(
+        self, agent_tag: str, snapshot_file: Path, snapshot_paths: List[str]
+    ) -> None:
+        """Capture-side snapshot loss check (residue-prune spec §11.4-H).
 
-        Compares the agent tag's tree (filtered by should_include_in_snapshot)
-        against the filtered tar. Mass absence means the capture pipeline lost
-        files (archive scoping, filter drift). Diagnostics only — writes a
-        sidecar JSON and warns; never breaks the pipeline. Note: files the
-        agent never committed are absent from the tag tree too and can only be
-        caught by the eval-side check against the START tree.
+        Three loss channels, all diagnostics only (sidecar JSON + warning,
+        never breaks the pipeline):
+        1. pipeline loss — includable files of the agent tag tree missing from
+           the filtered tar (archive/filter bug);
+        2. uncommitted loss — dirty work-tree paths at capture time: the agent
+           never committed them, so they are absent from the tag tree AND the
+           tar (invisible to channel 1);
+        3. out-of-scope loss — paths committed since the previous submission
+           that no archive pathspec covers (work in the wrong location; can
+           never reach the tar). The milestone START tag does not exist in the
+           agent container (all tags are stripped at setup, anti-leak), so the
+           previous agent-impl tag is the closest available baseline; the
+           trial's first milestone has none and skips this channel.
         """
         try:
-            res = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    "--user",
-                    "fakeroot",
-                    "-e",
-                    "HOME=/home/fakeroot",
-                    "-w",
-                    "/testbed",
-                    self.container_name,
-                    "git",
-                    "-c",
-                    "core.quotePath=false",
-                    "ls-tree",
-                    "-r",
-                    "-z",
-                    "--name-only",
-                    agent_tag,
-                ],
-                capture_output=True,
-                text=True,
+            res = self._docker_exec_git(
+                "-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only", agent_tag
             )
             if res.returncode != 0:
                 return
@@ -908,6 +907,41 @@ class E2EOrchestrator:
             with tarfile.open(snapshot_file) as tf:
                 tar_files = normalize_tar_members(tf.getnames())
             report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+
+            # Channel 2: uncommitted work at capture time. May include work the
+            # agent already started for the NEXT milestone (tag detection is
+            # async) — heuristic warning, not an error.
+            uncommitted_in: List[str] = []
+            uncommitted_out: List[str] = []
+            status = self._docker_exec_git(
+                "-c", "core.quotePath=false", "status", "--porcelain", "-z"
+            )
+            if status.returncode == 0:
+                dirty = parse_status_porcelain_z(status.stdout)
+                uncommitted_in, uncommitted_out = classify_capture_loss(
+                    dirty, self.src_filter, snapshot_paths
+                )
+
+            # Channel 3: committed outside the capture scope since the previous
+            # submission (--diff-filter=d: deletions are not lost work).
+            committed_out: List[str] = []
+            diff_base: Optional[str] = None
+            tags_res = self._docker_exec_git("tag", "-l", "agent-impl-*", "--sort=creatordate")
+            if tags_res.returncode == 0:
+                tags = [t for t in tags_res.stdout.splitlines() if t.strip()]
+                if agent_tag in tags and tags.index(agent_tag) > 0:
+                    diff_base = tags[tags.index(agent_tag) - 1]
+            if diff_base:
+                diff = self._docker_exec_git(
+                    "-c", "core.quotePath=false", "diff", "--name-only", "-z",
+                    "--diff-filter=d", diff_base, agent_tag,
+                )
+                if diff.returncode == 0:
+                    changed = [p for p in diff.stdout.split("\0") if p]
+                    _, committed_out = classify_capture_loss(
+                        changed, self.src_filter, snapshot_paths
+                    )
+
             sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
             sidecar.write_text(
                 json.dumps(
@@ -923,6 +957,13 @@ class E2EOrchestrator:
                         # even GT tests the agent deleted (absent from the tag
                         # tree) — and survives eval-side test_dirs drift.
                         "capture_filter": _capture_filter_config(self.src_filter),
+                        "uncommitted_lost_count": len(uncommitted_in),
+                        "uncommitted_lost_sample": uncommitted_in[:20],
+                        "uncommitted_outside_count": len(uncommitted_out),
+                        "uncommitted_outside_sample": uncommitted_out[:20],
+                        "committed_outside_count": len(committed_out),
+                        "committed_outside_sample": committed_out[:20],
+                        "outside_diff_base": diff_base,
                     },
                     indent=2,
                 )
@@ -931,6 +972,17 @@ class E2EOrchestrator:
                 logger.warning(
                     f"⚠️  snapshot capture integrity: {report.missing_count}/{report.expected_count} "
                     f"includable files of {agent_tag} missing from tar (sample: {report.missing_sample[:3]})"
+                )
+            if uncommitted_in or uncommitted_out:
+                logger.warning(
+                    f"⚠️  snapshot capture: {len(uncommitted_in) + len(uncommitted_out)} uncommitted "
+                    f"path(s) at capture of {agent_tag} — not in the snapshot "
+                    f"(in-scope: {uncommitted_in[:3]}, out-of-scope: {uncommitted_out[:3]})"
+                )
+            if committed_out:
+                logger.warning(
+                    f"⚠️  snapshot capture: {len(committed_out)} path(s) committed since {diff_base} "
+                    f"lie outside the capture scope and will never reach the snapshot: {committed_out[:3]}"
                 )
         except Exception as e:  # diagnostics must never break the pipeline
             logger.warning(f"snapshot capture integrity check failed: {e}")
@@ -1028,10 +1080,9 @@ class E2EOrchestrator:
         # Filter out test files and excluded files from snapshot
         self._filter_tar_archive(snapshot_file)
 
-        # Snapshot capture integrity (residue-prune spec, phase 1a capture side):
-        # the filtered tar should contain every snapshot-includable file of the
-        # agent tag tree; mass absence = files lost by the capture pipeline.
-        self._check_snapshot_capture_integrity(agent_tag, snapshot_file)
+        # Snapshot capture loss check (residue-prune spec §11.4-H): pipeline
+        # loss + uncommitted work + out-of-scope commits. Diagnostics only.
+        self._check_snapshot_capture_integrity(agent_tag, snapshot_file, snapshot_paths)
 
         # EARLY UNBLOCK MODE: If enabled, unlock dependent tasks immediately
         # after source extraction, without waiting for evaluation to complete.

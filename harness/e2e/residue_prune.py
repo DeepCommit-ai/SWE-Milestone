@@ -174,6 +174,72 @@ def normalize_tar_members(names: Iterable[str]) -> Set[str]:
     return normalized
 
 
+def parse_status_porcelain_z(out: str) -> List[str]:
+    """Parse `git status --porcelain -z` into candidate lost-work paths.
+
+    -z entries are `XY <path>NUL`; rename/copy entries (R/C in the status
+    pair) are followed by one extra NUL-terminated field holding the ORIGINAL
+    path, which is skipped. Deletions are dropped: a deleted-but-uncommitted
+    file is not lost work (the tar simply keeps the tagged version). Returns
+    the current path of every other dirty/untracked entry.
+    """
+    paths: List[str] = []
+    tokens = out.split("\0")
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if len(entry) < 4 or entry[2] != " ":
+            continue
+        xy, path = entry[:2], entry[3:]
+        if "R" in xy or "C" in xy:
+            i += 1  # skip the original-path field of a rename/copy
+        if xy == "!!" or "D" in xy:
+            continue
+        paths.append(path)
+    return paths
+
+
+def capture_scope_covered(path: str, snapshot_paths: Iterable[str]) -> bool:
+    """Is `path` inside the capture scope (the git-archive pathspecs)?
+
+    `snapshot_paths` entries are source directories (with or without a
+    trailing '/') or exact root build files (go.mod, Cargo.toml, ...).
+    """
+    for sp in snapshot_paths:
+        sp = sp.rstrip("/")
+        if sp and (path == sp or path.startswith(sp + "/")):
+            return True
+    return False
+
+
+def classify_capture_loss(
+    paths: Iterable[str],
+    src_filter: SrcFileFilter,
+    snapshot_paths: Iterable[str],
+) -> "tuple[List[str], List[str]]":
+    """Split candidate lost paths into (in_scope, out_of_scope) loss buckets.
+
+    - in_scope: covered by the capture pathspecs — this work belongs in the
+      tar and is not there (uncommitted case).
+    - out_of_scope: not covered by any pathspec — work that can NEVER reach
+      the tar regardless of committing (wrong location, spec §11.4-H).
+    Test/excluded paths are dropped from both buckets: their absence from the
+    snapshot is by-design filtering, not loss.
+    """
+    in_scope: List[str] = []
+    out_of_scope: List[str] = []
+    sps = [sp for sp in snapshot_paths if sp]
+    for p in paths:
+        if src_filter.is_test_file(p) or src_filter.is_excluded(p):
+            continue
+        if capture_scope_covered(p, sps):
+            in_scope.append(p)
+        else:
+            out_of_scope.append(p)
+    return sorted(in_scope), sorted(out_of_scope)
+
+
 def is_prunable(
     path: str,
     src_filter: SrcFileFilter,

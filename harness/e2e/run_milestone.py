@@ -27,7 +27,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import yaml
 
@@ -40,7 +40,9 @@ from harness.e2e.log_parser import get_parser, TrialStats
 from harness.e2e.residue_prune import (
     capture_filter_config as _capture_filter_config,
     check_snapshot_integrity,
+    classify_capture_loss,
     normalize_tar_members,
+    parse_status_porcelain_z,
 )
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
@@ -1092,37 +1094,57 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} test/excluded files")
 
-        # Snapshot capture integrity (residue-prune spec, phase 1a capture side):
-        # diagnostics only — sidecar JSON + warning, never breaks extraction.
+        # Snapshot capture loss check (residue-prune spec §11.4-H): pipeline
+        # loss + uncommitted work + out-of-scope commits. Diagnostics only —
+        # sidecar JSON + warning, never breaks extraction. The START tag does
+        # not exist in the agent container (tags stripped at setup, anti-leak);
+        # single-milestone runs have no previous submission either, so the
+        # out-of-scope channel usually records diff_base=null here.
         try:
-            res = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    "--user",
-                    "fakeroot",
-                    "-e",
-                    "HOME=/home/fakeroot",
-                    "-w",
-                    "/testbed",
-                    self.container_name,
-                    "git",
-                    "-c",
-                    "core.quotePath=false",
-                    "ls-tree",
-                    "-r",
-                    "-z",
-                    "--name-only",
-                    tag_name,
-                ],
-                capture_output=True,
-                text=True,
+            res = self.container_setup.docker_exec_git(
+                "-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only", tag_name
             )
             if res.returncode == 0:
                 tag_files = {p for p in res.stdout.split("\0") if p}
                 with tarfile.open(snapshot_path) as tf:
                     tar_files = normalize_tar_members(tf.getnames())
                 report = check_snapshot_integrity(tag_files, tar_files, self.src_filter)
+
+                # Uncommitted work at capture time: absent from BOTH the tag
+                # tree and the tar, invisible to the ls-tree channel above.
+                uncommitted_in: List[str] = []
+                uncommitted_out: List[str] = []
+                status = self.container_setup.docker_exec_git(
+                    "-c", "core.quotePath=false", "status", "--porcelain", "-z"
+                )
+                if status.returncode == 0:
+                    dirty = parse_status_porcelain_z(status.stdout)
+                    uncommitted_in, uncommitted_out = classify_capture_loss(
+                        dirty, self.src_filter, snapshot_paths
+                    )
+
+                # Committed outside the capture scope since the previous
+                # submission (--diff-filter=d: deletions are not lost work).
+                committed_out: List[str] = []
+                diff_base: Optional[str] = None
+                tags_res = self.container_setup.docker_exec_git(
+                    "tag", "-l", "agent-impl-*", "--sort=creatordate"
+                )
+                if tags_res.returncode == 0:
+                    tags = [t for t in tags_res.stdout.splitlines() if t.strip()]
+                    if tag_name in tags and tags.index(tag_name) > 0:
+                        diff_base = tags[tags.index(tag_name) - 1]
+                if diff_base:
+                    diff = self.container_setup.docker_exec_git(
+                        "-c", "core.quotePath=false", "diff", "--name-only", "-z",
+                        "--diff-filter=d", diff_base, tag_name,
+                    )
+                    if diff.returncode == 0:
+                        changed = [p for p in diff.stdout.split("\0") if p]
+                        _, committed_out = classify_capture_loss(
+                            changed, self.src_filter, snapshot_paths
+                        )
+
                 sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
                 sidecar.write_text(
                     json.dumps(
@@ -1133,6 +1155,13 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                             "missing_count": report.missing_count,
                             "missing_sample": report.missing_sample,
                             "capture_filter": _capture_filter_config(self.src_filter),
+                            "uncommitted_lost_count": len(uncommitted_in),
+                            "uncommitted_lost_sample": uncommitted_in[:20],
+                            "uncommitted_outside_count": len(uncommitted_out),
+                            "uncommitted_outside_sample": uncommitted_out[:20],
+                            "committed_outside_count": len(committed_out),
+                            "committed_outside_sample": committed_out[:20],
+                            "outside_diff_base": diff_base,
                         },
                         indent=2,
                     )
@@ -1141,6 +1170,17 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                     logger.warning(
                         f"⚠️  snapshot capture integrity: {report.missing_count}/{report.expected_count} "
                         f"includable files of {tag_name} missing from tar"
+                    )
+                if uncommitted_in or uncommitted_out:
+                    logger.warning(
+                        f"⚠️  snapshot capture: {len(uncommitted_in) + len(uncommitted_out)} uncommitted "
+                        f"path(s) at capture of {tag_name} — not in the snapshot "
+                        f"(in-scope: {uncommitted_in[:3]}, out-of-scope: {uncommitted_out[:3]})"
+                    )
+                if committed_out:
+                    logger.warning(
+                        f"⚠️  snapshot capture: {len(committed_out)} path(s) committed since {diff_base} "
+                        f"lie outside the capture scope and will never reach the snapshot: {committed_out[:3]}"
                     )
         except Exception as e:  # diagnostics must never break the pipeline
             logger.warning(f"snapshot capture integrity check failed: {e}")
@@ -1165,6 +1205,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             return 0
 
         filtered_count = 0
+        non_regular: List[str] = []
         temp_path = tar_path.with_suffix(".filtered.tar")
 
         with tarfile.open(tar_path, "r") as src:
@@ -1180,7 +1221,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                     # the path filter and replace the GT test at eval time.
                     if not member.isfile():
                         filtered_count += 1
-                        logger.debug(f"Dropped non-regular member: {member.name} (type={member.type!r})")
+                        non_regular.append(member.name)
                         continue
 
                     # Check if file should be included in snapshot
@@ -1195,6 +1236,13 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
 
         # Replace original with filtered
         temp_path.replace(tar_path)
+        if non_regular:
+            # Never silent: a range legitimately relying on symlinks would
+            # otherwise lose them without a trace (§11 decision 2026-07-11).
+            logger.warning(
+                f"⚠️  Dropped {len(non_regular)} non-regular tar member(s) "
+                f"(symlink/hardlink/device) from snapshot: {non_regular[:5]}"
+            )
         return filtered_count
 
     def _get_existing_workdir_dirs(self) -> list[str]:
