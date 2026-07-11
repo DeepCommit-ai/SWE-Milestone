@@ -52,6 +52,7 @@ from harness.utils.rust_test_filter import (
 from harness.utils.src_filter import SrcFileFilter
 from harness.utils.test_id_normalizer import TestIdNormalizer
 from harness.test_runner.core.milestone_attempt import run_single_state_tests
+from harness.test_runner.core.test_executor import detect_infrastructure_failure
 from harness.test_runner.core.report_parser import convert_to_summary
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,38 @@ def build_nodeid_map(test_ids: List[str], go_module: Optional[str] = None) -> Di
     return result
 
 
+def _scan_file_for_infrastructure_failure(
+    path: Path, chunk_bytes: int = 8_000_000, overlap: int = 4096
+) -> Optional[str]:
+    """Chunked full-file scan for infra-failure signatures (F-2a). Reports can
+    be tens of MB on one JSON line; the overlap catches boundary-straddling
+    matches without loading unbounded files into memory."""
+    tail = ""
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_bytes)
+                if not chunk:
+                    return None
+                text = tail + chunk.decode("utf-8", errors="replace")
+                sig = detect_infrastructure_failure(text)
+                if sig:
+                    return sig
+                tail = text[-overlap:]
+    except OSError:
+        return None
+
+
+class InfrastructureFailureError(RuntimeError):
+    """The evaluation environment (docker/testcontainers/...) broke the test
+    run — the recorded failures are not the agent's (F-2a).
+
+    Raised only AFTER the flagged evaluation_result.json is persisted, so the
+    orchestrator's transient-retry loop re-runs the evaluation; exhausted
+    retries leave the flagged JSON + evaluation_error.log behind and the
+    result stays scoring_untrusted."""
+
+
 @dataclass
 class EvaluationResult:
     """Result of patch evaluation."""
@@ -216,13 +249,20 @@ class EvaluationResult:
     snapshot_integrity_ok: Optional[bool] = None  # None = check not run
     snapshot_missing_count: int = 0
     residue_prune_skipped_reason: str = ""  # "", ls-tree-failed, snapshot-integrity-failed, safety-abort, tar-unreadable, config-invalid
+    # F-2a: first matched infrastructure-failure signature ("" = none detected).
+    # Set when test output shows the environment (docker/testcontainers/...)
+    # broke the run — these failures are not the agent's.
+    infrastructure_failure: str = ""
 
     @property
     def scoring_untrusted(self) -> bool:
-        """True when residue prune was requested but did not complete, so the
-        additive overlay may have resurrected the GT solution. Any resolution
-        recompute (orchestrator/run_milestone) MUST AND this in so it cannot
-        flip resolved back to True (codex F1)."""
+        """True when this result must never be scored as-is: residue prune was
+        requested but did not complete (additive overlay may have resurrected
+        the GT solution), or an infrastructure failure poisoned the test run
+        (F-2a). Any resolution recompute (orchestrator/run_milestone) MUST AND
+        this in so it cannot flip resolved back to True (codex F1)."""
+        if self.infrastructure_failure:
+            return True
         return self.residue_prune_skipped_reason in FAIL_CLOSED_SKIP_REASONS
 
     def to_dict(self) -> Dict[str, Any]:
@@ -271,6 +311,7 @@ class EvaluationResult:
             "ok": self.snapshot_integrity_ok,
             "missing_count": self.snapshot_missing_count,
         }
+        result["infrastructure_failure"] = self.infrastructure_failure
         return result
 
     def summary(self) -> str:
@@ -1502,6 +1543,17 @@ class PatchEvaluator:
         with open(merged_path) as f:
             return json.load(f)
 
+    def _scan_infrastructure_failure(self) -> str:
+        """Scan raw eval output files (merged report + per-mode tee logs) for
+        known infrastructure-failure signatures (F-2a)."""
+        for path in sorted(self.output_dir.glob("eval*")):
+            if not path.is_file():
+                continue
+            sig = _scan_file_for_infrastructure_failure(path)
+            if sig:
+                return sig
+        return ""
+
     def compare_results(
         self,
         baseline_classification: Dict[str, Any],
@@ -1888,6 +1940,14 @@ class PatchEvaluator:
             # 5. Compare results
             print("Comparing results against baseline...")
             evaluation = self.compare_results(baseline, test_results, patch_exists=True, patch_applied=True)
+
+            # 6. F-2a: scan raw eval output for known infrastructure-failure
+            # signatures; a hit locks scoring_untrusted (fail-closed) and the
+            # orchestrator turns it into a retryable error.
+            infra_sig = self._scan_infrastructure_failure()
+            if infra_sig:
+                evaluation.infrastructure_failure = infra_sig
+                print(f"🚫 Infrastructure failure detected in test output: {infra_sig}")
 
             return evaluation
 

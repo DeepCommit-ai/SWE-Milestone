@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from harness.e2e.dag import DAGManager
-from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
+from harness.e2e.evaluator import InfrastructureFailureError, PatchEvaluator, EvaluationResult
 from harness.e2e.config import E2EConfig
 from harness.e2e.container_setup import ContainerSetup
 from harness.e2e.residue_prune import (
@@ -27,6 +27,19 @@ from harness.utils.src_filter import SrcFileFilter
 from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
 
 logger = logging.getLogger("e2e.orchestrator")
+
+
+def _is_transient_error(e: BaseException) -> bool:
+    """Errors worth an evaluation retry: environment/infrastructure trouble,
+    not deterministic evaluator bugs. InfrastructureFailureError (F-2a) is
+    transient by definition — the runtime may recover between attempts."""
+    return (
+        isinstance(e, InfrastructureFailureError)
+        or "Broken pipe" in str(e)
+        or "Connection reset" in str(e)
+        or "Temporary failure" in str(e)
+        or isinstance(e, (OSError, IOError, BrokenPipeError))
+    )
 
 
 def _run_evaluation_once(
@@ -56,6 +69,15 @@ def _run_evaluation_once(
         import json
 
         json.dump(eval_res.to_dict(), f, indent=2)
+
+    # F-2a: an infrastructure failure poisoned the test run. The flagged JSON
+    # is already on disk as evidence; raise so the transient-retry loop in
+    # run_evaluation_task re-runs the evaluation instead of scoring it.
+    if eval_res.infrastructure_failure:
+        raise InfrastructureFailureError(
+            f"{milestone_id}: infrastructure failure during evaluation: "
+            f"{eval_res.infrastructure_failure}"
+        )
 
     # Use config thresholds to determine resolution
     # Calculate rates for each test category
@@ -89,8 +111,10 @@ def _run_evaluation_once(
     )
     if eval_res.scoring_untrusted:
         logger.warning(
-            f"🚫 {milestone_id}: residue prune did not complete "
-            f"({eval_res.residue_prune_skipped_reason}) — resolution locked False (fail-closed)"
+            f"🚫 {milestone_id}: scoring untrusted "
+            f"(residue: {eval_res.residue_prune_skipped_reason or 'ok'}, "
+            f"infra: {eval_res.infrastructure_failure or 'none'}) "
+            f"— resolution locked False (fail-closed)"
         )
 
     # Actual test result: did tests actually pass 100%? (ignoring thresholds)
@@ -167,12 +191,7 @@ def run_evaluation_task(
             print(f"   Traceback:\n{last_traceback}")
 
             # Check if this is a transient error worth retrying
-            is_transient = (
-                "Broken pipe" in str(e)
-                or "Connection reset" in str(e)
-                or "Temporary failure" in str(e)
-                or isinstance(e, (OSError, IOError, BrokenPipeError))
-            )
+            is_transient = _is_transient_error(e)
 
             if attempt < max_retries and is_transient:
                 print(f"   🔄 Retrying in 5 seconds (transient error detected)...")

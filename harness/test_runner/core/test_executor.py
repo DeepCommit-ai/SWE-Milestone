@@ -115,6 +115,37 @@ def build_test_cmd(
     return get_default_test_cmd(workers, timeout, output_file, framework)
 
 
+# Known infrastructure-failure signatures (F-2a). Deliberately narrow: this
+# deterministic layer only carries CONFIRMED mechanical signatures; the
+# general sweep lives in docs/post_verify/SKILL.md and promotes new ones here.
+INFRA_FAILURE_PATTERNS = [
+    re.compile(r"Could not find a working container runtime strategy"),  # testcontainers
+    re.compile(r"Cannot connect to the Docker daemon"),
+    re.compile(r"error during connect: .*docker", re.IGNORECASE),
+    re.compile(r"dial unix /var/run/docker\.sock"),
+    re.compile(r"docker: (?:command )?not found"),
+]
+
+
+def detect_infrastructure_failure(text: str, *, max_chars: int = 300) -> Optional[str]:
+    """
+    Return a snippet around the first known infrastructure-failure signature,
+    or None. A hit means the evaluation environment (not the agent's code)
+    broke the test run — callers mark scoring untrusted and retry.
+
+    Reports are often one giant JSON line, so the snippet is a window around
+    the match itself, never the head of the containing line.
+    """
+    first: Optional[re.Match] = None
+    for pattern in INFRA_FAILURE_PATTERNS:
+        m = pattern.search(text)
+        if m and (first is None or m.start() < first.start()):
+            first = m
+    if first is None:
+        return None
+    return text[first.start() : first.start() + max_chars].splitlines()[0].strip()
+
+
 def run_test(
     runner: DockerRunner,
     *,
