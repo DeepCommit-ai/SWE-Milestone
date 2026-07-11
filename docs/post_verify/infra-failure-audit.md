@@ -1,8 +1,3 @@
----
-name: post-verify-infra-audit
-description: Audit completed trial evaluations for infrastructure-contaminated failures (any language, any milestone, any report format) — cross-arm cluster analysis plus signature mining. Confirmed mechanical signatures feed back into the deterministic harness detector.
----
-
 # Post-Verify — Infrastructure Failure Audit
 
 Catch evaluation failures caused by the **environment** (container runtime

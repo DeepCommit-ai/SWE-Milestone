@@ -1,5 +1,5 @@
 """Tests for F-2a: infrastructure-failure detection, fail-closed scoring,
-and transient-retry classification (see docs/post_verify/SKILL.md — this is
+and transient-retry classification (see docs/post_verify/infra-failure-audit.md — this is
 the deterministic layer; the skill sweep feeds new signatures into it).
 """
 

@@ -117,7 +117,7 @@ def build_test_cmd(
 
 # Known infrastructure-failure signatures (F-2a). Deliberately narrow: this
 # deterministic layer only carries CONFIRMED mechanical signatures; the
-# general sweep lives in docs/post_verify/SKILL.md and promotes new ones here.
+# general sweep lives in docs/post_verify/infra-failure-audit.md and promotes new ones here.
 INFRA_FAILURE_PATTERNS = [
     re.compile(r"Could not find a working container runtime strategy"),  # testcontainers
     re.compile(r"Cannot connect to the Docker daemon"),
