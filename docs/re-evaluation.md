@@ -61,6 +61,55 @@ Per test id, between primary and reeval `evaluation_result.json`:
 Store the comparison output next to `EXPECTATION.md`. Any undeclared delta →
 stop and investigate; nothing is promoted.
 
+## Previewing score impact with monitor.sh
+
+`scripts/monitor.sh` wraps `harness.e2e.collect_results --multi-repo`; because
+`reeval/` mirrors the primary layout, it can read either root directly:
+
+```
+./scripts/monitor.sh <arm> --data-root <EvoClaw-log>        --detail <repo>   # current scores
+./scripts/monitor.sh <arm> --data-root <EvoClaw-log>/reeval --detail <repo>   # re-eval scores
+```
+
+Read the two `--detail` tables side by side for per-milestone deltas
+(status / F2P / N2P / P2P / score). Caveats:
+
+- In the reeval root only re-evaluated cells have data; every other milestone
+  shows "Not run", so **repo-level aggregates are meaningless there** — only
+  per-milestone rows are comparable before promotion.
+- Score columns: `score_1000` = V2 (`(F2P+N2P)_ach/req × max(0, 1 −
+  P2P_missed/min(1000, P2P_req))`), `score_full` = V1 (ratio × P2P ratio),
+  `score_reliable` = PR-F1 where broken = P2P failed+missing. Repo score =
+  mean over graded milestones × 100. `resolve_pct` counts the `resolved` bit.
+- `collect_results` prefers `evaluation_result_filtered.json` over
+  `evaluation_result.json` per cell (`--non-filter` disables).
+
+## Promotion procedure (explicit, human-approved; per campaign)
+
+Promotion = replacing evaluator *outputs* in the primary record after the
+mechanical comparison passed. Never enabled by default; each campaign is
+promoted once, by hand, after user sign-off.
+
+1. **Back up, append-only**: move the cell's current evaluator outputs
+   (`evaluation_result.json`, `evaluation_result_filtered.json` if present,
+   `artifacts/`, `artifacts.tar.gz`, `feedback_report.md`) to
+   `reeval/promotion_backup/<range>/<arm>/<milestone>/`. Never delete.
+2. **Copy in the re-eval outputs** from the reeval mirror path. **Never touch
+   `source_snapshot.tar`** (frozen agent artifact — input, not output).
+3. **Sync `summary.json`**: update `results[<milestone>]` (`eval_status`,
+   `test_summary`, keep `attempt`) to match the new evaluation_result.
+   Required because `collect_results.load_e2e_results` only replaces a
+   summary-sourced `test_summary` when it reads a *filtered* file; with plain
+   `evaluation_result.json` it corrects `eval_status` but keeps the stale
+   summary counts.
+   *Exception — filter_list-only campaigns (e.g. M021):* dropping the new
+   `evaluation_result_filtered.json` next to the untouched original is
+   sufficient; the filtered-preference path replaces `test_summary` on its
+   own, and the original file staying in place is the audit trail.
+4. **Record the flip**: run the two monitor commands above before/after,
+   store the diff as `SCORE_DELTA_<campaign>.md` next to the campaign's
+   EXPECTATION.md, then regenerate any downstream aggregates.
+
 ## Current application: D-1 (nushell)
 
 | Item | Value |
