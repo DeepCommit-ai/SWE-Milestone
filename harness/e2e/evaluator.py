@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import tarfile
@@ -44,6 +45,7 @@ from harness.e2e.residue_prune import (
     normalize_extensions,
     normalize_keep_list,
     normalize_tar_members,
+    resolve_prune_enablement,
 )
 from harness.utils.rust_test_filter import (
     get_rust_files_from_tar,
@@ -53,6 +55,7 @@ from harness.utils.src_filter import SrcFileFilter
 from harness.utils.test_id_normalizer import TestIdNormalizer
 from harness.test_runner.core.milestone_attempt import run_single_state_tests
 from harness.test_runner.core.test_executor import detect_infrastructure_failure
+from harness.test_runner.core.types import MilestoneTestConfig
 from harness.test_runner.core.report_parser import convert_to_summary
 
 logger = logging.getLogger(__name__)
@@ -169,6 +172,30 @@ def build_nodeid_map(test_ids: List[str], go_module: Optional[str] = None) -> Di
         normalized = normalize_ginkgo_nodeid(test_id, go_module)
         result[normalized] = test_id
     return result
+
+
+def _find_free_port() -> int:
+    """Ask the OS for a free TCP port. Host-network evaluations get a unique
+    webServer port per run via SWE_MILESTONE_EVAL_PORT (fixed ports would make
+    concurrent evals mutually exclusive and collide with foreign services)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _milestone_requires_docker_socket(workspace_root: Path, milestone_id: str) -> bool:
+    """True when the milestone's test_config declares requires_docker_socket
+    (testcontainers e2e tests). Same flag the classification runner consumes
+    (run_milestone_tests) — the e2e evaluator historically ignored it, which
+    is the root cause of the F-2a incident class."""
+    config_path = workspace_root / "dockerfiles" / milestone_id / "test_config.json"
+    if not config_path.exists():
+        return False
+    try:
+        config = MilestoneTestConfig.from_file(config_path, include_original=False)
+        return config.requires_docker_socket_any()
+    except Exception:
+        return False
 
 
 def _scan_file_for_infrastructure_failure(
@@ -710,9 +737,20 @@ class PatchEvaluator:
                 # docker_cpus: number of CPUs for Docker container (default: 16)
                 self.docker_cpus = metadata.get("docker_cpus", 16)
                 # Residue prune (docs/residue-prune-spec.md): metadata carries the
-                # per-range facts — enablement flag + keep-list; the mechanism
-                # lives here. Filter reuses the same fields as the snapshot side.
-                prune_requested = bool(metadata.get("residue_prune", False))
+                # per-range facts — keep-list, optional extension pin, optional
+                # enablement override; the mechanism lives here. DEFAULT-ON
+                # (2026-07-11 通用化): an undeclared flag enables pruning for any
+                # dataset whose metadata defines the src/test split; legacy
+                # metadata without the split stays additive without penalty.
+                _has_partition = bool(metadata.get("repo_src_dirs") and metadata.get("test_dirs"))
+                prune_requested, _enable_reason = resolve_prune_enablement(
+                    metadata.get("residue_prune"), _has_partition
+                )
+                if _enable_reason == "legacy-no-partition":
+                    print(
+                        "ℹ️  residue prune: metadata lacks repo_src_dirs/test_dirs — "
+                        "additive overlay retained (legacy dataset, pruning undefined)"
+                    )
                 self.prune_keep_list = normalize_keep_list(metadata.get("prune_keep_list", []))
                 # F3/F6: per-range language scope. Metadata may pin prune_extensions
                 # (phase 1 navidrome -> [".go"] so its ui/src TS is never pruned);
@@ -796,6 +834,13 @@ class PatchEvaluator:
             image_base = local_ref(self.repo_name, milestone_id)
         self.docker_image = resolve_image(image_base)
 
+        # F-2a: testcontainers milestones need the host Docker socket inside
+        # the eval container — consume the same test_config flag as the
+        # classification runner instead of relying on ambient host luck.
+        self.needs_docker_socket = _milestone_requires_docker_socket(self.workspace_root, milestone_id)
+        if self.needs_docker_socket:
+            print("🐳 requires_docker_socket: mounting host Docker socket (testcontainers parity)")
+
         # Docker container name: {repo_base}-{milestone_id}-{pid}-eval[-retry{N}]
         # Extract repo base name (e.g., "urllib3_urllib3_2.0.6_2.3.0" -> "urllib3")
         # Include process ID to avoid conflicts when running multiple evaluations in parallel
@@ -856,6 +901,27 @@ class PatchEvaluator:
             "nofile=65535:65535",
             "-v",
             f"{str(self.output_dir.resolve())}:/output",
+        ]
+        if self.needs_docker_socket:
+            # Parity with classification-time runs (run_milestone_tests):
+            # socket so testcontainers can spawn containers, host network so
+            # tests reach them, Ryuk disabled to avoid reaper connect issues.
+            # Each run also gets a unique webServer port (consumed by the
+            # milestone's apply_patches.sh hook) so host-network evals can run
+            # concurrently and survive foreign services squatting on 8080.
+            eval_port = _find_free_port()
+            print(f"🐳 SWE_MILESTONE_EVAL_PORT={eval_port}")
+            cmd += [
+                "-v",
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "--network",
+                "host",
+                "-e",
+                "TESTCONTAINERS_RYUK_DISABLED=true",
+                "-e",
+                f"SWE_MILESTONE_EVAL_PORT={eval_port}",
+            ]
+        cmd += [
             self.docker_image,
             "tail",
             "-f",
@@ -2069,6 +2135,21 @@ Example:
             none_to_pass_required=0,
             none_to_pass_achieved=0,
         )
+
+        # Fail-loud fields must survive the failure path too (phase 1a): the
+        # evaluator instance already holds the real prune/base facts for this
+        # run — a defaulted residue_prune block on a failed cell reads as
+        # "pruning never ran", which is exactly the silence 1a exists to end.
+        meta = evaluator._eval_meta
+        result.base_tag = meta["base_tag"]
+        result.fallback_triggered = meta["fallback_triggered"]
+        result.residue_prune_enabled = meta["residue_prune_enabled"]
+        result.pruned_files_count = meta["pruned_files_count"]
+        result.pruned_files = meta["pruned_files"]
+        result.keep_list_hits = meta["keep_list_hits"]
+        result.snapshot_integrity_ok = meta["snapshot_integrity_ok"]
+        result.snapshot_missing_count = meta["snapshot_missing_count"]
+        result.residue_prune_skipped_reason = meta["residue_prune_skipped_reason"]
 
         # Save failed result to file
         args.output.parent.mkdir(parents=True, exist_ok=True)

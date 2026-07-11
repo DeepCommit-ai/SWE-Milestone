@@ -96,6 +96,24 @@ def _mk_result(**overrides) -> EvaluationResult:
     return EvaluationResult(**kwargs)
 
 
+class TestMilestoneRequiresDockerSocket:
+    def test_flag_true(self, tmp_path):
+        from harness.e2e.evaluator import _milestone_requires_docker_socket
+
+        d = tmp_path / "dockerfiles" / "M1"
+        d.mkdir(parents=True)
+        (d / "test_config.json").write_text(
+            '[{"name": "default", "test_states": ["start", "end"],'
+            ' "test_cmd": "npx jest {output_file}", "requires_docker_socket": true}]'
+        )
+        assert _milestone_requires_docker_socket(tmp_path, "M1") is True
+
+    def test_absent_config_is_false(self, tmp_path):
+        from harness.e2e.evaluator import _milestone_requires_docker_socket
+
+        assert _milestone_requires_docker_socket(tmp_path, "M1") is False
+
+
 class TestScoringUntrusted:
     def test_default_result_is_trusted(self):
         assert _mk_result().scoring_untrusted is False
@@ -111,6 +129,70 @@ class TestScoringUntrusted:
     def test_to_dict_carries_infrastructure_failure(self):
         res = _mk_result(infrastructure_failure="sig-text")
         assert res.to_dict()["infrastructure_failure"] == "sig-text"
+
+
+VALID_REPORT = '{"tests": [{"nodeid": "t::a", "outcome": "passed"}], "summary": {"total": 1, "passed": 1, "failed": 0, "error": 0, "skipped": 0}}'
+
+
+class _TimeoutCapturingRunner:
+    def __init__(self, output_dir, files):
+        self._output_dir = output_dir
+        self._files = files
+        self.timeouts = []
+
+    def run(self, script, timeout=None, extra_volumes=None):
+        self.timeouts.append(timeout)
+        for name, content in self._files.items():
+            (self._output_dir / name).write_text(content)
+        return 0, "", ""
+
+
+def _two_mode_workspace(tmp_path, second_mode_extra=""):
+    ws = tmp_path / "ws"
+    cfg = ws / "dockerfiles" / "M1"
+    cfg.mkdir(parents=True)
+    (cfg / "test_config.json").write_text(
+        '[{"name": "default", "test_states": ["start", "end"],'
+        ' "test_cmd": "pytest {output_file}", "framework": "pytest"},'
+        ' {"name": "slow", "test_states": ["start", "end"],'
+        ' "test_cmd": "pytest {output_file}", "framework": "pytest"'
+        + second_mode_extra
+        + "}]"
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    return ws, out
+
+
+class TestModeRunTimeout:
+    def test_run_timeout_seconds_plumbs_through_to_runner(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import run_single_state_tests
+
+        ws, out = _two_mode_workspace(tmp_path, ', "run_timeout_seconds": 4321')
+        runner = _TimeoutCapturingRunner(
+            out, {"eval_default.json": VALID_REPORT, "eval_slow.json": VALID_REPORT}
+        )
+        run_single_state_tests(
+            runner, workspace_root=ws, milestone_id="M1", output_dir=out, workers=1, timeout=60
+        )
+        assert runner.timeouts == [1800, 4321]
+
+
+class TestDroppedReportIsLoud:
+    def test_unparseable_mode_report_prints_alarm(self, tmp_path, capsys):
+        from harness.test_runner.core.milestone_attempt import run_single_state_tests
+
+        ws, out = _two_mode_workspace(tmp_path)
+        runner = _TimeoutCapturingRunner(
+            out, {"eval_default.json": VALID_REPORT, "eval_slow.json": '{"trunca'}
+        )
+        run_single_state_tests(
+            runner, workspace_root=ws, milestone_id="M1", output_dir=out, workers=1, timeout=60
+        )
+        captured = capsys.readouterr().out
+        assert "🚨" in captured
+        assert "eval_slow.json" in captured
+        assert "test universe shrank" in captured
 
 
 class TestTransientClassification:
