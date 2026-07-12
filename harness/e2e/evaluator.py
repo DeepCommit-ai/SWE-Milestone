@@ -183,6 +183,87 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _resolve_test_framework(
+    repo_config: dict,
+    workspace_root: Path,
+    milestone_id: str,
+    baseline_ids: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Resolve the test framework for TestIdNormalizer, robustly.
+
+    `repo_config["test_framework"]` (from config/<repo>.yaml) is authoritative
+    but that file lives beside the *canonical* data root; a derived/de-pinned
+    workspace-root may not have it, in which case the raw value is None and Go
+    random-subtest normalization silently no-ops (the 2026-07-12 go-zero
+    incident: N2P required 17 -> 222). So:
+
+    1. explicit config value wins;
+    2. else infer from the milestone's own test_config command text (always
+       shipped with the milestone, unlike the repo config);
+    3. else, if the baseline clearly contains go_test random subtests
+       (`Parent/<rand>` that the go_test normalizer would collapse) yet we did
+       NOT resolve go_test, fail loudly instead of scoring wrong.
+    """
+    explicit = repo_config.get("test_framework")
+    if explicit:
+        return explicit
+
+    inferred = _infer_framework_from_test_config(workspace_root, milestone_id)
+
+    if inferred != "go_test" and baseline_ids:
+        probe = TestIdNormalizer(framework="go_test")
+        collapsible = sum(1 for t in baseline_ids if probe.normalize(t) != t)
+        if collapsible >= 5:
+            raise ValueError(
+                f"{milestone_id}: baseline has {collapsible} go_test random-subtest "
+                f"IDs but test_framework resolved to {inferred!r} — normalization "
+                f"would silently no-op and scores would crater (cf. go-zero "
+                f"17->222 incident). Ensure config/<repo>.yaml is reachable from "
+                f"workspace-root, or set framework in the milestone test_config."
+            )
+    return inferred
+
+
+def _infer_framework_from_test_config(workspace_root: Path, milestone_id: str) -> Optional[str]:
+    """Infer framework from the milestone test_config command text. Returns
+    None (not a default) when nothing matches, so the caller's fail-loud guard
+    can distinguish 'inferred something' from 'could not tell'."""
+    config_path = workspace_root / "dockerfiles" / milestone_id / "test_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            modes = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(modes, list):
+        return None
+    for mode in modes:
+        if isinstance(mode, dict) and mode.get("framework"):
+            return mode["framework"]
+    joined = "\n".join(
+        str(m.get("test_cmd", "")) for m in modes if isinstance(m, dict)
+    ).lower()
+    # Order matters: match the specific tool before the generic 'test' word.
+    if "cargo test" in joined:
+        return "cargo"
+    if "ginkgo" in joined:
+        return "ginkgo"
+    if "go test" in joined:
+        return "go_test"
+    if "mvn " in joined or "mvnw" in joined:
+        return "maven"
+    if "gradle" in joined:
+        return "gradle"
+    if "vitest" in joined:
+        return "vitest"
+    if "jest" in joined:
+        return "jest"
+    if "pytest" in joined or "python -m pytest" in joined:
+        return "pytest"
+    return None
+
+
 def _milestone_requires_docker_socket(workspace_root: Path, milestone_id: str) -> bool:
     """True when the milestone's test_config declares requires_docker_socket
     (testcontainers e2e tests). Same flag the classification runner consumes
@@ -1642,9 +1723,25 @@ class PatchEvaluator:
         Returns:
             EvaluationResult with detailed comparison
         """
-        # Determine test framework from repo config for test ID normalization
-        # This handles Go fuzz/parameterized tests with random subtest IDs
-        test_framework = self.repo_config.get("test_framework")
+        # Determine test framework for test ID normalization (Go fuzz/
+        # parameterized tests with random subtest IDs). Robust: explicit config
+        # wins, else infer from the milestone test_config, else fail loud if the
+        # baseline clearly needs go_test normalization but we couldn't resolve it
+        # (guards the 2026-07-12 config-missing incident).
+        _bc = (
+            baseline_classification.get("stable_classification")
+            or baseline_classification.get("classification")
+            or baseline_classification
+        )
+        _baseline_ids: Optional[List[str]] = None
+        if isinstance(_bc, dict):
+            _baseline_ids = []
+            for _cat in ("none_to_pass", "fail_to_pass", "pass_to_pass"):
+                for _t in _bc.get(_cat, []) or []:
+                    _baseline_ids.append(_t if isinstance(_t, str) else _t.get("test_id", ""))
+        test_framework = _resolve_test_framework(
+            self.repo_config, self.workspace_root, self.milestone_id, _baseline_ids
+        )
         test_id_normalizer = TestIdNormalizer(framework=test_framework, enable_normalization=True)
 
         def load_summary_payload(results: Dict[str, Any]) -> Dict[str, Any]:
