@@ -24,10 +24,13 @@ verified**.
 | 2 | `all predefined address pools have been fully subnetted` (×240/report) | docker bridge subnet pool exhausted by concurrency + **leaked networks** (RYUK disabled ⇒ killed evals never free their nets) | same — inside the poisoned pool; hit cells for *hours* outside the load spike | whole-time-range sweep + per-test final-outcome |
 | 3 | N2P `required` explodes (go-zero M026: 17→222), score craters | `--workspace-root` = derived tree with no sibling `config/` → `test_framework=None` → `TestIdNormalizer` no-ops → Go random subtests stop collapsing to parent | numbers self-consistent across arms; "env drift" was a plausible story | preflight: check `required` vs primary on one random-subtest milestone |
 
+**#3 now hardened** (`4e09cae`): `_resolve_test_framework` infers framework from the milestone test_config and fails loud when a baseline needs go_test normalization but it didn't resolve. Cross-repo normalizer drift (the deeper cause) tracked in DeepCommit-Env#30.
+
 The pattern behind all three: **an environment/config gap makes the evaluator
 emit a well-formed but wrong result, with no error raised.** Backlog for each:
 the evaluator should fail-loud instead of silently degrading (webServer/pool →
-`INFRA_FAILURE_PATTERNS`, done; `test_framework` unset → still silent).
+`INFRA_FAILURE_PATTERNS`, done; `test_framework` unset → infer + fail-loud,
+done `4e09cae`).
 
 ## Preflight (before launching the batch)
 
