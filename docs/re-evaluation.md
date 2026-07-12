@@ -84,6 +84,22 @@ Read the two `--detail` tables side by side for per-milestone deltas
 - `collect_results` prefers `evaluation_result_filtered.json` over
   `evaluation_result.json` per cell (`--non-filter` disables).
 
+## Workspace-root must carry `config/` (learned 2026-07-12)
+
+`load_repo_config` reads `test_framework` from
+`<workspace_root>/../config/<repo>.yaml`. If you point `--workspace-root` at a
+scratch/derived workspace (e.g. a de-pinned prune tree) that lacks a sibling
+`config/`, `test_framework` silently becomes `None` and `TestIdNormalizer`
+no-ops — Go fuzz/parameterized subtests (`TestX/<rand>`) stop collapsing to
+their parent, N2P `required` explodes (go-zero M026: 17 → 222) and scores
+crater. The failure is silent (no error, plausible-looking numbers), so it
+survives direction-only comparison. Guard: before re-evaluating, confirm the
+workspace has `config/<repo>.yaml` reachable (symlink the canonical
+`EvoClaw-data/config` if using a derived tree), and spot-check one
+random-subtest milestone's `none_to_pass_required` against the primary record.
+Backlog: evaluator should fail-loud (or fall back to metadata) when
+`test_framework` is unset for a repo whose baseline contains normalized IDs.
+
 ## Promotion procedure (explicit, human-approved; per campaign)
 
 Promotion = replacing evaluator *outputs* in the primary record after the
