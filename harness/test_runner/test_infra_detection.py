@@ -39,6 +39,17 @@ class TestDetectInfrastructureFailure:
     def test_clean_output_returns_none(self):
         assert detect_infrastructure_failure(CLEAN_OUTPUT) is None
 
+    def test_playwright_webserver_startup_timeout(self):
+        # 2026-07-11 element full batch: 52 concurrent evals pushed host load
+        # past 380; `npx serve` couldn't come up within playwright's 30s
+        # webServer window → identical error across 31 cells. Environment
+        # (load/port), not agent code — agent patches never touch the config.
+        out = ('{"errors": [{"message": "Error: Timed out waiting 30000ms '
+               'from config.webServer."}], "stats": {"expected": 0}}')
+        sig = detect_infrastructure_failure(out)
+        assert sig is not None
+        assert "config.webServer" in sig
+
     def test_signature_inside_giant_single_line_json(self):
         # Real reports are often one giant JSON line; the returned snippet
         # must contain the matched signature, not the start of the line.

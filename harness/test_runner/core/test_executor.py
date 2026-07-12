@@ -124,6 +124,10 @@ INFRA_FAILURE_PATTERNS = [
     re.compile(r"error during connect: .*docker", re.IGNORECASE),
     re.compile(r"dial unix /var/run/docker\.sock"),
     re.compile(r"docker: (?:command )?not found"),
+    # playwright's webServer failing to come up is an environment condition
+    # (host load / port); agent patches are src/-only and cannot reach the
+    # playwright config (2026-07-11 element concurrent-batch case).
+    re.compile(r"Timed out waiting \d+ms from config\.webServer"),
 ]
 
 
