@@ -50,6 +50,17 @@ class TestDetectInfrastructureFailure:
         assert sig is not None
         assert "config.webServer" in sig
 
+    def test_docker_address_pool_exhausted(self):
+        # 2026-07-12 element last6: e2e ran during the prune-line load peak;
+        # 140+ concurrent containers exhausted the docker bridge subnet pool,
+        # failing every testcontainers-backed test with this exact text
+        # (240 identical hits in one report). Pure host-resource condition.
+        out = ('{"error": {"message": "Error: (HTTP code 400) unexpected - '
+               'all predefined address pools have been fully subnetted "}}')
+        sig = detect_infrastructure_failure(out)
+        assert sig is not None
+        assert "address pools" in sig
+
     def test_signature_inside_giant_single_line_json(self):
         # Real reports are often one giant JSON line; the returned snippet
         # must contain the matched signature, not the start of the line.

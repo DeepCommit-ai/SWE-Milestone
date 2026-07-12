@@ -128,6 +128,9 @@ INFRA_FAILURE_PATTERNS = [
     # (host load / port); agent patches are src/-only and cannot reach the
     # playwright config (2026-07-11 element concurrent-batch case).
     re.compile(r"Timed out waiting \d+ms from config\.webServer"),
+    # docker bridge subnet pool exhausted by concurrent containers — every
+    # testcontainers-backed test fails with this exact text (2026-07-12 case).
+    re.compile(r"all predefined address pools have been fully subnetted"),
 ]
 
 
