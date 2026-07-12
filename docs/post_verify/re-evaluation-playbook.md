@@ -48,6 +48,14 @@ done `4e09cae`).
   Σ(containers × N) ≲ 1.5 × cores, **and** active docker networks < ~31
   (bridge pool limit). e2e/testcontainers batches are network-bound, not just
   CPU-bound (catalog #1, #2).
+- [ ] **Don't co-schedule CPU-dense and latency-sensitive batches** — a
+  `go test`/`cargo` fan-out (CPU-dense, bursty) running alongside a playwright
+  e2e batch (latency-sensitive: needs CPU promptly to start its webServer and
+  drive browsers) starves the latter to a crawl — observed a `yarn build`
+  taking 1.5 h at 6% CPU. Either run them in sequence, or `docker pause` the
+  e2e containers (SIGSTOP freezes progress AND the test timers — monotonic
+  clock, so no false timeout — and the in-container webServer freezes with
+  them) while the CPU-dense batch finishes, then `docker unpause`.
 - [ ] **EXPECTATION.md written** — declared (arm × milestone) scope + direction
   + data commit + image tag, per protocol.
 
