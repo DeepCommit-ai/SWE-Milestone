@@ -22,7 +22,14 @@ time window. Real incidents that all carried this fingerprint:
 - element-web: ~122 failures × 5 arms, one string
   ("Could not find a working container runtime strategy");
 - nushell G01: 23/23 archived eval logs byte-identical (cargo resolver);
-- nushell core_development.4: 17/17 byte-identical (version pin).
+- nushell core_development.4: 17/17 byte-identical (version pin);
+- element-web re-eval 2026-07-11: 31 cells, one string ("Timed out waiting
+  30000ms from config.webServer") — host-load storm at batch start;
+- element-web re-eval 2026-07-12: 51/53 cells, one string ("all predefined
+  address pools have been fully subnetted") — docker network pool exhausted
+  by concurrency **plus** leaked networks (TESTCONTAINERS_RYUK_DISABLED means
+  killed evaluations never release their networks; resource exhaustion
+  snowballs across later runs until leaks are pruned).
 
 Heuristic: cluster failures by normalized error text (strip paths, PIDs,
 timestamps, hashes). Any cluster spanning ≥3 arms, or covering ≥80% of one
@@ -38,6 +45,20 @@ arm's failures for a milestone, is an infrastructure suspect.
 - control probe: GT empty-overlay self-grade on the same image
   (see docs/re-evaluation.md) — if GT fails the same way, the agent is
   innocent by construction.
+
+## Re-evaluation trap (learned 2026-07-12)
+
+When a re-eval campaign *declares* a pool of tests that "may flip to real
+outcomes", an infrastructure failure inside that pool masquerades as a
+legitimate flip — direction-only comparison will bless it. Two rules:
+
+1. Sweep the **whole batch, whole time range** for signature clusters before
+   accepting any comparison; do not restrict the sweep to a known incident
+   window (the 2026-07-12 pool-exhaustion hit cells for hours outside the
+   observed load spike).
+2. "Report is large / suites > 0" is not health. playwright's retries can
+   absorb transient infra errors (text present, outcome passed — harmless),
+   so judge by **final-outcome failures carrying the signature**, per test.
 
 ## Procedure
 
