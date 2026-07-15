@@ -34,6 +34,15 @@ _FATAL_LINE_PATTERNS = [
     re.compile(r"Cannot find module"),  # node
 ]
 
+# Maven prints a generic ``[ERROR] COMPILATION ERROR`` banner before the
+# useful source diagnostic.  Recent javac versions can then emit a multi-line
+# annotation-processing warning whose continuation is also prefixed with
+# ``[ERROR]``.  Prefer a source-located compiler error anywhere in the output
+# before falling back to the first generic framework error.
+_SOURCE_LOCATED_FATAL_LINE_PATTERNS = [
+    re.compile(r"^\[ERROR\]\s+.*\.(?:java|kt|scala|groovy):\[\d+,\d+\]"),
+]
+
 
 def extract_first_fatal_error(
     text: str,
@@ -49,6 +58,10 @@ def extract_first_fatal_error(
     eval_*.log) when no valid test report can be produced.
     """
     lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if any(pattern.search(line) for pattern in _SOURCE_LOCATED_FATAL_LINE_PATTERNS):
+            snippet = "\n".join(lines[i : i + 1 + context_lines])
+            return snippet[:max_chars]
     for i, line in enumerate(lines):
         for pattern in _FATAL_LINE_PATTERNS:
             if pattern.search(line):

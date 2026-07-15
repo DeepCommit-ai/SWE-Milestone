@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -9,6 +10,28 @@ from harness.e2e.agents.base import AgentFramework, register_framework
 from harness.e2e.model_aliases import resolve_model_alias
 
 logger = logging.getLogger(__name__)
+
+_CLAUDE_CODE_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
+_CLAUDE_CODE_VERSION_CHANNELS = {"stable", "latest"}
+
+
+def validate_claude_code_version(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize a Claude Code installer version selector."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value in _CLAUDE_CODE_VERSION_CHANNELS or _CLAUDE_CODE_VERSION_RE.fullmatch(value):
+        return value
+    raise ValueError(
+        "Claude Code agent_version must be a semantic version such as "
+        "'2.1.158', or one of: latest, stable"
+    )
+
+
+def parse_claude_code_version(output: str) -> Optional[str]:
+    """Extract the numeric version from ``claude --version`` output."""
+    match = _CLAUDE_CODE_VERSION_RE.search(output or "")
+    return match.group(1) if match else None
 
 
 # Vertex (native CLAUDE_CODE_USE_VERTEX): copy the mounted host ADC into
@@ -82,6 +105,7 @@ class ClaudeCodeFramework(AgentFramework):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        agent_version: Optional[str] = None,
         **kwargs,
     ):
         """Initialize Claude Code framework.
@@ -92,6 +116,7 @@ class ClaudeCodeFramework(AgentFramework):
             reasoning_effort: Reasoning effort level ("low", "medium", "high", "xhigh").
                              Mapped to Claude Code CLI --effort flag.
                              "xhigh" is mapped to "max" for Claude Code.
+            agent_version: Exact Claude Code CLI version, or ``stable``/``latest``.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
@@ -103,6 +128,7 @@ class ClaudeCodeFramework(AgentFramework):
         # max transmits faithfully and is honored, ~2.6x low's thinking). Unset
         # stays a safe default for any older pinned claude.
         self._reasoning_effort = reasoning_effort
+        self._agent_version = validate_claude_code_version(agent_version)
         # Apply short-name aliasing (e.g. "kimi-k2.6" →
         # "openrouter/moonshotai/kimi-k2.6") so every env var and --model flag
         # downstream carries the canonical ID the all-hands LiteLLM proxy
@@ -127,6 +153,20 @@ class ClaudeCodeFramework(AgentFramework):
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
         return self._reasoning_effort
+
+    def get_requested_version(self) -> Optional[str]:
+        return self._agent_version
+
+    def get_version_command(self) -> List[str]:
+        return ["claude", "--version"]
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        return parse_claude_code_version(output)
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        if self._agent_version in _CLAUDE_CODE_VERSION_CHANNELS:
+            return True
+        return self._agent_version is None or actual_version == self._agent_version
 
     def _build_effort_args(self) -> List[str]:
         """Return Claude Code CLI args for reasoning effort.
@@ -227,6 +267,13 @@ class ClaudeCodeFramework(AgentFramework):
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={self._auto_compact_window}",
             ])
+        # An exact version is a reproducibility pin, so prevent background
+        # self-updates between recovery invocations. Do not use
+        # DISABLE_UPDATES here: the official installer also honors it and then
+        # silently skips the initial installation. Release channels retain
+        # their normal within-channel updates.
+        if self._agent_version and self._agent_version not in _CLAUDE_CODE_VERSION_CHANNELS:
+            env_vars.extend(["-e", "DISABLE_AUTOUPDATER=1"])
         # Quarantine mode: force pip to the offline wheelhouse (shared base
         # helper so gemini-cli & co. get the same treatment).
         env_vars.extend(self.get_quarantine_env_vars())
@@ -323,6 +370,7 @@ class ClaudeCodeFramework(AgentFramework):
 try:
     import subprocess
     import shutil
+    import re
 
     def run_cmd(cmd, shell=False):
         try:
@@ -333,12 +381,25 @@ try:
         except Exception as e:
             return False, '', str(e)
 
-    # Check if claude is already installed and working
+    requested_version = {self._agent_version!r}
+
+    # Check if claude is already installed and working. Exact matches can be
+    # reused; a release channel is re-applied so the installer selects the
+    # current version for that channel.
     success, version, _ = run_cmd(['claude', '--version'])
-    if success:
+    installed_match = re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', version) if success else None
+    installed_version = installed_match.group(1) if installed_match else None
+    needs_install = not success
+    if requested_version in ('stable', 'latest'):
+        needs_install = True
+    elif requested_version and installed_version != requested_version:
+        needs_install = True
+
+    if not needs_install:
         print(f"Claude Code already installed: {{version}}")
     else:
-        print("Installing Claude Code standalone binary...")
+        target_label = requested_version or 'latest'
+        print(f"Installing Claude Code standalone binary (target={{target_label}})...")
 
         # Ensure curl is available
         if not shutil.which('curl'):
@@ -346,11 +407,23 @@ try:
             run_cmd(['apt-get', 'update'])
             run_cmd(['apt-get', 'install', '-y', 'curl', 'ca-certificates'])
 
-        # Install via standalone installer (no Node.js required)
-        success, stdout, stderr = run_cmd(
-            'curl -fsSL https://claude.ai/install.sh | bash',
-            shell=True
+        # Install via standalone installer (no Node.js required). Download and
+        # invoke separately so the validated version is passed as an argv item,
+        # without interpolating it into a shell command.
+        installer = subprocess.run(
+            ['curl', '-fsSL', 'https://claude.ai/install.sh'],
+            capture_output=True, text=True, timeout=300
         )
+        if installer.returncode != 0:
+            raise RuntimeError(f"Failed to download Claude Code installer: {{installer.stderr}}")
+        install_cmd = ['bash', '-s']
+        if requested_version:
+            install_cmd.append(requested_version)
+        install_result = subprocess.run(
+            install_cmd, input=installer.stdout, capture_output=True, text=True, timeout=300
+        )
+        success = install_result.returncode == 0
+        stdout, stderr = install_result.stdout.strip(), install_result.stderr.strip()
         if success:
             import os
 
@@ -367,6 +440,13 @@ try:
 
             success, version, _ = run_cmd(['/usr/local/bin/claude', '--version'])
             print(f"Claude Code ready: {{version}}")
+            ready_match = re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', version) if success else None
+            ready_version = ready_match.group(1) if ready_match else None
+            if requested_version not in (None, 'stable', 'latest') and ready_version != requested_version:
+                raise RuntimeError(
+                    f"Claude Code version mismatch: requested {{requested_version}}, "
+                    f"installed {{ready_version or version or 'unknown'}}"
+                )
         else:
             print(f"Failed to install Claude Code: {{stderr}}")
             raise Exception("Claude Code installation failed")

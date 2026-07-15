@@ -39,6 +39,16 @@ MAVEN_ERROR_OUTPUT = """\
 [ERROR] /testbed/dubbo-mutiny/src/main/java/Foo.java:[10,8] cannot find symbol
 """
 
+MAVEN_JAVAC_WARNING_BEFORE_ERROR_OUTPUT = """\
+[ERROR] COMPILATION ERROR :
+[INFO] -------------------------------------------------------------
+[ERROR]   on the class path. A future release of javac may disable annotation processing
+  unless at least one processor is specified by name (-processor), or a search
+[ERROR] /testbed/dubbo-plugin/src/main/java/Foo.java:[42,17] cannot find symbol
+[ERROR]   symbol:   class MissingType
+[ERROR]   location: class Foo
+"""
+
 CLEAN_OUTPUT = """\
 running 42 tests
 test result: ok. 42 passed; 0 failed; 0 ignored
@@ -62,7 +72,14 @@ class TestExtractFirstFatalError:
     def test_maven_error(self):
         snippet = extract_first_fatal_error(MAVEN_ERROR_OUTPUT)
         assert snippet is not None
-        assert "Failed to execute goal" in snippet
+        assert "Foo.java:[10,8] cannot find symbol" in snippet
+
+    def test_maven_source_error_wins_over_javac_warning_continuation(self):
+        snippet = extract_first_fatal_error(MAVEN_JAVAC_WARNING_BEFORE_ERROR_OUTPUT)
+        assert snippet is not None
+        assert snippet.startswith("[ERROR] /testbed/dubbo-plugin/src/main/java/Foo.java")
+        assert "MissingType" in snippet
+        assert "annotation processing" not in snippet
 
     def test_clean_output_returns_none(self):
         assert extract_first_fatal_error(CLEAN_OUTPUT) is None

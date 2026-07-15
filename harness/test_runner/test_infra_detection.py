@@ -3,6 +3,9 @@ and transient-retry classification (see docs/post_verify/infra-failure-audit.md 
 the deterministic layer; the skill sweep feeds new signatures into it).
 """
 
+import json
+
+import pytest
 
 from harness.e2e.evaluator import EvaluationResult, InfrastructureFailureError
 from harness.e2e.orchestrator import _is_transient_error
@@ -152,6 +155,33 @@ class TestScoringUntrusted:
         res = _mk_result(infrastructure_failure="sig-text")
         assert res.to_dict()["infrastructure_failure"] == "sig-text"
 
+    def test_zero_test_build_failure_is_scored_not_infra_invalid(self):
+        res = _mk_result(
+            pass_to_pass_required=3,
+            start_compile_error="Compilation failed: cannot find symbol",
+        )
+        result = res.to_dict()
+
+        assert res.scoring_untrusted is False
+        assert res.scored_failure_reason == "build-failure-with-zero-tests"
+        assert result["infra_invalid"] is False
+        assert result["infra_invalid_reason"] == ""
+        assert result["eval_status"] == "failed"
+
+    def test_infrastructure_signature_overrides_build_failure_classification(self):
+        res = _mk_result(
+            pass_to_pass_required=3,
+            start_compile_error="Compilation failed: cannot find symbol",
+        )
+        res.infrastructure_failure = "Cannot connect to the Docker daemon"
+        res.classify_zero_test_result()
+        result = res.to_dict()
+
+        assert res.scored_failure_reason == ""
+        assert res.scoring_untrusted is True
+        assert result["infra_invalid"] is True
+        assert result["eval_status"] == "infra-invalid"
+
 
 VALID_REPORT = '{"tests": [{"nodeid": "t::a", "outcome": "passed"}], "summary": {"total": 1, "passed": 1, "failed": 0, "error": 0, "skipped": 0}}'
 
@@ -167,6 +197,19 @@ class _TimeoutCapturingRunner:
         for name, content in self._files.items():
             (self._output_dir / name).write_text(content)
         return 0, "", ""
+
+
+class _FailingRunner:
+    def __init__(self, output_dir, *, returncode=-1, files=None, stderr="runner timed out"):
+        self._output_dir = output_dir
+        self._returncode = returncode
+        self._files = files or {}
+        self._stderr = stderr
+
+    def run(self, script, timeout=None, extra_volumes=None):
+        for name, content in self._files.items():
+            (self._output_dir / name).write_text(content)
+        return self._returncode, "", self._stderr
 
 
 def _two_mode_workspace(tmp_path, second_mode_extra=""):
@@ -197,7 +240,7 @@ class TestModeRunTimeout:
         run_single_state_tests(
             runner, workspace_root=ws, milestone_id="M1", output_dir=out, workers=1, timeout=60
         )
-        assert runner.timeouts == [1800, 4321]
+        assert runner.timeouts == [3600, 4321]
 
 
 class TestDroppedReportIsLoud:
@@ -215,6 +258,230 @@ class TestDroppedReportIsLoud:
         assert "🚨" in captured
         assert "eval_slow.json" in captured
         assert "test universe shrank" in captured
+
+
+class TestRunnerFailureIsFailClosed:
+    def test_timeout_rejects_partial_report_and_clears_merged_artifacts(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerInfrastructureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _two_mode_workspace(tmp_path)
+        (out / "eval.json").write_text(VALID_REPORT)
+        (out / "eval_summary.json").write_text(VALID_REPORT)
+        runner = _FailingRunner(
+            out,
+            files={"eval_default.json": VALID_REPORT},
+            stderr="Command timed out after 3600 seconds",
+        )
+
+        with pytest.raises(RunnerInfrastructureError, match="refusing to parse partial"):
+            run_single_state_tests(
+                runner, workspace_root=ws, milestone_id="M1", output_dir=out, workers=1, timeout=60
+            )
+
+        assert not (out / "eval.json").exists()
+        assert not (out / "eval_summary.json").exists()
+
+    def test_timeout_stays_fail_closed_in_build_compatibility_mode(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerInfrastructureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _two_mode_workspace(tmp_path)
+        runner = _FailingRunner(out, files={"eval_default.json": VALID_REPORT})
+
+        with pytest.raises(RunnerInfrastructureError, match="refusing to parse partial"):
+            run_single_state_tests(
+                runner,
+                workspace_root=ws,
+                milestone_id="M1",
+                output_dir=out,
+                workers=1,
+                timeout=60,
+                build_failure_fail_closed=False,
+            )
+
+    def test_nonzero_runner_error_is_retryable(self):
+        from harness.test_runner.core.milestone_attempt import RunnerInfrastructureError
+
+        assert _is_transient_error(RunnerInfrastructureError("docker exec exited 137")) is True
+
+
+def _single_mode_workspace(tmp_path, framework):
+    ws = tmp_path / "ws"
+    cfg = ws / "dockerfiles" / "M1"
+    cfg.mkdir(parents=True)
+    (cfg / "test_config.json").write_text(
+        '[{"name": "default", "test_states": ["start", "end"],'
+        f' "test_cmd": "run-tests {{output_file}}", "framework": "{framework}"}}]'
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    return ws, out
+
+
+class TestMaskedBuildFailureIsFailClosed:
+    def test_go_build_failure_rejects_partial_report(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerBuildFailureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _single_mode_workspace(tmp_path, "go_test")
+        partial = """\
+# github.com/example/project/core/logx
+core/logx/writer.go:302:16: undefined: errors.Join
+FAIL\tgithub.com/example/project/core/logx [build failed]
+{"Action":"run","Package":"github.com/example/project/other","Test":"TestOne"}
+{"Action":"pass","Package":"github.com/example/project/other","Test":"TestOne"}
+"""
+        runner = _TimeoutCapturingRunner(out, {"eval_default.jsonl": partial})
+        diagnostics = []
+
+        with pytest.raises(RunnerBuildFailureError, match="partial test universe") as exc_info:
+            run_single_state_tests(
+                runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+                workers=1, timeout=60, build_failure_fail_closed=True,
+                build_failure_diagnostics=diagnostics,
+            )
+
+        assert not (out / "eval.json").exists()
+        message = str(exc_info.value)
+        assert (
+            "build/setup failure (core/logx/writer.go:302:16: undefined: errors.Join)"
+            in message
+        )
+        assert "core/logx/writer.go:302:16: undefined: errors.Join" in message
+        assert diagnostics and "undefined: errors.Join" in diagnostics[0]
+        context = message.split("First build failure", 1)[1]
+        assert context.index("undefined: errors.Join") < context.index("[build failed]")
+
+    def test_parallel_go_failure_preserves_cause_before_unrelated_failed_package(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerBuildFailureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _single_mode_workspace(tmp_path, "go_test")
+        partial = """\
+# github.com/example/project/zrpc/resolver/internal
+zrpc/resolver/internal/directbuilder_test.go:49:12: min requires go1.21 or later
+FAIL\tgithub.com/example/project/core/bloom [build failed]
+{"Action":"start","Package":"github.com/example/project/core/breaker"}
+"""
+        runner = _TimeoutCapturingRunner(out, {"eval_default.jsonl": partial})
+
+        with pytest.raises(RunnerBuildFailureError) as exc_info:
+            run_single_state_tests(
+                runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+                workers=1, timeout=60, build_failure_fail_closed=True,
+            )
+
+        message = str(exc_info.value)
+        assert (
+            "build/setup failure (zrpc/resolver/internal/directbuilder_test.go:49:12: "
+            "min requires go1.21 or later)" in message
+        )
+        assert "directbuilder_test.go:49:12: min requires go1.21" in message
+        assert "core/bloom [build failed]" in message
+
+    def test_go_build_failure_can_score_completed_packages(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import run_single_state_tests
+
+        ws, out = _single_mode_workspace(tmp_path, "go_test")
+        partial = """\
+# github.com/example/project/core/logx
+core/logx/writer.go:302:16: undefined: errors.Join
+FAIL\tgithub.com/example/project/core/logx [build failed]
+{"Action":"run","Package":"github.com/example/project/other","Test":"TestOne"}
+{"Action":"pass","Package":"github.com/example/project/other","Test":"TestOne"}
+"""
+        runner = _TimeoutCapturingRunner(out, {"eval_default.jsonl": partial})
+        diagnostics = []
+
+        merged = run_single_state_tests(
+            runner,
+            workspace_root=ws,
+            milestone_id="M1",
+            output_dir=out,
+            workers=1,
+            timeout=60,
+            build_failure_fail_closed=False,
+            build_failure_diagnostics=diagnostics,
+        )
+
+        report = json.loads(merged.read_text())
+        assert report["summary"]["total"] == 1
+        assert report["summary"]["passed"] == 1
+        assert len(diagnostics) == 1
+        assert "undefined: errors.Join" in diagnostics[0]
+
+    def test_maven_build_failure_rejects_partial_report(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerBuildFailureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _single_mode_workspace(tmp_path, "maven")
+        partial = """\
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[ERROR] Intentional application error emitted by a passing exception-path test
+[ERROR] COMPILATION ERROR :
+[ERROR] /testbed/module/src/main/java/A.java:[1,1] cannot find symbol
+[INFO] BUILD FAILURE
+"""
+        runner = _TimeoutCapturingRunner(out, {"eval_default.log": partial})
+
+        with pytest.raises(RunnerBuildFailureError, match="maven build/setup failure") as exc_info:
+            run_single_state_tests(
+                runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+                workers=1, timeout=60, build_failure_fail_closed=True,
+            )
+
+        message = str(exc_info.value)
+        assert "First build failure" in message
+        assert "[ERROR] COMPILATION ERROR" in message
+        assert "/testbed/module/src/main/java/A.java" in message
+        assert "Intentional application error" not in message
+        assert not (out / "eval.json").exists()
+
+    def test_ordinary_go_test_failure_remains_scoreable(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import run_single_state_tests
+
+        ws, out = _single_mode_workspace(tmp_path, "go_test")
+        report = """\
+{"Action":"run","Package":"github.com/example/project","Test":"TestBroken"}
+{"Action":"output","Package":"github.com/example/project","Test":"TestBroken","Output":"assertion failed\\n"}
+{"Action":"fail","Package":"github.com/example/project","Test":"TestBroken","Elapsed":0.01}
+{"Action":"fail","Package":"github.com/example/project","Elapsed":0.01}
+"""
+        runner = _TimeoutCapturingRunner(out, {"eval_default.jsonl": report})
+
+        merged = run_single_state_tests(
+            runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+            workers=1, timeout=60,
+        )
+
+        assert merged.exists()
+        assert '"failed": 1' in merged.read_text()
+
+    def test_maven_test_failure_with_build_success_is_not_build_failure(self):
+        from harness.test_runner.core.milestone_attempt import detect_masked_build_failure
+
+        report = """\
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0
+[INFO] Test failures are ignored.
+[INFO] BUILD SUCCESS
+"""
+        assert detect_masked_build_failure(report, "maven") is None
+
+    def test_build_failure_error_is_not_transient(self):
+        from harness.test_runner.core.milestone_attempt import RunnerBuildFailureError
+
+        assert _is_transient_error(RunnerBuildFailureError("compile failed")) is False
 
 
 class TestTransientClassification:

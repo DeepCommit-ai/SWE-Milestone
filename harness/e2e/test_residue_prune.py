@@ -244,11 +244,44 @@ def test_snapshot_integrity_ok_with_few_missing():
     """A handful of agent deletions is normal work, not a capture failure."""
     f = make_filter()
     reference = {f"core/f{i}.go" for i in range(20)} | {"core/x_test.go", "go.mod"}
-    tar_files = {f"core/f{i}.go" for i in range(18)}  # 2 missing
-    report = check_snapshot_integrity(reference, tar_files, f, max_missing=10)
+    tar_files = {f"core/f{i}.go" for i in range(18)} | {"go.mod"}  # 2 missing
+    report = check_snapshot_integrity(
+        reference, tar_files, f, max_missing=10, extra_build_manifests={"go.mod"}
+    )
     assert report.ok is True
     assert report.missing_count == 2
-    assert report.expected_count == 20  # test file and go.mod not snapshot-includable
+    assert report.expected_count == 21  # test file excluded; root go.mod retained
+
+
+def test_snapshot_integrity_covers_root_build_manifest():
+    f = make_filter()
+    report = check_snapshot_integrity(
+        {"core/f.go", "go.mod"},
+        {"core/f.go"},
+        f,
+        extra_build_manifests={"go.mod"},
+    )
+    assert report.expected_count == 2
+    assert report.missing_count == 1
+    assert report.missing_sample == ["go.mod"]
+
+
+def test_snapshot_integrity_covers_only_explicit_external_build_manifests():
+    f = make_filter()
+    reference = {
+        "core/f.go",
+        "dubbo-test/changed/pom.xml",
+        "dubbo-test/untouched/pom.xml",
+    }
+    report = check_snapshot_integrity(
+        reference,
+        {"core/f.go"},
+        f,
+        extra_build_manifests={"dubbo-test/changed/pom.xml"},
+    )
+    assert report.expected_count == 2
+    assert report.missing_count == 1
+    assert report.missing_sample == ["dubbo-test/changed/pom.xml"]
 
 
 def test_snapshot_integrity_flags_mass_missing():
@@ -330,6 +363,7 @@ def test_evaluation_result_fail_loud_defaults():
     d = _mk_result().to_dict()
     assert d["base_tag"] == ""
     assert d["fallback_triggered"] is False
+    assert d["end_compile_error"] == ""
     assert d["residue_prune"] == {
         "enabled": False,
         "pruned_files_count": 0,
@@ -350,18 +384,51 @@ def test_scoring_untrusted_property():
     assert _mk_result(residue_prune_skipped_reason="config-invalid").scoring_untrusted is True
     # a completed prune (or nothing to prune) is trusted
     assert _mk_result(residue_prune_skipped_reason="").scoring_untrusted is False
+    infra_invalid = _mk_result(
+        total_tests=0,
+        none_to_pass_required=1,
+    )
+    assert infra_invalid.scoring_untrusted is True
+    assert infra_invalid.resolved is False
+    assert infra_invalid.infra_invalid_reason == "zero-tests-with-required-tests"
+    assert infra_invalid.to_dict()["eval_status"] == "infra-invalid"
+
+
+def test_required_test_counts_prefer_stable_classification():
+    from harness.e2e.evaluator import baseline_required_test_counts
+
+    baseline = {
+        "classification": {
+            "fail_to_pass": ["unstable-f2p"],
+            "none_to_pass": ["unstable-n2p"],
+            "pass_to_pass": ["unstable-p2p"],
+        },
+        "stable_classification": {
+            "fail_to_pass": ["stable-f2p"],
+            "none_to_pass": [],
+            "pass_to_pass": ["stable-p2p-1", "stable-p2p-2"],
+        },
+    }
+
+    assert baseline_required_test_counts(baseline) == {
+        "fail_to_pass": 1,
+        "none_to_pass": 0,
+        "pass_to_pass": 2,
+    }
     # the integrity gate is GONE: mass-missing is no longer a fail-closed reason
     # (a near-empty tar prunes and scores honestly, it is not "protected").
     assert "snapshot-integrity-failed" not in _fail_closed_reasons()
 
 
-def test_orchestrator_ands_scoring_untrusted():
-    """F1: the orchestrator resolution recompute must AND in the safety flag."""
+def test_orchestrator_preserves_locked_false_verdicts():
+    """F1: outer threshold recompute must AND every locked-false verdict."""
     from harness.e2e import orchestrator as orch_mod
     import inspect
 
     src = inspect.getsource(orch_mod._run_evaluation_once)
-    assert "scoring_untrusted" in src, "orchestrator does not consult scoring_untrusted"
+    assert "resolution_locked_false" in src, (
+        "orchestrator does not preserve evaluator locked-false verdicts"
+    )
 
 
 def test_extension_normalization():
@@ -398,6 +465,7 @@ def test_evaluation_result_fail_loud_populated():
     d = _mk_result(
         base_tag="milestone-m1-start",
         fallback_triggered=True,
+        end_compile_error="core/service.go:42:7: undefined: missingSymbol",
         residue_prune_enabled=True,
         pruned_files_count=2,
         pruned_files=["core/a.go", "core/b.go"],
@@ -408,6 +476,7 @@ def test_evaluation_result_fail_loud_populated():
     ).to_dict()
     assert d["base_tag"] == "milestone-m1-start"
     assert d["fallback_triggered"] is True
+    assert d["end_compile_error"] == "core/service.go:42:7: undefined: missingSymbol"
     assert d["residue_prune"]["pruned_files_count"] == 2
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
     assert d["residue_prune"]["skipped_reason"] == "ls-tree-failed"
@@ -482,3 +551,107 @@ def test_classify_capture_loss_buckets():
 def test_classify_capture_loss_empty():
     f = make_filter()
     assert classify_capture_loss([], f, SNAPSHOT_PATHS) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# Default-OFF compatibility policy + all-language predicate edges
+# ---------------------------------------------------------------------------
+
+from harness.e2e.residue_prune import resolve_prune_enablement  # noqa: E402
+
+
+def test_enablement_default_off_with_partition():
+    assert resolve_prune_enablement(None, True) == (False, "default-off")
+
+
+def test_enablement_legacy_without_partition_stays_off():
+    # Old datasets without src/test split: additive overlay, NOT untrusted.
+    assert resolve_prune_enablement(None, False) == (False, "legacy-no-partition")
+
+
+def test_enablement_explicit_flag_honored():
+    assert resolve_prune_enablement(False, True) == (False, "explicit")
+    assert resolve_prune_enablement(True, True) == (True, "explicit")
+    # Explicit True without partition: still "requested" — the evaluator's
+    # config-invalid fail-closed path (F3) takes it from here.
+    assert resolve_prune_enablement(True, False) == (True, "explicit")
+
+
+# Real per-range filter configs (copied from SWE-Milestone-data metadata) —
+# each range's audited never-delete edge must hold under the multi-language
+# default extension set.
+
+def _filter_from(cfg):
+    return SrcFileFilter(
+        src_dirs=cfg["src"], test_dirs=cfg["test"],
+        exclude_patterns=cfg.get("excl", []), generated_patterns=cfg.get("gen", []),
+        modifiable_test_patterns=cfg.get("mod", []),
+    )
+
+
+NUSHELL = {"src": ["src/", "crates/"],
+           "test": ["tests/**", "benches/**", "crates/*/tests/**", "crates/*/benches/**",
+                    "crates/nu-cmd-lang/src/example_test.rs"],
+           "excl": ["crates/nu_plugin_python/**"]}
+RIPGREP = {"src": ["crates/"],
+           "test": ["tests/**", "crates/*/tests/**", "crates/*/benches/**", "benchsuite/**", "fuzz/**"],
+           "excl": ["crates/*/examples/**", "crates/core/flags/doc/*.help", "crates/core/flags/doc/*.1"]}
+ELEMENT = {"src": ["src/", "packages/shared-components/src/", "res/css/"],
+           "test": ["test/**", "playwright/**", "__mocks__/**", "**/*.test.*", "**/*.spec.*",
+                    "**/__snapshots__/**", "**/__tests__/**"],
+           "excl": ["**/*.stories.*", "**/i18n/strings/**"]}
+DUBBO = {"src": ["dubbo-common/", "dubbo-plugin/", "dubbo-config/"],
+         "test": ["**/src/test/**", "**/*Test.java", "**/*Tests.java", "dubbo-test/**", "dubbo-demo/**"],
+         "excl": ["**/target/**"]}
+SCIKIT = {"src": ["sklearn/"],
+          "test": ["**/test_*.py", "**/conftest.py", "**/tests/**"],
+          "excl": ["sklearn/datasets/data/**", "sklearn/datasets/descr/**"]}
+
+
+def test_all_language_rust_src_prunable_tests_protected():
+    f = _filter_from(NUSHELL)
+    assert is_prunable("crates/nu-cli/src/repl.rs", f, frozenset())
+    # Inline-test FILES named in test_dirs are tests, never pruned (V1-R).
+    assert not is_prunable("crates/nu-cmd-lang/src/example_test.rs", f, frozenset())
+    assert not is_prunable("crates/nu-command/tests/commands/ls.rs", f, frozenset())
+    # Excluded plugin examples: never pruned.
+    assert not is_prunable("crates/nu_plugin_python/plugin.py", f, frozenset())
+    # Non-code assets in src dirs: never pruned.
+    assert not is_prunable("crates/nu-command/assets/228_themes.zip", f, frozenset())
+
+
+def test_all_language_ripgrep_docs_and_completions_protected():
+    f = _filter_from(RIPGREP)
+    assert is_prunable("crates/core/main.rs", f, frozenset())
+    # Generated-doc/completion assets (audited §8.3-style edges): no code ext.
+    assert not is_prunable("crates/core/flags/doc/rg.1", f, frozenset())
+    assert not is_prunable("crates/core/flags/doc/args.help", f, frozenset())
+
+
+def test_all_language_element_pcss_protected_tsx_prunable():
+    f = _filter_from(ELEMENT)
+    assert is_prunable("src/components/views/rooms/RoomListPanel/EmptyRoomList.tsx", f, frozenset())
+    # .pcss (audited §8.3: 9 GT-added in this range): non-code ext, never pruned.
+    assert not is_prunable("res/css/views/rooms/_EmptyRoomList.pcss", f, frozenset())
+    assert not is_prunable("src/components/structures/RoomView.test.tsx", f, frozenset())
+    assert not is_prunable("src/i18n/strings/en_EN.json", f, frozenset())
+
+
+def test_all_language_dubbo_spi_and_mustache_protected():
+    f = _filter_from(DUBBO)
+    assert is_prunable("dubbo-plugin/dubbo-mutiny/src/main/java/org/apache/dubbo/mutiny/calls/MutinyClientCalls.java", f, frozenset())
+    # SPI declaration files and mustache templates (audited §8.3: real
+    # flip-score risk if deleted): no code extension, never pruned.
+    assert not is_prunable("dubbo-plugin/dubbo-mutiny/src/main/resources/META-INF/dubbo/org.apache.dubbo.rpc.protocol.tri.stub.StubSuppliers", f, frozenset())
+    assert not is_prunable("dubbo-config/dubbo-config-spring/src/main/resources/template/service.mustache", f, frozenset())
+    assert not is_prunable("dubbo-common/src/test/java/org/apache/dubbo/FooTest.java", f, frozenset())
+
+
+def test_all_language_scikit_pyx_prunable_data_protected():
+    f = _filter_from(SCIKIT)
+    assert is_prunable("sklearn/utils/_unique.py", f, frozenset())
+    assert is_prunable("sklearn/tree/_tree.pyx", f, frozenset())
+    assert is_prunable("sklearn/tree/_tree.pxd", f, frozenset())
+    assert not is_prunable("sklearn/utils/tests/test_unique.py", f, frozenset())
+    assert not is_prunable("sklearn/datasets/data/iris.csv", f, frozenset())
+    assert not is_prunable("sklearn/datasets/descr/iris.rst", f, frozenset())

@@ -104,6 +104,7 @@ DEFAULT_CONFIG = {
     },
     "evaluation": {
         "include_new_tests": False,
+        "build_failure_fail_closed": False,
     },
     "retry_and_timing": {
         "debounce_seconds": 120,
@@ -200,6 +201,20 @@ class E2EConfig:
     def include_new_tests(self) -> bool:
         """If True, treat new_tests from classification as fail_to_pass tests."""
         return self.config.get("evaluation", {}).get("include_new_tests", False)
+
+    @property
+    def build_failure_fail_closed(self) -> bool:
+        """Whether a detected build failure rejects partial test reports.
+
+        False is the global compatibility default: an otherwise completed test
+        command may contribute results from packages/modules that did run.
+        Runner timeouts and nonzero outer exits are controlled separately and
+        always remain fail-closed. Set true explicitly for strict scoring.
+        """
+        value = self.config.get("evaluation", {}).get("build_failure_fail_closed", False)
+        if not isinstance(value, bool):
+            raise ValueError("evaluation.build_failure_fail_closed must be a boolean")
+        return value
 
     # === Retry and Timing Configuration ===
 

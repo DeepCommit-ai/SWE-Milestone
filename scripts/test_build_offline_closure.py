@@ -861,7 +861,8 @@ def test_assemble_go_dockerfile_raw_cache_fallback_no_online_fetch():
     assert df == union + (
         "RUN rm -rf /usr/local/go\n"
         "COPY --from=swe-milestone/r_x__m02:latest /usr/local/go /usr/local/go\n"
-        "ENV GOTOOLCHAIN=local\n")
+        "ENV GOTOOLCHAIN=local\n"
+        "ENV GOLANG_VERSION=1.21.13\n")
 
 
 # ---- go_mechanism dispatch (online-fetch default; raw-cache escape) ------------
@@ -972,32 +973,83 @@ def test_maven_rm_self_at_b_cmd_empty_is_noop():
     assert boc.maven_rm_self_at_b_cmd(None) == "RUN true\n"
 
 
-def test_maven_online_fetch_cmd_goes_offline_and_test_scope():
-    """The per-milestone fetch body runs BOTH a broad `dependency:go-offline`
-    (plugins + compile/runtime graph) AND an ONLINE `test-compile` (the tightest
-    match to the offline `mvn -o test-compile` gate — it downloads the exact
-    versions/jars incl. test-scope deps that go-offline alone misses, e.g.
-    bcprov-ext-jdk18on jar and otel-sdk-testing 1.50.0) into the SHARED
-    maven.repo.local, cd'd into the milestone's reactor, each `|| true`-guarded, lint
-    plugins skipped, and ONLINE (no `-o`)."""
+def test_maven_online_fetch_cmd_goes_offline_test_scope_and_spotless_engine():
+    """The fetch also resolves Spotless's dynamically selected formatter."""
     body = boc.maven_online_fetch_cmd("/tb/m3", "/root/.m2/repository")
     assert body.startswith("cd /tb/m3 && (")
+    # Bootstrap the source BOM without copying the milestone's answer-bearing
+    # local cache; final self@B rm/audit removes this temporary POM.
+    assert "if [ -f dubbo-dependencies-bom/pom.xml ]" in body
+    assert "mvn -q -f dubbo-dependencies-bom/pom.xml install" in body
     # the cheap broad first pass: plugins + compile/runtime graph
     assert "mvn -q dependency:go-offline" in body
     # the workhorse: ONLINE test-compile downloads exactly what the gate needs,
     # incl. all test-scope deps; -fae so a non-compiling module doesn't starve the
     # cache, -DskipTests so only test-SOURCES compile (still resolves test deps).
     assert "mvn -q -fae test-compile -DskipTests" in body
-    # both write into the SHARED local repo
-    assert body.count("-Dmaven.repo.local=/root/.m2/repository") == 2
+    # Palantir/other dynamically selected formatters are outside go-offline's
+    # reliable closure, so initialize Spotless explicitly and force the check on.
+    assert "mvn -q -N spotless:check -Dspotless.check.skip=false" in body
+    # bootstrap + all three goals write into the SHARED local repo
+    assert body.count("-Dmaven.repo.local=/root/.m2/repository") == 4
     # ONLINE fetch stage — must NOT pass -o (that would defeat the whole point)
     assert " -o " not in f" {body} "
     # each goal guarded so one milestone's source-state never aborts the build
-    assert body.count("|| true") == 2
+    assert body.count("|| true") == 4
     # lint plugins skipped so a spotless/rat violation can't abort the reactor
     for skip in ("-Dspotless.check.skip=true", "-Dcheckstyle.skip=true",
                  "-Drat.skip=true"):
         assert skip in body
+    assert body.index("dubbo-dependencies-bom/pom.xml install") < body.index("dependency:go-offline")
+    assert body.index("test-compile") < body.index("spotless:check")
+
+
+def test_maven_module_plugin_probe_warms_and_proves_selected_engine():
+    probes = [
+        {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 120},
+        {
+            "pom": "dubbo-dependencies-bom/pom.xml",
+            "goal": "spotless:check",
+            "timeout_seconds": 180,
+        },
+    ]
+    body = boc.maven_online_fetch_cmd("/tb/m4", "/root/.m2/repository", probes)
+    assert "-f dubbo-dependencies-bom/pom.xml spotless:check" in body
+    assert "-Dmaven.repo.local=/root/.m2/repository" in body
+    assert body.endswith("|| true")
+
+    df = boc.assemble_maven_dockerfile(
+        "r_x",
+        ["swe-milestone/r_x__m04:latest"],
+        ["/root/.m2/repository"],
+        _DUBBO_FORBID,
+        probes,
+    )
+    assert "RUN cd /tb/m0 &&" in df
+    assert "-f dubbo-dependencies-bom/pom.xml spotless:check" in df
+    assert (
+        "RUN cd /testbed && mvn -q -o -N -f "
+        "dubbo-dependencies-bom/pom.xml spotless:check"
+    ) in df
+
+
+def test_combine_maven_offline_build_runs_all_gates_and_preserves_failure():
+    probes = [
+        {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 120},
+        {
+            "pom": "dubbo-dependencies-bom/pom.xml",
+            "goal": "spotless:check",
+            "timeout_seconds": 120,
+        },
+    ]
+    command = boc.combine_maven_offline_build(
+        "git clean -xfd && mvn -o test-compile", probes
+    )
+    assert command.startswith("status=0; ( git clean -xfd && mvn -o test-compile )")
+    assert command.count("|| status=$?") == 3
+    assert "-o -N -f pom.xml spotless:check" in command
+    assert "-o -N -f dubbo-dependencies-bom/pom.xml spotless:check" in command
+    assert command.endswith('exit "$status"')
 
 
 def test_assemble_maven_dockerfile_online_fetch_union_plus_self_at_b_rm():
@@ -1017,15 +1069,26 @@ def test_assemble_maven_dockerfile_online_fetch_union_plus_self_at_b_rm():
     assert "COPY --from=swe-milestone/r_x__m01:latest /testbed /tb/m0" in df
     assert "COPY --from=swe-milestone/r_x__m02:latest /testbed /tb/m1" in df
     # one online fetch RUN per milestone, each warming the shared local repo
-    assert "RUN cd /tb/m0 && ( mvn -q dependency:go-offline" in df
-    assert "RUN cd /tb/m1 && ( mvn -q dependency:go-offline" in df
+    assert "RUN cd /tb/m0 && ( if [ -f dubbo-dependencies-bom/pom.xml ]" in df
+    assert "RUN cd /tb/m1 && ( if [ -f dubbo-dependencies-bom/pom.xml ]" in df
     assert df.count("mvn -q -fae test-compile -DskipTests") == len(ms)
+    # Per-milestone best-effort warms plus one guaranteed base/A warm (some
+    # milestone POMs cannot resolve their intentionally absent self/B BOM).
+    assert df.count("mvn -q -N spotless:check -Dspotless.check.skip=false") == len(ms) + 1
+    assert "RUN cd /testbed && mvn -q -N spotless:check" in df
     # the warmed cache is COPY'd into the final stage, then self@B is rm'd from it
     assert "COPY --from=fetch_builder /root/.m2/repository /root/.m2/repository" in df
+    assert "RUN chmod g+x /root && chmod -R g+rwX /root/.m2" in df
+    assert "RUN cd /testbed && mvn -q -o -N" in df
+    assert "spotless:check -Dspotless.check.skip=false" in df
     assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in df
-    # ordering: every milestone fetch BEFORE the final COPY BEFORE the self@B rm
+    # ordering: every milestone fetch BEFORE the final COPY BEFORE permission
+    # normalization BEFORE the self@B rm (which remains the final instruction).
     assert df.index("RUN cd /tb/m1 && (") < \
+        df.index("RUN cd /testbed && mvn -q -N spotless:check") < \
         df.index("COPY --from=fetch_builder /root/.m2/repository") < \
+        df.index("RUN chmod g+x /root") < \
+        df.index("RUN cd /testbed && mvn -q -o -N") < \
         df.index("RUN rm -rf /root/.m2/repository/org/apache/dubbo")
 
 
@@ -1118,7 +1181,7 @@ def test_build_closure_maven_branch_wires_union_rm_audit_gate(monkeypatch, tmp_p
     # the staging Dockerfile ONLINE-fetches each milestone's declared deps (go-offline
     # + resolve test-scope) into the shared `.m2` and rm's self@B (the forbid globs)
     assert "rsync -a /milestone_" not in built["df"]
-    assert "RUN cd /tb/m0 && ( mvn -q dependency:go-offline" in built["df"]
+    assert "RUN cd /tb/m0 && ( if [ -f dubbo-dependencies-bom/pom.xml ]" in built["df"]
     assert "mvn -q -fae test-compile -DskipTests" in built["df"]
     assert "RUN rm -rf /root/.m2/repository/org/apache/dubbo/*/3.3.[4-9]*" in built["df"]
     # the generic audit got the SAME forbid globs the rm deleted (post-rm: clean)

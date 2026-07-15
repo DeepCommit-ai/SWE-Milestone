@@ -1,12 +1,13 @@
 """Unified offline closure builder. Union all milestone images' deps into a
 self-contained swe-milestone/<repo_full>__base-offline:latest image.
 See docs/quarantine.md (build + validation protocol)."""
-import argparse, glob as _glob, subprocess, sys, yaml
+import argparse, glob as _glob, shlex, subprocess, sys, yaml
 from pathlib import Path
 
 # Naming authority (single source): harness/e2e/image_version.py
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from harness.e2e.image_version import PREFIX, SEP, local_ref, resolve_image
+from harness.e2e.quarantine import normalize_maven_plugin_probes
 
 
 def _base_image(repo_lower: str) -> str:
@@ -1646,7 +1647,8 @@ def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
     if not online_fetch:
         tail = ("RUN rm -rf /usr/local/go\n"
                 f"COPY --from={tc} /usr/local/go /usr/local/go\n"
-                "ENV GOTOOLCHAIN=local\n")
+                "ENV GOTOOLCHAIN=local\n"
+                f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n")
         return union + tail
     # Online-fetch path (default). render_union_dockerfile emits `# syntax=...` then
     # `FROM ... AS builder` (rsync union) then `FROM ... AS final` (COPY the unioned
@@ -1671,7 +1673,8 @@ def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
     tail = (f"COPY --from=go_fetch {modcache} {modcache}\n"
             "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
-            "ENV GOTOOLCHAIN=local\n")
+            "ENV GOTOOLCHAIN=local\n"
+            f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n")
     return syntax + fetch_stage + union_body + tail
 
 
@@ -1719,12 +1722,66 @@ _MVN_FETCH_LINT_SKIPS = (
     "-Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true"
 )
 
+_DEFAULT_MAVEN_PLUGIN_PROBES = [
+    {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 120},
+]
 
-def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str:
+
+def maven_plugin_probe_cmd(
+    testbed_dir: str,
+    probe: dict,
+    m2_repo: str = _M2_REPO_DIR,
+    *,
+    offline: bool,
+) -> str:
+    """Render one safe Maven module/plugin initialization probe."""
+    pom = shlex.quote(probe["pom"])
+    goal = shlex.quote(probe["goal"])
+    offline_flag = "-o " if offline else ""
+    return (
+        f"cd {shlex.quote(testbed_dir)} && mvn -q {offline_flag}-N -f {pom} {goal} "
+        f"-Dspotless.check.skip=false -Dcheckstyle.skip=true -Drat.skip=true "
+        f"-Dmaven.gitcommitid.skip=true -Dmaven.repo.local={shlex.quote(m2_repo)}"
+    )
+
+
+def combine_maven_offline_build(
+    offline_build: str,
+    probes: list[dict],
+    m2_repo: str = _M2_REPO_DIR,
+) -> str:
+    """Run the normal closure gate and every plugin probe without masking errors.
+
+    All commands execute even when a mid-migration source checkpoint fails. The
+    final non-zero status lets the Maven classifier inspect the combined output:
+    any third-party offline-resolution error blocks publication, while a pure
+    compile/format source-state error remains diagnostic.
+    """
+    commands = [offline_build] + [
+        maven_plugin_probe_cmd("/testbed", probe, m2_repo, offline=True)
+        for probe in probes
+    ]
+    pieces = ["status=0"]
+    pieces.extend(f"( {command} ) || status=$?" for command in commands)
+    pieces.append('exit "$status"')
+    return "; ".join(pieces)
+
+
+def maven_online_fetch_cmd(
+    testbed_dir: str,
+    m2_repo: str = _M2_REPO_DIR,
+    plugin_probes: list[dict] | None = None,
+) -> str:
     """Render the per-milestone ONLINE declared-deps fetch RUN body (no `RUN `
     prefix), warming `m2_repo` from the reactor rooted at `testbed_dir`.
 
-    The fetch runs TWO maven goals against the milestone's FULL multi-module
+    Before resolving the reactor, Dubbo needs one source-defined bootstrap POM:
+    `dubbo-dependencies-bom`. Milestone images contain that self/B POM in their
+    local cache, but copying milestone caches would leak answer artifacts. Instead
+    we install only the BOM POM from the copied source into the temporary fetch
+    cache. The final self@B removal and audit delete it before publication.
+
+    The fetch then runs THREE maven goals against the milestone's FULL multi-module
     reactor (dubbo is multi-module; `mvn` needs every module's pom to build the
     reactor model), both writing into the SHARED `-Dmaven.repo.local=<m2_repo>`:
 
@@ -1750,8 +1807,16 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
          source won't compile, so one un-buildable module never starves the rest of
          the cache; `-DskipTests` skips test EXECUTION (we only need test-SOURCES
          compiled, which still resolves+downloads the test-scope deps).
+      3. `-N spotless:check` (ONLINE, failure-tolerant) — resolves Spotless's
+         formatter implementation selected by the repository configuration.
+         These formatter artifacts are loaded dynamically by the plugin and are
+         not guaranteed to be included by `dependency:go-offline`; Dubbo's
+         Palantir formatter was the concrete gap. `-N` initializes the root
+         configuration without letting a formatting violation in milestone
+         source prevent the cache warm, and `spotless.check.skip=false` overrides
+         any inherited build-time skip flag.
 
-    Both goals are `-o`-free (this is the ONLINE build stage — repo1.maven.org /
+    All goals are `-o`-free (this is the ONLINE build stage — repo1.maven.org /
     Maven Central is a non-answer registry that serves third-party artifacts, safe to
     fetch from at BUILD time; the closure is sealed offline at eval). Each goal is
     `|| true`-guarded so a milestone whose reactor can't fully build (a mid-migration
@@ -1767,6 +1832,12 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
     published closure never serves the answer.
     """
     goals = (
+        # (0) Bootstrap only the source-defined BOM POM needed to construct the
+        # reactor model. It is temporary self/B material and is removed + audited
+        # in the final stage along with every other forbidden self coordinate.
+        f"if [ -f dubbo-dependencies-bom/pom.xml ]; then "
+        f"mvn -q -f dubbo-dependencies-bom/pom.xml install -DskipTests "
+        f"{_MVN_FETCH_LINT_SKIPS} -Dmaven.repo.local={m2_repo} || true ; fi ; "
         # (1) cheap broad pass: plugins + compile/runtime graph (resolution-only).
         f"mvn -q dependency:go-offline {_MVN_FETCH_LINT_SKIPS} "
         f"-Dmaven.repo.local={m2_repo} || true ; "
@@ -1775,14 +1846,33 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
         # -fae so a non-compiling module doesn't starve the rest; -DskipTests skips
         # test EXECUTION but still compiles test-sources (→ resolves test-scope deps).
         f"mvn -q -fae test-compile -DskipTests {_MVN_FETCH_LINT_SKIPS} "
+        f"-Dmaven.repo.local={m2_repo} || true ; "
+        # (3) Spotless loads formatter engines (notably palantir-java-format)
+        # dynamically, outside dependency:go-offline's reliable closure.
+        f"mvn -q -N spotless:check -Dspotless.check.skip=false "
+        f"-Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true "
         f"-Dmaven.repo.local={m2_repo} || true"
     )
-    return f"cd {testbed_dir} && ( {goals} )"
+    probes = normalize_maven_plugin_probes(plugin_probes or _DEFAULT_MAVEN_PLUGIN_PROBES)
+    # The historical root probe above remains for byte-for-byte compatibility;
+    # do not render it twice when it is also the configured default.
+    extra_probe_cmds = []
+    for probe in probes:
+        if probe["pom"] == "pom.xml" and probe["goal"] == "spotless:check":
+            continue
+        extra_probe_cmds.append(
+            maven_plugin_probe_cmd(testbed_dir, probe, m2_repo, offline=False) + " || true"
+        )
+    body = f"cd {testbed_dir} && ( {goals} )"
+    if extra_probe_cmds:
+        body += " ; " + " ; ".join(extra_probe_cmds)
+    return body
 
 
 def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
                               cache_paths: list[str],
-                              forbid_globs: list[str]) -> str:
+                              forbid_globs: list[str],
+                              plugin_probes: list[dict] | None = None) -> str:
     """Maven closure Dockerfile: ONLINE-fetch the UNION of every milestone's
     *declared* deps into the local `.m2`, then bake it — the robust pattern pip
     (`pip download` the union freeze), cargo (`cargo vendor` the union of locks), and
@@ -1831,6 +1921,7 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     # (a single entry for dubbo); fall back to the canonical default if unset so the
     # assembly is always well-formed.
     m2_repo = (cache_paths or [_M2_REPO_DIR])[0]
+    probes = normalize_maven_plugin_probes(plugin_probes or _DEFAULT_MAVEN_PLUGIN_PROBES)
     lines = [
         "# syntax=docker/dockerfile:1",
         f"FROM {_base_image(repo_lower)} AS fetch_builder",
@@ -1843,7 +1934,16 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     # local repo (m2_repo). go-offline (compile+runtime+plugins) AND resolve
     # -DincludeScope=test (the test-scope deps go-offline misses, e.g. bcprov).
     for i in range(len(milestones)):
-        lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo)}")
+        lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo, probes)}")
+    # Milestone checkpoints may deliberately have a temporarily unresolvable
+    # self/B reactor model, so their best-effort Spotless warm can stop before
+    # plugin initialization. The fetch_builder's own /testbed is the valid
+    # base/A tree: warm its active JDK profile as the guaranteed formatter seed.
+    # The final-stage offline command below is still the fail-closed proof.
+    lines.append(
+        f"RUN cd /testbed && mvn -q -N spotless:check "
+        f"-Dspotless.check.skip=false -Dcheckstyle.skip=true -Drat.skip=true "
+        f"-Dmaven.gitcommitid.skip=true -Dmaven.repo.local={m2_repo}")
     lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=fetch_builder {m2_repo} {m2_repo}")
     # maven-build-cache-extension offline marker fix: the jar IS in the closure `.m2`,
@@ -1858,6 +1958,26 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
         "RUN find "
         f"{m2_repo}/org/apache/maven/extensions/maven-build-cache-extension "
         "-name _remote.repositories -delete 2>/dev/null || true")
+    # Runtime agents use uid!=0 with primary GID 0. Bake the minimum parent
+    # traverse bit plus group read/write access into the closure image itself,
+    # so it is intrinsically usable even before container_setup's repair and
+    # fail-fast checks. This is defense in depth for legacy/custom launch paths.
+    lines.append("RUN chmod g+x /root && chmod -R g+rwX /root/.m2")
+    # Prove that the dynamically selected Spotless formatter is actually in the
+    # sealed cache. The base/A worktree is clean, and `-o` makes this a closure
+    # gate even though Docker build networking is available.
+    lines.append(
+        f"RUN cd /testbed && mvn -q -o -N -Dmaven.repo.local={m2_repo} "
+        "spotless:check -Dspotless.check.skip=false -Dcheckstyle.skip=true "
+        "-Drat.skip=true -Dmaven.gitcommitid.skip=true")
+    for probe in probes:
+        if probe["pom"] == "pom.xml" and probe["goal"] == "spotless:check":
+            continue
+        lines.append(
+            "RUN " + maven_plugin_probe_cmd(
+                "/testbed", probe, m2_repo, offline=True
+            )
+        )
     # self@B removal AFTER the fetch+COPY: the online fetch may have pulled dubbo's
     # OWN 3.3.6 artifacts into the cache; delete exactly the cache_forbid_globs so
     # the closure never serves the answer and the generic audit (same globs) passes.
@@ -2158,6 +2278,7 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
             "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
             "ENV GOTOOLCHAIN=local\n"
+            f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n"
             f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n"
             "RUN chmod -R a+rX /tmp/taglib 2>/dev/null || true\n"
             "RUN chmod 755 /root && chmod -R a+rX /root/.npm 2>/dev/null || true\n")
@@ -2599,8 +2720,11 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             # (same globs) matches nothing. The per-milestone B-source gate (mvn -o
             # test-compile) applies unchanged, with the maven classifier.
             cache_paths = cfg["cache_paths"]
+            maven_plugin_probes = normalize_maven_plugin_probes(
+                cfg.get("maven_plugin_probes") or _DEFAULT_MAVEN_PLUGIN_PROBES
+            )
             df = assemble_maven_dockerfile(repo_lower, milestones, cache_paths,
-                                           forbid_globs)
+                                           forbid_globs, maven_plugin_probes)
             _docker_build(df, staging_tag, project_root)
         elif eco == "npm":
             # ONLINE-fetch the UNION of every milestone's DECLARED deps into the
@@ -2688,10 +2812,17 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             gate_classifier = classify_cargo_offline_build_failure
         else:
             gate_classifier = None
+        gate_build = offline_build
+        if eco == "maven":
+            gate_build = combine_maven_offline_build(
+                offline_build,
+                maven_plugin_probes,
+                (cfg.get("cache_paths") or [_M2_REPO_DIR])[0],
+            )
         source_state = []
         for i, m in enumerate(milestones, 1):
             print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
-            result = run_offline_gate(staging_tag, m, offline_build,
+            result = run_offline_gate(staging_tag, m, gate_build,
                                      goproxy_off=gate_goproxy_off,
                                      classifier=gate_classifier)
             if result == "SOURCE_STATE":

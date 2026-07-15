@@ -109,19 +109,21 @@ Declared per-ecosystem in the policy, injected as container env by
 | policy switch | container effect |
 |---|---|
 | `cargo_offline: true` | `CARGO_NET_OFFLINE=true` |
-| `go_offline: true` | `GOPROXY=off` (also written into `/etc/environment` + `.bashrc` by `lock_network` — shell profiles override a bare `docker -e`) |
+| `go_offline: true` | local-only `GOPROXY`, `GONOPROXY=none`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, pinned `GOFLAGS`/`GOENV`, a root-owned `BASH_ENV` contract, and per-invocation COW module/build/bin/env state |
 | `maven_offline: true` | `MAVEN_ARGS=-o` (+ `-Dmaven.repo.local=<maven_repo_local>`) |
 | `npm_offline: true` | `npm_config_offline=true` |
 | (pip — derived from `ecosystem: [pip]`, no key) | `PIP_NO_INDEX=1`, `PIP_FIND_LINKS=/wheelhouse` |
 
-This layer does double duty: it is an **independent anti-cheat line** (for go it
-is the *primary* one — `GOPROXY=off` makes `go get <self>@<target>` fail inside
-the toolchain itself, needed because proxy.golang.org can't be IP-blocked, see
-§9), and it **keeps legitimate builds working** — an online-configured manager
+This layer does double duty: it is an **independent anti-cheat line** (for Go,
+the only configured proxy is the image-baked, read-only dependency closure;
+`cache_forbid_globs` rejects any copy of the repo-under-test, so
+`go get <self>@<target>` cannot resolve), and it **keeps legitimate builds
+working** — an online-configured manager
 would hang against the DROP rules; an offline one uses the image's baked closure
-directly. `GOPROXY` is set to `off` under *any* quarantine (the mirror domains
-are hosts-poisoned anyway), and stays at the sanctioned proxy in non-quarantine
-containers (`goproxy_value` in `harness/e2e/quarantine.py`).
+directly. A Go quarantine uses the local file proxy; other quarantine ecosystems
+set `GOPROXY=off` because the public mirror domains are hosts-poisoned. An
+unprotected container keeps the sanctioned public proxy (`goproxy_value` in
+`harness/e2e/quarantine.py`).
 
 Additionally, `lock_network` removes the agent user's sudoers entry, so the
 agent cannot flush iptables or edit `/etc/hosts`.
@@ -407,7 +409,7 @@ per Step 3, or the harness will keep launching the previous generation.
   `firewall_exempt_domains` (enforced by the code-level constant
   `FIREWALL_EXEMPTABLE_DOMAINS` — a *fact*, not a self-declaration; the gate
   rejects anything else and `verify` honors only the intersection). Their
-  defense is downgraded: `/etc/hosts` poisoning + `GOPROXY=off`. That stops the
+  defense is downgraded: `/etc/hosts` poisoning + a local-only `GOPROXY`. That stops the
   toolchain and ordinary curl, **not** a deliberate `curl --resolve` with a
   known Google IP. The definitive fix for this whole shared-CDN class is a
   future **SNI-filtering egress proxy** (terminate all egress at a proxy that

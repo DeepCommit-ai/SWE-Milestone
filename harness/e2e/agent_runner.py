@@ -12,6 +12,7 @@ import json
 import logging
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -99,7 +100,7 @@ class AgentRunner:
 
     def _get_exec_env_vars(self) -> list[str]:
         """Return env var args for docker exec."""
-        return self._framework.get_container_env_vars()
+        return self._framework.get_effective_container_env_vars()
 
     # Auth error patterns from agent CLI/API responses
     _AUTH_ERROR_PATTERNS = [
@@ -1111,9 +1112,11 @@ class E2EAgentRunner(AgentRunner):
 
         # Format source directories
         src_dirs_str = ", ".join(f"`{d}`" for d in self.repo_src_dirs)
+        src_paths_str = " ".join(shlex.quote(d) for d in self.repo_src_dirs)
 
         # Replace template variables
         prompt = template.replace("{src_dirs}", src_dirs_str)
+        prompt = prompt.replace("{src_paths}", src_paths_str)
 
         return prompt
 

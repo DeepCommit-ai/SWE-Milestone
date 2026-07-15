@@ -4,8 +4,10 @@ This module provides shared container initialization logic used by both
 run_milestone.py (single milestone mode) and orchestrator.py (E2E mode).
 """
 
+import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import time
@@ -15,11 +17,19 @@ from typing import Optional
 from harness.e2e.agents import AgentFramework, get_agent_framework
 from harness.e2e.image_version import parse_local_ref
 from harness.e2e.quarantine import (
+    GO_OFFLINE_FILE_PROXY,
+    GO_OFFLINE_SHELL_ENV,
     FIREWALL_EXEMPTABLE_DOMAINS,
     QUARANTINE_MIRROR_DOMAINS,
     cidr_overlaps_any,
     goproxy_value,
     load_quarantine_env,
+    normalize_maven_plugin_probes,
+)
+from harness.e2e.runtime_policy_binding import (
+    RUNTIME_POLICY_ENV_KEYS,
+    RuntimePolicyBinding,
+    RuntimePolicyBindingError,
 )
 
 logger = logging.getLogger("e2e.container_setup")
@@ -237,6 +247,65 @@ def _recover_quarantine_env(repo_name, image_name: str, project_root=None) -> di
     return _quarantine_env_from_image(image_name, project_root)
 
 
+def _configured_cache_paths() -> list[str]:
+    """Return validated, de-duplicated quarantine cache paths from the env.
+
+    ``closure.cache_paths`` is exported as JSON by ``load_quarantine_env``.
+    Keep the Maven-specific variable as a backward-compatible fallback for
+    workers launched with an older policy env.  Invalid or dangerous paths fail
+    closed: container setup must never recursively adjust ``/`` or a relative
+    host-controlled path.
+    """
+    raw = os.environ.get("SWE_MILESTONE_CACHE_PATHS", "").strip()
+    paths: list[str] = []
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "SWE_MILESTONE_CACHE_PATHS must be a JSON list of absolute paths"
+            ) from exc
+        if not isinstance(decoded, list) or not all(isinstance(path, str) for path in decoded):
+            raise RuntimeError(
+                "SWE_MILESTONE_CACHE_PATHS must be a JSON list of absolute paths"
+            )
+        paths.extend(decoded)
+
+    maven_repo = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL", "").strip()
+    if maven_repo:
+        paths.append(maven_repo)
+
+    normalized: list[str] = []
+    for path in paths:
+        clean = os.path.normpath(path.strip())
+        if not clean.startswith("/") or clean == "/":
+            raise RuntimeError(
+                f"Invalid quarantine cache path {path!r}: expected an absolute path below /"
+            )
+        if clean not in normalized:
+            normalized.append(clean)
+    return normalized
+
+
+def inspect_docker_image_id(image_or_container: str, *, container: bool = False) -> str:
+    """Return a normalized full Docker image ID or fail closed.
+
+    Image tags are mutable; callers persist this digest and use it to bind a
+    trial/snapshot to the exact bytes that actually backed the container.
+    """
+    if container:
+        command = ["docker", "container", "inspect", image_or_container, "--format", "{{.Image}}"]
+    else:
+        command = ["docker", "image", "inspect", image_or_container, "--format", "{{.Id}}"]
+    result = subprocess.run(command, capture_output=True, text=True)
+    value = (result.stdout or "").strip().removeprefix("sha256:")
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", value):
+        detail = (result.stderr or result.stdout or "missing image ID").strip()
+        kind = "container" if container else "image"
+        raise RuntimeError(f"Cannot inspect {kind} image ID for {image_or_container}: {detail}")
+    return value
+
+
 class ContainerSetup:
     """Docker container initialization with fakeroot user and Claude credentials."""
 
@@ -249,7 +318,9 @@ class ContainerSetup:
         e2e_workspace_path: Optional[Path] = None,
         agent_framework_name: str = "claude-code",
         reasoning_effort: Optional[str] = None,
+        agent_version: Optional[str] = None,
         repo_name: Optional[str] = None,
+        runtime_policy_binding: Optional[RuntimePolicyBinding] = None,
     ):
         """Initialize container setup.
 
@@ -260,6 +331,7 @@ class ContainerSetup:
             agent_name: Git user name for agent commits (default: claude)
             e2e_workspace_path: Path to mount as /e2e_workspace (for E2E mode)
             agent_framework_name: Agent framework to use (default: claude-code)
+            agent_version: Optional agent CLI version selector.
         """
         self.container_name = container_name
         self.image_name = image_name
@@ -272,8 +344,22 @@ class ContainerSetup:
         framework_kwargs = {}
         if reasoning_effort:
             framework_kwargs["reasoning_effort"] = reasoning_effort
+        if agent_version:
+            framework_kwargs["agent_version"] = agent_version
         self._framework: AgentFramework = get_agent_framework(agent_framework_name, **framework_kwargs)
         self.repo_name = repo_name
+        self.runtime_policy_binding = runtime_policy_binding
+        self.resolved_image_id: Optional[str] = None
+
+        if (
+            self.runtime_policy_binding is not None
+            and self.runtime_policy_binding.repo_name != self.repo_name
+        ):
+            raise RuntimePolicyBindingError(
+                "container runtime policy binding mismatch: "
+                f"expected {self.repo_name!r}, got "
+                f"{self.runtime_policy_binding.repo_name!r}"
+            )
 
         # F2: run_all injects the quarantine env into the worker subprocess; a
         # direct run_e2e --resume-trial or a manual run_milestone does NOT.
@@ -283,7 +369,9 @@ class ContainerSetup:
         # present (run_all path — leave it so a canary env override still applies)
         # or when SWE_MILESTONE_UNPROTECTED is set (operator explicitly wants an open
         # baseline). Uses the authoritative repo_name, not a fragile image parse.
-        if not os.environ.get("SWE_MILESTONE_QUARANTINE") and not os.environ.get("SWE_MILESTONE_UNPROTECTED"):
+        if self.runtime_policy_binding is not None:
+            self._verify_bound_runtime_policy_env()
+        elif not os.environ.get("SWE_MILESTONE_QUARANTINE") and not os.environ.get("SWE_MILESTONE_UNPROTECTED"):
             _recovered = _recover_quarantine_env(repo_name, image_name)
             if _recovered:
                 os.environ.update(_recovered)
@@ -291,6 +379,29 @@ class ContainerSetup:
                     f"Quarantine env recovered from policy for "
                     f"'{repo_name or _repo_from_image(image_name)}' (env-less launch path)"
                 )
+
+    def _verify_bound_runtime_policy_env(self) -> None:
+        """Fail closed if process env no longer matches the trial binding."""
+        binding = getattr(self, "runtime_policy_binding", None)
+        if binding is None:
+            return
+        expected = dict(binding.env)
+        actual = {
+            key: os.environ[key]
+            for key in RUNTIME_POLICY_ENV_KEYS
+            if key in os.environ
+        }
+        if actual != expected:
+            raise RuntimePolicyBindingError(
+                "process runtime policy environment drifted from trial binding: "
+                f"expected={expected}, actual={actual}"
+            )
+        unprotected = bool(os.environ.get("SWE_MILESTONE_UNPROTECTED"))
+        if unprotected != (binding.mode == "unprotected"):
+            raise RuntimePolicyBindingError(
+                "SWE_MILESTONE_UNPROTECTED disagrees with runtime policy mode "
+                f"{binding.mode!r}"
+            )
 
     def get_agent_mounts(self) -> list[str]:
         """Return Docker volume mount arguments for the agent.
@@ -310,7 +421,44 @@ class ContainerSetup:
         Returns:
             List of -e arguments for docker run
         """
-        return self._framework.get_container_env_vars()
+        return self._framework.get_effective_container_env_vars()
+
+    def get_agent_version(self, *, verify_requested: bool = False) -> Optional[str]:
+        """Read and normalize the agent CLI version inside the container.
+
+        When ``verify_requested`` is true, an unavailable or mismatched exact
+        version is fatal. Channel selectors such as ``stable`` and ``latest``
+        are validated by the installer and accept the numeric version it chose.
+        """
+        command = self._framework.get_version_command()
+        requested = self._framework.get_requested_version()
+        if not command:
+            if verify_requested and requested:
+                raise RuntimeError(
+                    f"Agent framework {self._framework.FRAMEWORK_NAME!r} does not support version detection"
+                )
+            return None
+
+        result = subprocess.run(
+            ["docker", "exec", self.container_name, *command],
+            capture_output=True,
+            text=True,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        actual = self._framework.parse_version_output(output) if result.returncode == 0 else None
+
+        if verify_requested and requested:
+            if not actual:
+                raise RuntimeError(
+                    f"Could not detect {self._framework.FRAMEWORK_NAME} version after requesting "
+                    f"{requested!r}: {output or f'exit code {result.returncode}'}"
+                )
+            if not self._framework.version_matches_request(actual):
+                raise RuntimeError(
+                    f"{self._framework.FRAMEWORK_NAME} version mismatch: "
+                    f"requested {requested!r}, found {actual!r}"
+                )
+        return actual
 
     # Backward compatibility alias
     def get_claude_mounts(self) -> list[str]:
@@ -335,6 +483,8 @@ class ContainerSetup:
         Returns:
             Python script as a string
         """
+        configured_cache_paths = _configured_cache_paths()
+        go_offline = bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE"))
         return f'''
 import os
 import pwd
@@ -452,14 +602,58 @@ try:
         '/usr/local/rustup',     # Rustup home
         '/root/.cargo',          # Alternative cargo location
         '/root/.rustup',         # Alternative rustup location
-        '/usr/local/go',         # Go installation
-        '/go',                   # Go workspace (GOPATH default in many images)
-        '/root/go',              # Go workspace (alternative)
         '/usr/local/lib/node_modules',  # Global npm modules
         '/root/.npm',            # npm cache
         '/root/.cache',          # General cache (pip, etc.)
         '/root/.m2',             # Maven local repo (fakeroot needs rw under the quarantine maven.repo.local redirect)
     ]
+    go_offline = {go_offline!r}
+    if not go_offline:
+        # Legacy/open Go workflows may still need to install into GOPATH. In a
+        # sealed Go trial the toolchain and canonical proxy are immutable and
+        # writable build/module caches live under fakeroot's home instead.
+        toolchain_dirs.extend(['/usr/local/go', '/go', '/root/go'])
+
+    # The policy's closure.cache_paths are the authoritative caches actually
+    # consumed under quarantine.  A cache can itself be readable while an
+    # ancestor (notably /root at 0700) blocks fakeroot.  Grant only traverse on
+    # ancestors; the declared cache/toolchain directory itself also gets read.
+    # Never add ancestor read/write. Apply this to all known toolchain dirs too,
+    # so a future /root-based Cargo/npm cache cannot repeat Maven's failure.
+    configured_cache_paths = {configured_cache_paths!r}
+    access_paths = list(dict.fromkeys(toolchain_dirs + configured_cache_paths))
+    fake_groups = set(os.getgrouplist(fake_user.pw_name, gid))
+    adjusted_ancestors = set()
+    for access_path in access_paths:
+        path = Path(access_path)
+        if not path.exists():
+            continue
+        candidates = [path] + list(path.parents)
+        for candidate in candidates:
+            if candidate == Path('/') or not candidate.is_dir():
+                continue
+            st = candidate.stat()
+            mode = stat.S_IMODE(st.st_mode)
+            if st.st_uid == uid:
+                required = stat.S_IXUSR
+                if candidate == path:
+                    required |= stat.S_IRUSR
+            elif st.st_gid in fake_groups:
+                required = stat.S_IXGRP
+                if candidate == path:
+                    required |= stat.S_IRGRP
+            else:
+                required = stat.S_IXOTH
+                if candidate == path:
+                    required |= stat.S_IROTH
+            if (mode & required) != required:
+                os.chmod(candidate, mode | required)
+                adjusted_ancestors.add(str(candidate))
+    if adjusted_ancestors:
+        print(
+            "Granted fakeroot traverse-only access to cache/toolchain ancestors: "
+            + ", ".join(sorted(adjusted_ancestors))
+        )
 
     for toolchain_dir in toolchain_dirs:
         if os.path.exists(toolchain_dir):
@@ -474,6 +668,55 @@ try:
                     print(f"Made {{toolchain_dir}} group-writable")
                 else:
                     print(f"Failed to fix permissions for {{toolchain_dir}}")
+
+    if go_offline:
+        immutable_go_paths = [
+            Path('/usr/local/go'),
+            Path('/go/pkg/mod/cache/download'),
+        ]
+        for immutable in immutable_go_paths:
+            if not immutable.exists():
+                raise RuntimeError(f"sealed Go path is missing: {{immutable}}")
+            subprocess.run(
+                ['chown', '-R', '0:0', str(immutable)], check=True,
+                capture_output=True, text=True,
+            )
+            # Canonical toolchain/proxy bytes must survive every model and
+            # milestone unchanged. Go writes locks/extracted modules only to
+            # the separate fakeroot-owned GOMODCACHE below.
+            for root, dirs, files in os.walk(immutable):
+                root_mode = stat.S_IMODE(os.stat(root).st_mode)
+                os.chmod(root, (root_mode | 0o555) & ~0o222)
+                for name in files:
+                    item = os.path.join(root, name)
+                    if not os.path.islink(item):
+                        item_mode = stat.S_IMODE(os.stat(item).st_mode)
+                        os.chmod(item, (item_mode | 0o444) & ~0o222)
+        for parent in [
+            Path('/go'), Path('/go/pkg'), Path('/go/pkg/mod'), Path('/go/pkg/mod/cache')
+        ]:
+            if parent.exists():
+                os.chown(parent, 0, 0)
+                os.chmod(parent, 0o755)
+
+        for writable in [
+            Path('/home/fakeroot/.cache/evoclaw-gomodcache'),
+            Path('/home/fakeroot/.cache/go-build'),
+            Path('/home/fakeroot/.cache/evoclaw-goenv'),
+            Path('/home/fakeroot/go/bin'),
+        ]:
+            writable.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ['chown', '-R', f'{{uid}}:{{gid}}', str(writable)], check=True,
+                capture_output=True, text=True,
+            )
+            os.chmod(writable, 0o755)
+        marker = Path('/var/lib/evoclaw/go-runtime-sealed-v1')
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('immutable=/usr/local/go,/go/pkg/mod/cache/download\\n')
+        os.chown(marker, 0, 0)
+        os.chmod(marker, 0o444)
+        print("Sealed Go toolchain/file proxy; initialized writable per-agent caches")
 
     # Ensure /tmp has correct permissions (some tools need it)
     if os.path.exists('/tmp'):
@@ -551,6 +794,8 @@ print("Container initialization complete!")
             extra_mounts: Additional -v mount arguments
             force: If True, remove existing container first
         """
+        self._verify_bound_runtime_policy_env()
+
         # Check for existing container
         if self.container_exists():
             if force:
@@ -559,19 +804,23 @@ print("Container initialization complete!")
             else:
                 if self.is_running():
                     logger.info(f"Container {self.container_name} already running")
+                    self.resolved_image_id = inspect_docker_image_id(
+                        self.container_name, container=True
+                    )
+                    self.verify_runtime_environment()
                     return
                 else:
                     logger.info(f"Starting existing container {self.container_name}...")
                     subprocess.run(["docker", "start", self.container_name], check=True)
+                    self.resolved_image_id = inspect_docker_image_id(
+                        self.container_name, container=True
+                    )
+                    self.verify_runtime_environment()
                     return
 
         # Verify image exists
-        result = subprocess.run(
-            ["docker", "image", "inspect", self.image_name],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Docker image not found: {self.image_name}")
+        self.resolved_image_id = inspect_docker_image_id(self.image_name)
+        immutable_image = f"sha256:{self.resolved_image_id}"
 
         logger.info(f"Launching container {self.container_name} from {self.image_name}...")
 
@@ -615,7 +864,10 @@ print("Container initialization complete!")
             docker_options.extend(extra_mounts)
 
         # Add image and command
-        cmd = docker_options + [self.image_name, "tail", "-f", "/dev/null"]
+        # Resolve the mutable user-facing tag once, then run the immutable
+        # digest. This closes the inspect -> docker run retag race and makes the
+        # actual agent base independently auditable.
+        cmd = docker_options + [immutable_image, "tail", "-f", "/dev/null"]
 
         logger.debug(f"Docker run command: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
@@ -643,7 +895,517 @@ print("Container initialization complete!")
         # Wait for fakeroot user
         self._wait_for_fakeroot()
 
+        # Fresh and resume paths share the same data-driven runtime gate.
+        self.verify_runtime_environment()
+
         logger.info(f"Container {self.container_name} launched and initialized.")
+
+    def _repair_existing_quarantine_cache_access(self) -> None:
+        """Repair cache permissions when resuming a pre-fix container.
+
+        Existing containers bypass the full initialization script.  Without a
+        targeted repair, an old /root=0700 container would remain broken forever
+        even when resumed with the fixed harness.  Only policy-declared cache
+        paths are touched; Maven's local repository additionally needs recursive
+        ownership/write because reactor builds install artifacts into it.
+        """
+        cache_paths = _configured_cache_paths()
+        if not cache_paths:
+            return
+        maven_repo = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL", "").strip()
+        script = f'''
+import os
+import pwd
+import stat
+import subprocess
+from pathlib import Path
+
+cache_paths = {cache_paths!r}
+maven_repo = {maven_repo!r}
+fake_user = pwd.getpwnam("fakeroot")
+uid, gid = fake_user.pw_uid, fake_user.pw_gid
+fake_groups = set(os.getgrouplist(fake_user.pw_name, gid))
+
+if maven_repo and Path(maven_repo).is_dir():
+    subprocess.run(["chown", "-R", f"{{uid}}:{{gid}}", maven_repo], check=True)
+    subprocess.run(["chmod", "-R", "u+rwX", maven_repo], check=True)
+
+adjusted = []
+for raw_path in cache_paths:
+    path = Path(raw_path)
+    if not path.exists():
+        continue
+    for candidate in [path] + list(path.parents):
+        if candidate == Path("/") or not candidate.is_dir():
+            continue
+        st = candidate.stat()
+        mode = stat.S_IMODE(st.st_mode)
+        if st.st_uid == uid:
+            required = stat.S_IXUSR
+            if candidate == path:
+                required |= stat.S_IRUSR
+        elif st.st_gid in fake_groups:
+            required = stat.S_IXGRP
+            if candidate == path:
+                required |= stat.S_IRGRP
+        else:
+            required = stat.S_IXOTH
+            if candidate == path:
+                required |= stat.S_IROTH
+        if (mode & required) != required:
+            os.chmod(candidate, mode | required)
+            adjusted.append(str(candidate))
+print("cache permission repair complete: " + ", ".join(sorted(set(adjusted))))
+'''
+        result = subprocess.run(
+            ["docker", "exec", self.container_name, "python3", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown permission error"
+            raise RuntimeError(
+                f"Failed to repair quarantine cache permissions: {detail}"
+            )
+        logger.info(result.stdout.strip() or "Quarantine cache permission repair complete")
+
+    def _harden_go_offline_runtime(self) -> None:
+        """Seal canonical Go input while leaving per-agent caches writable."""
+        if not os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+            return
+        marker = subprocess.run(
+            [
+                "docker", "exec", self.container_name, "test", "-f",
+                "/var/lib/evoclaw/go-runtime-sealed-v1",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if marker.returncode != 0:
+            # Legacy containers made these trees writable before the immutable
+            # split existed. Never seal unknown bytes in place: compare every
+            # canonical regular file/symlink to a pristine container launched
+            # from this trial's exact image ID, then migrate permissions.
+            digest_script = r'''
+set -eu
+for root in /usr/local/go /go/pkg/mod/cache/download; do
+  find "$root" \( -type f -o -type l \) -print0
+done | sort -z | while IFS= read -r -d '' path; do
+  # Go's old shared GOMODCACHE may have left zero-byte download locks.
+  # They contain no dependency bytes and are ignored by module resolution.
+  # Any symlink or non-empty .lock remains part of the digest and fails shut.
+  if test -f "$path" && test ! -L "$path" && test ! -s "$path" &&
+     case "$path" in *.lock) true;; *) false;; esac; then
+    continue
+  elif test -L "$path"; then
+    printf 'link\t%s\t%s\n' "$path" "$(readlink "$path")"
+  else
+    printf 'file\t%s\t' "$path"
+    sha256sum "$path" | awk '{print $1}'
+  fi
+done | sha256sum | awk '{print $1}'
+'''
+            current = subprocess.run(
+                [
+                    "docker", "exec", self.container_name, "bash", "-c",
+                    digest_script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            image_id = inspect_docker_image_id(self.container_name, container=True)
+            pristine = subprocess.run(
+                [
+                    "docker", "run", "--rm", "--pull=never", "--network", "none",
+                    "--entrypoint", "bash", f"sha256:{image_id}", "-c",
+                    digest_script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            current_digest = (current.stdout or "").strip()
+            pristine_digest = (pristine.stdout or "").strip()
+            if (
+                current.returncode != 0
+                or pristine.returncode != 0
+                or not re.fullmatch(r"[0-9a-f]{64}", current_digest)
+                or current_digest != pristine_digest
+            ):
+                detail = "\n".join(
+                    part
+                    for part in (
+                        current.stderr,
+                        pristine.stderr,
+                        f"container={current_digest or '?'} pristine={pristine_digest or '?'}",
+                    )
+                    if part
+                )
+                raise RuntimeError(
+                    "Legacy Go runtime/cache differs from its pinned base image; "
+                    "refusing resume instead of blessing possibly model-mutated bytes:\n"
+                    + detail[-4000:]
+                )
+        script = r'''
+set -eu
+marker=/var/lib/evoclaw/go-runtime-sealed-v1
+if test ! -f "$marker"; then
+  for path in /usr/local/go /go/pkg/mod/cache/download; do
+    test -d "$path"
+    chown -R 0:0 "$path"
+    chmod -R a+rX,a-w "$path"
+  done
+  for parent in /go /go/pkg /go/pkg/mod /go/pkg/mod/cache; do
+    test -d "$parent"
+    chown root:root "$parent"
+    chmod 0755 "$parent"
+  done
+  install -d -o fakeroot -g 0 -m 0755 \
+    /home/fakeroot/.cache/evoclaw-gomodcache \
+    /home/fakeroot/.cache/go-build \
+    /home/fakeroot/.cache/evoclaw-goenv \
+    /home/fakeroot/go/bin
+  install -d -o root -g root -m 0755 /var/lib/evoclaw
+  printf '%s\n' 'immutable=/usr/local/go,/go/pkg/mod/cache/download' > "$marker"
+  chown root:root "$marker"
+  chmod 0444 "$marker"
+fi
+install -d -o root -g root -m 0755 /etc/evoclaw
+cat > __GO_SHELL_ENV__ <<'EVOCLAW_GO_RUNTIME'
+export GOPROXY=__GO_FILE_PROXY__
+export GONOPROXY=none
+export GOSUMDB=off
+export GOTOOLCHAIN=local
+export GOFLAGS=-buildvcs=false
+export GOENV=/home/fakeroot/.cache/evoclaw-goenv/env
+export GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache
+export GOCACHE=/home/fakeroot/.cache/go-build
+export GOBIN=/home/fakeroot/go/bin
+export PATH=/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export BASH_ENV=__GO_SHELL_ENV__
+EVOCLAW_GO_RUNTIME
+chown root:root __GO_SHELL_ENV__
+chmod 0444 __GO_SHELL_ENV__
+'''
+        script = script.replace("__GO_FILE_PROXY__", GO_OFFLINE_FILE_PROXY)
+        script = script.replace("__GO_SHELL_ENV__", GO_OFFLINE_SHELL_ENV)
+        result = subprocess.run(
+            ["docker", "exec", self.container_name, "sh", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "hardening failed").strip()
+            raise RuntimeError(f"Failed to seal Go runtime/cache: {detail}")
+
+    def _prepare_go_disposable_dirs(self, *, reset_module_cache: bool) -> None:
+        """Symlink-safely restore model-owned Go cache/output directories.
+
+        ``reset_module_cache`` is kept as the public compatibility switch, but
+        a requested reset covers every disposable Go output and user GOENV.
+        Leaving GOCACHE, GOBIN, or ``go env -w`` state populated would otherwise
+        leak model-produced state into the next invocation just as surely as
+        leaving GOMODCACHE populated.
+        """
+        if not os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+            return
+        reset = "1" if reset_module_cache else "0"
+        script = r'''
+set -eu
+reset_disposable=$1
+home=/home/fakeroot
+module=/home/fakeroot/.cache/evoclaw-gomodcache
+if test -L "$home" || test ! -d "$home"; then
+  echo "fakeroot home is missing or a symlink: $home" >&2
+  exit 1
+fi
+# The model owns these immediate parents and may replace either with a symlink.
+# Repair the parent before touching a child path; checking only the child would
+# let e.g. /home/fakeroot/go -> /usr/local/go redirect a root cleanup into the
+# sealed toolchain.
+for parent in "$home/.cache" "$home/go"; do
+  if test -L "$parent" || test ! -d "$parent"; then
+    rm -rf -- "$parent"
+    install -d -o fakeroot -g 0 -m 0755 "$parent"
+  else
+    chown fakeroot:0 "$parent"
+    chmod 0755 "$parent"
+  fi
+done
+for path in "$module" /home/fakeroot/.cache/go-build \
+  /home/fakeroot/.cache/evoclaw-goenv /home/fakeroot/go/bin; do
+  if test -L "$path" || test ! -d "$path"; then
+    rm -rf -- "$path"
+    install -d -o fakeroot -g 0 -m 0755 "$path"
+  else
+    chown fakeroot:0 "$path"
+    chmod 0755 "$path"
+  fi
+  if test "$reset_disposable" = 1; then
+    find "$path" -xdev -mindepth 1 -delete
+  fi
+done
+'''
+        result = subprocess.run(
+            [
+                "docker", "exec", self.container_name, "sh", "-c", script,
+                "evoclaw-go-disposable", reset,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "cache repair failed").strip()
+            raise RuntimeError(f"Cannot prepare disposable Go directories: {detail}")
+
+    def _verify_go_offline_runtime(self) -> None:
+        """Fail closed on toolchain/proxy drift or an unusable writable COW cache."""
+        if not os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+            return
+        expected = os.environ.get("SWE_MILESTONE_GO_TOOLCHAIN", "").removeprefix("go")
+        script = r'''
+set -eu
+printf 'executable=%s\n' "$(command -v go)"
+printf 'version=%s\n' "$(go version)"
+printf 'goroot=%s\n' "$(go env GOROOT)"
+printf 'gomodcache=%s\n' "$(go env GOMODCACHE)"
+printf 'gocache=%s\n' "$(go env GOCACHE)"
+printf 'goproxy=%s\n' "$(go env GOPROXY)"
+printf 'gotoolchain=%s\n' "$(go env GOTOOLCHAIN)"
+printf 'goflags=%s\n' "$(go env GOFLAGS)"
+printf 'goenv=%s\n' "$(go env GOENV)"
+printf 'bash_env=%s\n' "${BASH_ENV:-}"
+printf 'bash_go=%s\n' "$(bash -lc 'command -v go')"
+printf 'bash_goproxy=%s\n' "$(bash -lc 'go env GOPROXY')"
+printf 'bash_goenv=%s\n' "$(bash -lc 'go env GOENV')"
+printf 'bash_goflags=%s\n' "$(bash -lc 'go env GOFLAGS')"
+printf 'golang_version=%s\n' "${GOLANG_VERSION:-}"
+test -r /var/lib/evoclaw/go-runtime-sealed-v1
+test ! -w /usr/local/go
+test ! -w /usr/local/go/bin/go
+test ! -w /go/pkg/mod/cache/download
+test ! -w /go/pkg/mod/cache
+test ! -w /go/pkg/mod
+test -z "$(find /usr/local/go /go/pkg/mod/cache/download -type d ! -executable -print -quit)"
+test -z "$(find /usr/local/go /go/pkg/mod/cache/download -type f ! -readable -print -quit)"
+test -w /home/fakeroot/.cache/evoclaw-gomodcache
+test -w /home/fakeroot/.cache/go-build
+test -w /home/fakeroot/.cache/evoclaw-goenv
+test -w /home/fakeroot/go/bin
+test -r __GO_SHELL_ENV__
+test ! -w __GO_SHELL_ENV__
+'''
+        script = script.replace("__GO_SHELL_ENV__", GO_OFFLINE_SHELL_ENV)
+        env = [
+            "-e", "HOME=/home/fakeroot",
+            "-e", f"GOPROXY={GO_OFFLINE_FILE_PROXY}",
+            "-e", "GONOPROXY=none",
+            "-e", "GOSUMDB=off",
+            "-e", "GOTOOLCHAIN=local",
+            "-e", "GOFLAGS=-buildvcs=false",
+            "-e", "GOENV=/home/fakeroot/.cache/evoclaw-goenv/env",
+            "-e", f"BASH_ENV={GO_OFFLINE_SHELL_ENV}",
+            "-e", "GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache",
+            "-e", "GOCACHE=/home/fakeroot/.cache/go-build",
+            "-e", "GOBIN=/home/fakeroot/go/bin",
+            "-e", (
+                "PATH=/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+        ]
+        if expected:
+            # Legacy images may carry stale Config.Env metadata even though the
+            # sealed toolchain bytes are correct. Every agent framework and this
+            # verifier explicitly bind the policy version for each docker exec.
+            env.extend(["-e", f"GOLANG_VERSION={expected}"])
+        result = subprocess.run(
+            [
+                "docker", "exec", "--user", "fakeroot", *env,
+                self.container_name, "sh", "-c", script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = "\n".join(
+            part for part in (result.stdout, result.stderr) if part
+        ).strip()
+        version_match = re.search(
+            r"^version=go version go([0-9.]+)\s", output, re.MULTILINE
+        )
+        actual = version_match.group(1) if version_match else ""
+        required = {
+            "executable=/usr/local/go/bin/go",
+            "goroot=/usr/local/go",
+            "gomodcache=/home/fakeroot/.cache/evoclaw-gomodcache",
+            "gocache=/home/fakeroot/.cache/go-build",
+            f"goproxy={GO_OFFLINE_FILE_PROXY}",
+            "gotoolchain=local",
+            "goflags=-buildvcs=false",
+            "goenv=/home/fakeroot/.cache/evoclaw-goenv/env",
+            f"bash_env={GO_OFFLINE_SHELL_ENV}",
+            "bash_go=/usr/local/go/bin/go",
+            f"bash_goproxy={GO_OFFLINE_FILE_PROXY}",
+            "bash_goenv=/home/fakeroot/.cache/evoclaw-goenv/env",
+            "bash_goflags=-buildvcs=false",
+        }
+        missing = sorted(item for item in required if item not in output.splitlines())
+        if expected and f"golang_version={expected}" not in output.splitlines():
+            missing.append(f"golang_version={expected}")
+        if result.returncode != 0 or missing or (expected and actual != expected):
+            raise RuntimeError(
+                "Sealed Go runtime verification failed"
+                + (f" (expected go{expected}, found go{actual or '?'})" if expected else "")
+                + (f"; missing probes: {missing}" if missing else "")
+                + f":\n{output}"
+            )
+        logger.info("Sealed Go runtime verified: go%s, immutable local proxy", actual)
+
+    def verify_runtime_environment(self) -> None:
+        """Shared fresh/resume gate for all quarantine runtime prerequisites."""
+        self._verify_bound_runtime_policy_env()
+        self._repair_existing_quarantine_cache_access()
+        self._harden_go_offline_runtime()
+        self._prepare_go_disposable_dirs(reset_module_cache=False)
+        self._verify_quarantine_cache_access()
+        self._verify_maven_offline_smoke()
+        self._verify_go_offline_runtime()
+
+    def prepare_agent_invocation(self) -> None:
+        """Verify shared inputs and reset disposable Go state before a model turn."""
+        self._verify_bound_runtime_policy_env()
+        # A model may legitimately run ``go clean -modcache`` or remove its
+        # disposable caches. Repair/reset them before the verifier demands
+        # writability; immutable toolchain/proxy inputs are checked afterward.
+        self._prepare_go_disposable_dirs(reset_module_cache=True)
+        self.verify_runtime_environment()
+        if not os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+            return
+        logger.info("Disposable Go module cache reset before agent invocation")
+
+    def _verify_quarantine_cache_access(self) -> None:
+        """Fail fast when fakeroot cannot consume an image-baked cache."""
+        cache_paths = _configured_cache_paths()
+        maven_repo = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL", "").strip()
+        go_offline = bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE"))
+        for cache_path in cache_paths:
+            # All caches must be non-empty, readable and traversable. Maven also
+            # installs reactor artifacts into its local repo, so it must be
+            # writable. The first-file probe catches a path that exists but is an
+            # empty/wrong cache (the original failure otherwise looked like an
+            # ordinary offline dependency miss).
+            if cache_path == maven_repo:
+                writable_check = ' && test -w "$1"'
+            elif go_offline and cache_path.endswith("/cache/download"):
+                writable_check = ' && test ! -w "$1"'
+            else:
+                writable_check = ""
+            probe = (
+                'test -d "$1" && test -r "$1" && test -x "$1"'
+                + writable_check
+                + ' && first=$(find "$1" -type f -print -quit 2>/dev/null)'
+                + ' && test -n "$first" && test -r "$first"'
+            )
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "fakeroot",
+                    "-e",
+                    "HOME=/home/fakeroot",
+                    self.container_name,
+                    "/bin/sh",
+                    "-c",
+                    probe,
+                    "sh",
+                    cache_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                detail = (
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "path missing, empty, or permission denied"
+                )
+                raise RuntimeError(
+                    "Configured offline cache is not usable by fakeroot: "
+                    f"{cache_path} ({detail})"
+                )
+            logger.info(f"Offline cache is usable by fakeroot: {cache_path}")
+
+    def _verify_maven_offline_smoke(self) -> None:
+        """Load Maven extensions and config-selected plugin engines offline."""
+        repo = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL", "").strip()
+        if not repo:
+            return
+
+        raw = os.environ.get("SWE_MILESTONE_MAVEN_PLUGIN_PROBES", "").strip()
+        try:
+            configured = json.loads(raw) if raw else [
+                {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 120}
+            ]
+            probes = normalize_maven_plugin_probes(configured)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid Maven plugin probe configuration: {exc}") from exc
+        if not probes:
+            raise RuntimeError("Maven offline mode has no configured plugin probes")
+
+        for probe in probes:
+            command = [
+                "docker",
+                "exec",
+                "--user",
+                "fakeroot",
+                "-e",
+                "HOME=/home/fakeroot",
+                "-w",
+                self.workdir,
+                self.container_name,
+                "mvn",
+                "-q",
+                "-o",
+                f"-Dmaven.repo.local={repo}",
+                "-N",
+                "-f",
+                probe["pom"],
+                probe["goal"],
+                "-Dspotless.check.skip=false",
+                "-Dcheckstyle.skip=true",
+                "-Drat.skip=true",
+                "-Dmaven.gitcommitid.skip=true",
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=probe["timeout_seconds"],
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "Maven offline cache smoke test timed out for "
+                    f"{probe['pom']} {probe['goal']}"
+                ) from exc
+            if result.returncode != 0:
+                detail = (result.stderr.strip() or result.stdout.strip() or "unknown Maven error")[-4000:]
+                raise RuntimeError(
+                    "Maven offline cache smoke test failed for "
+                    f"{probe['pom']} {probe['goal']} ({repo}): {detail}"
+                )
+            logger.info(
+                "Maven offline cache smoke test passed: %s %s (%s)",
+                probe["pom"],
+                probe["goal"],
+                repo,
+            )
 
     def _ensure_python3(self) -> None:
         """Ensure Python3 is available in the container.
@@ -768,6 +1530,20 @@ git config --global --add safe.directory /testbed 2>/dev/null || true
 
 MAIN_BRANCH="{main_branch}"
 
+# Some release images intentionally contain only the prepared source tree and
+# omit .git.  Submission tags are the evaluator's source of truth, so create a
+# single baseline commit before handing the tree to the agent.  Do this in the
+# harness instead of relying on an agent to notice and repair the environment.
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "No Git repository found; creating a single baseline commit..."
+    git init -q
+    git config user.name "SWE-Milestone Harness"
+    git config user.email "harness@swe-milestone.local"
+    git add -A
+    git commit -q -m "Initial baseline"
+    echo "  Baseline repository initialized"
+fi
+
 echo "=== Git History Truncation ==="
 echo "Current HEAD: $(git rev-parse HEAD)"
 echo "Current branch: $(git branch --show-current 2>/dev/null || echo 'detached')"
@@ -871,9 +1647,12 @@ echo "Git history truncated successfully"
                     logger.warning(f"  {line}")
 
         if result.returncode != 0:
-            logger.warning(f"Git history truncation returned non-zero exit code: {result.returncode}")
-        else:
-            logger.info("Git history truncation completed")
+            detail = (result.stderr or result.stdout or "unknown Git error").strip()
+            raise RuntimeError(
+                f"Git baseline initialization/history truncation failed "
+                f"(exit {result.returncode}): {detail}"
+            )
+        logger.info("Git history truncation completed")
 
     def _resolve_whitelisted_ips(self) -> set[str]:
         """Resolve all WHITELISTED_DOMAINS to IP addresses from the host.
@@ -1077,21 +1856,51 @@ echo "/etc/hosts poisoned with {len(_poison)} domains"
         logger.info(f"  /etc/hosts poisoned ({len(_poison)} domains)")
 
         # --- Step 5: Set Go env vars ---
-        # GOPROXY=off under go quarantine (the proxy is the answer channel) OR
-        # any quarantine (mirror domains are hosts-poisoned above, so a bare
-        # proxy URL would resolve to 0.0.0.0 and every fetch would fail). A
-        # non-quarantine container keeps the sanctioned proxy. Shell profiles
-        # override docker -e, so this MUST be written here (#4).
+        # Go quarantine uses the image-baked local file proxy; other quarantine
+        # ecosystems use GOPROXY=off because the public mirror domains are
+        # hosts-poisoned above. A non-quarantine container keeps the sanctioned
+        # public proxy. Shell profiles override docker -e, so this MUST be
+        # written here (#4).
         _goproxy = goproxy_value(
             go_offline=bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE")),
             quarantine_active=_quarantine,
         )
+        _go_offline = bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE"))
+        if _go_offline and _goproxy != GO_OFFLINE_FILE_PROXY:
+            raise RuntimeError("Go-offline policy did not resolve to the local file proxy")
+        _go_extra = ""
+        _go_shell_extra = ""
+        if _go_offline:
+            _go_extra = """
+GONOPROXY=none
+GOSUMDB=off
+GOTOOLCHAIN=local
+GOFLAGS=-buildvcs=false
+GOENV=/home/fakeroot/.cache/evoclaw-goenv/env
+BASH_ENV={GO_OFFLINE_SHELL_ENV}
+GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache
+GOCACHE=/home/fakeroot/.cache/go-build
+GOBIN=/home/fakeroot/go/bin
+"""
+            _go_shell_extra = """
+export GONOPROXY=none
+export GOSUMDB=off
+export GOTOOLCHAIN=local
+export GOFLAGS=-buildvcs=false
+export GOENV=/home/fakeroot/.cache/evoclaw-goenv/env
+export BASH_ENV={GO_OFFLINE_SHELL_ENV}
+export GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache
+export GOCACHE=/home/fakeroot/.cache/go-build
+export GOBIN=/home/fakeroot/go/bin
+export PATH=/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:$PATH
+"""
         go_env_script = f"""
 # Configure Go module fetching (quarantine-aware)
 cat >> /etc/environment << 'EOF'
 GOPROXY={_goproxy}
 GONOSUMCHECK=*
 GONOSUMDB=*
+{_go_extra}
 EOF
 
 # Also set for fakeroot's shell profile
@@ -1100,6 +1909,7 @@ cat >> /home/fakeroot/.bashrc << 'EOF'
 export GOPROXY={_goproxy}
 export GONOSUMCHECK=*
 export GONOSUMDB=*
+{_go_shell_extra}
 EOF
 echo "Go env vars configured (GOPROXY={_goproxy})"
 """
@@ -1246,7 +2056,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # A denied registry is exempt from the reachability assertion ONLY if the
         # policy DECLARES it un-CIDR-blockable (SWE_MILESTONE_FIREWALL_EXEMPT — e.g.
         # proxy.golang.org shares Vertex's Google range, defended by /etc/hosts
-        # poison + GOPROXY=off). Everything else MUST verify unreachable. The old
+        # poison + local-only GOPROXY). Everything else MUST verify unreachable. The old
         # runtime "resolved IPs all fall in a still-ACCEPTed CDN range" inference
         # is gone: a typo'd/omitted deny_cidr made a normal registry look exempt
         # and silently pass (fail-open, #2b). A missing deny_cidr is now caught up

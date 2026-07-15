@@ -37,6 +37,15 @@ dag_unlock:
     # Minimum ratio of none_to_pass tests that must pass (1.0 = 100%)
     none_to_pass: 1.0
 
+# Evaluation scoring policy
+evaluation:
+  # true (strict opt-in): any deterministic build/setup failure rejects the
+  # partial test universe and scores the milestone as an evaluation failure.
+  # false (compatibility/default): preserve the build diagnostics, but parse and score
+  # reports from packages/modules that completed. Runner timeouts and nonzero
+  # outer exits always remain fail-closed.
+  build_failure_fail_closed: false
+
 # Retry and timing configuration
 retry_and_timing:
   # Wait time (seconds) for tag hash to stabilize before starting evaluation

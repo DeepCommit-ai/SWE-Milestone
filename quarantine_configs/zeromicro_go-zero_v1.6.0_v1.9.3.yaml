@@ -2,9 +2,10 @@
 #
 # Channel (attempted via WebFetch, blocked; the registry path was open):
 # `go get github.com/zeromicro/go-zero@v1.9.3` or a raw curl of the proxy
-# zip serves the full target source. Primary defense is GOPROXY=off (go
-# refuses proxy AND direct/VCS fetches, works from the image's /go/pkg/mod);
-# domain-deny is belt-and-suspenders. goproxy.cn (the image's configured
+# zip serves the full target source. Primary defense is a local-only GOPROXY
+# backed by the image's read-only dependency closure; the main module is
+# forbidden from that closure, and direct/VCS fallback is disabled. Domain-deny
+# is belt-and-suspenders. goproxy.cn (the image's configured
 # proxy, Qiniu CDN) and goproxy.io (Cloudflare) are CIDR-deniable;
 # proxy.golang.org rides Google ranges shared with Vertex aiplatform, so it
 # is domain-deny only — narrow residual (curl --resolve with a known Google
@@ -27,7 +28,7 @@ deny_cidrs:
 
 # Domains on Google's Vertex-shared range that can't be IP-blocked without
 # cutting the LLM path. verify_network_lockdown exempts ONLY these from the
-# reachability assertion (defended by /etc/hosts poison + GOPROXY=off). Omitting
+# reachability assertion (defended by /etc/hosts poison + local-only GOPROXY). Omitting
 # one ⇒ verify (correctly) FAILs it as reachable via the still-ACCEPTed Google
 # CDN range — this replaces the old fail-open runtime auto-exempt (#2b).
 firewall_exempt_domains:
@@ -47,7 +48,7 @@ cache_forbid_globs:
 
 # Only the IP-blockable proxies are asserted here (proxy.golang.org & friends
 # share Google's Vertex range and can't be IP-blocked — see
-# firewall_exempt_domains above; GOPROXY=off + /etc/hosts poison is their defense).
+# firewall_exempt_domains above; local-only GOPROXY + /etc/hosts poison is their defense).
 verify_fetch_urls:
   - https://goproxy.cn/github.com/zeromicro/go-zero/@v/v1.9.3.zip
   - https://goproxy.io/github.com/zeromicro/go-zero/@v/v1.9.3.zip
@@ -55,6 +56,11 @@ verify_fetch_urls:
 closure:
   cache_paths:
     - /go/pkg/mod/cache/download
+  # Agent trials run on base-offline's fixed Go 1.21.13 toolchain. Overlay the
+  # same directory into milestone evaluator images (replace, do not merge) so
+  # model code is never compiled under an older per-milestone Go release.
+  evaluator_replace_paths:
+    - /usr/local/go
   # Build-scoped gate, NOT whole-graph `go mod download`. The milestone module
   # caches were warmed by `go build` (dataset prep), so they hold exactly what
   # BUILDING needs — the compiled-package closure — not the full MVS download

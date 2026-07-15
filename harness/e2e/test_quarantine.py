@@ -1,12 +1,17 @@
 """Tests for the per-repo quarantine policy module."""
 
+import json
+
 import pytest
 
 from harness.e2e.quarantine import (
     cidr_overlaps_any,
     image_for_repo,
     load_quarantine_env,
+    normalize_maven_plugin_probes,
     quarantine_coverage_errors,
+    quarantine_coverage_errors_from_config,
+    quarantine_guard_error_from_config,
 )
 
 
@@ -31,15 +36,18 @@ class TestMirrorDomainsAndGoproxy:
             "goproxy.io",
         }
 
-    def test_goproxy_off_under_go_offline(self):
-        from harness.e2e.quarantine import goproxy_value
+    def test_goproxy_uses_local_file_proxy_under_go_offline(self):
+        from harness.e2e.quarantine import GO_OFFLINE_FILE_PROXY, goproxy_value
 
-        assert goproxy_value(go_offline=True, quarantine_active=False) == "off"
+        assert (
+            goproxy_value(go_offline=True, quarantine_active=False)
+            == GO_OFFLINE_FILE_PROXY
+        )
 
     def test_goproxy_off_under_quarantine_even_without_go_offline(self):
         # A quarantine container poisons the go-proxy mirror domains, so a bare
         # GOPROXY=proxy.golang.org would resolve to 0.0.0.0 and every fetch would
-        # fail. Under quarantine GOPROXY must be off regardless of ecosystem.
+        # fail. A non-Go quarantine therefore keeps GOPROXY fully off.
         from harness.e2e.quarantine import goproxy_value
 
         assert goproxy_value(go_offline=False, quarantine_active=True) == "off"
@@ -112,7 +120,7 @@ class TestGateHardening:
 
     def test_firewall_exempt_domain_needs_no_cidr(self, tmp_path):
         # proxy/sum.golang.org ride Google's Vertex range (un-CIDR-blockable),
-        # so they're exempt (poison + GOPROXY=off defense); goproxy.cn/io still
+        # so they're exempt (poison + local-only GOPROXY defense); goproxy.cn/io still
         # require deny_cidrs.
         errs = self._errs(
             tmp_path, "gz",
@@ -173,6 +181,71 @@ npm_offline: true
         assert env["SWE_MILESTONE_MAVEN_OFFLINE"] == "1"
         assert env["SWE_MILESTONE_MAVEN_REPO_LOCAL"] == "/root/.m2/repository"
         assert env["SWE_MILESTONE_NPM_OFFLINE"] == "1"
+
+    def test_closure_cache_paths_exported_as_json(self, tmp_path):
+        _write_config(tmp_path, "cache-repo", """
+ecosystem: [go, npm]
+closure:
+  cache_paths:
+    - /go/pkg/mod/cache/download
+    - /root/.npm/_cacache
+  offline_build: npm ci --offline
+""")
+
+        env = load_quarantine_env("cache-repo", tmp_path)
+
+        assert json.loads(env["SWE_MILESTONE_CACHE_PATHS"]) == [
+            "/go/pkg/mod/cache/download",
+            "/root/.npm/_cacache",
+        ]
+
+    def test_maven_plugin_probes_exported_as_validated_json(self, tmp_path):
+        _write_config(tmp_path, "dubbo", """
+ecosystem: [maven]
+closure:
+  cache_paths: [/root/.m2/repository]
+  offline_build: mvn -o test-compile
+  maven_plugin_probes:
+    - pom: pom.xml
+      goal: spotless:check
+      timeout_seconds: 90
+    - pom: dubbo-dependencies-bom/pom.xml
+      goal: spotless:check
+""")
+        env = load_quarantine_env("dubbo", tmp_path)
+        assert json.loads(env["SWE_MILESTONE_MAVEN_PLUGIN_PROBES"]) == [
+            {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 90},
+            {
+                "pom": "dubbo-dependencies-bom/pom.xml",
+                "goal": "spotless:check",
+                "timeout_seconds": 120,
+            },
+        ]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "not-a-list",
+            [{"pom": "../pom.xml", "goal": "spotless:check"}],
+            [{"pom": "pom.xml", "goal": "spotless:check;curl bad"}],
+            [{"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 0}],
+        ],
+    )
+    def test_maven_plugin_probe_validation_rejects_unsafe_values(self, value):
+        with pytest.raises(ValueError):
+            normalize_maven_plugin_probes(value)
+
+    def test_pip_wheelhouse_exported_when_native_cache_paths_empty(self, tmp_path):
+        _write_config(tmp_path, "wheelhouse-repo", """
+ecosystem: [pip]
+closure:
+  cache_paths: []
+  offline_build: pip install --no-index -f /wheelhouse
+""")
+
+        env = load_quarantine_env("wheelhouse-repo", tmp_path)
+
+        assert json.loads(env["SWE_MILESTONE_CACHE_PATHS"]) == ["/wheelhouse"]
 
     def test_audit_lists_joined(self, tmp_path):
         _write_config(tmp_path, "r3", """
@@ -289,6 +362,15 @@ class TestQuarantineGuard:
             is None
         )
 
+    def test_pure_guard_uses_supplied_mapping(self):
+        assert quarantine_guard_error_from_config(
+            "sk", {"ecosystem": ["pip"]}, False, False
+        )
+        assert (
+            quarantine_guard_error_from_config("sk", None, False, False)
+            is None
+        )
+
 
 class TestCoverageGate:
     def test_missing_config_is_error(self, tmp_path):
@@ -334,6 +416,11 @@ firewall_exempt_domains: [proxy.golang.org, sum.golang.org]
         _write_config(tmp_path, "repoF", "ecosystem: [none]\n")
         assert quarantine_coverage_errors(["repoF"], tmp_path) == []
 
+    def test_pure_coverage_never_needs_a_project_root(self):
+        assert quarantine_coverage_errors_from_config(
+            "repoF", {"ecosystem": ["none"]}
+        ) == []
+
 
 class TestAgentQuarantineEnvVars:
     def _env_dict(self, flags):
@@ -378,7 +465,139 @@ class TestAgentQuarantineEnvVars:
             "CARGO_NET_OFFLINE": "true"}
 
     def test_go_offline(self):
-        assert self._env_dict({"SWE_MILESTONE_GO_OFFLINE": "1"}) == {"GOPROXY": "off"}
+        env = self._env_dict({
+            "SWE_MILESTONE_GO_OFFLINE": "1",
+            "SWE_MILESTONE_GO_TOOLCHAIN": "1.21.13",
+        })
+        assert env == {
+            "GOPROXY": "file:///go/pkg/mod/cache/download",
+            "GONOPROXY": "none",
+            "GOSUMDB": "off",
+            "GOTOOLCHAIN": "local",
+            "GOFLAGS": "-buildvcs=false",
+            "GOENV": "/home/fakeroot/.cache/evoclaw-goenv/env",
+            "BASH_ENV": "/etc/evoclaw/go-runtime.sh",
+            "GOMODCACHE": "/home/fakeroot/.cache/evoclaw-gomodcache",
+            "GOCACHE": "/home/fakeroot/.cache/go-build",
+            "GOBIN": "/home/fakeroot/go/bin",
+            "PATH": (
+                "/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "GOLANG_VERSION": "1.21.13",
+        }
+
+    @pytest.mark.parametrize(
+        "framework_name",
+        ["claude-code", "codex", "gemini-cli", "openhands"],
+    )
+    def test_every_framework_inherits_the_same_go_runtime_contract(
+        self,
+        framework_name,
+        monkeypatch,
+    ):
+        from harness.e2e.agents import get_agent_framework
+
+        monkeypatch.setenv("SWE_MILESTONE_GO_OFFLINE", "1")
+        monkeypatch.setenv("SWE_MILESTONE_GO_TOOLCHAIN", "1.21.13")
+        monkeypatch.setenv("UNIFIED_API_KEY", "test-key")
+        monkeypatch.setenv("UNIFIED_BASE_URL", "https://example.invalid")
+
+        args = get_agent_framework(framework_name).get_effective_container_env_vars()
+        assert all(args[index] == "-e" for index in range(0, len(args), 2))
+        pairs = [args[index] for index in range(1, len(args), 2)]
+        env = dict(
+            value.split("=", 1)
+            for value in pairs
+        )
+        go_keys = {
+            "GOPROXY",
+            "GONOPROXY",
+            "GOSUMDB",
+            "GOTOOLCHAIN",
+            "GOFLAGS",
+            "GOENV",
+            "BASH_ENV",
+            "GOMODCACHE",
+            "GOCACHE",
+            "GOBIN",
+            "PATH",
+            "GOLANG_VERSION",
+        }
+        assert all(
+            sum(value.startswith(f"{key}=") for value in pairs) == 1
+            for key in go_keys
+        )
+
+        assert {
+            "GOPROXY": env.get("GOPROXY"),
+            "GONOPROXY": env.get("GONOPROXY"),
+            "GOSUMDB": env.get("GOSUMDB"),
+            "GOTOOLCHAIN": env.get("GOTOOLCHAIN"),
+            "GOFLAGS": env.get("GOFLAGS"),
+            "GOENV": env.get("GOENV"),
+            "BASH_ENV": env.get("BASH_ENV"),
+            "GOMODCACHE": env.get("GOMODCACHE"),
+            "GOCACHE": env.get("GOCACHE"),
+            "GOBIN": env.get("GOBIN"),
+            "PATH": env.get("PATH"),
+            "GOLANG_VERSION": env.get("GOLANG_VERSION"),
+        } == {
+            "GOPROXY": "file:///go/pkg/mod/cache/download",
+            "GONOPROXY": "none",
+            "GOSUMDB": "off",
+            "GOTOOLCHAIN": "local",
+            "GOFLAGS": "-buildvcs=false",
+            "GOENV": "/home/fakeroot/.cache/evoclaw-goenv/env",
+            "BASH_ENV": "/etc/evoclaw/go-runtime.sh",
+            "GOMODCACHE": "/home/fakeroot/.cache/evoclaw-gomodcache",
+            "GOCACHE": "/home/fakeroot/.cache/go-build",
+            "GOBIN": "/home/fakeroot/go/bin",
+            "PATH": (
+                "/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "GOLANG_VERSION": "1.21.13",
+        }
+
+    def test_core_env_merge_protects_a_future_adapter_that_omits_quarantine(
+        self,
+        monkeypatch,
+    ):
+        from harness.e2e.agents.base import AgentFramework
+
+        class FutureFramework(AgentFramework):
+            FRAMEWORK_NAME = "future"
+
+            def get_container_mounts(self):
+                return []
+
+            def get_container_env_vars(self):
+                return [
+                    "-e", "FUTURE_API_KEY=dummy",
+                    "-e", "GOPROXY=https://wrong.invalid",
+                ]
+
+            def get_container_init_script(self, agent_name):
+                return ""
+
+            def build_run_command(self, model, session_id, prompt_path):
+                return ""
+
+            def build_resume_command(self, model, session_id, message_path):
+                return ""
+
+        monkeypatch.setenv("SWE_MILESTONE_GO_OFFLINE", "1")
+        monkeypatch.setenv("SWE_MILESTONE_GO_TOOLCHAIN", "1.21.13")
+        args = FutureFramework().get_effective_container_env_vars()
+        values = [args[index] for index in range(1, len(args), 2)]
+        env = dict(value.split("=", 1) for value in values)
+
+        assert env["FUTURE_API_KEY"] == "dummy"
+        assert env["GOPROXY"] == "file:///go/pkg/mod/cache/download"
+        assert env["GOENV"] == "/home/fakeroot/.cache/evoclaw-goenv/env"
+        assert env["BASH_ENV"] == "/etc/evoclaw/go-runtime.sh"
+        assert sum(value.startswith("GOPROXY=") for value in values) == 1
 
     def test_maven_offline_with_repo_local(self):
         env = self._env_dict({"SWE_MILESTONE_MAVEN_OFFLINE": "1",

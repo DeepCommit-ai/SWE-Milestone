@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import FrozenSet, Iterable, List, Optional, Set
 
 from harness.utils.src_filter import SrcFileFilter
+from harness.utils.snapshot import should_include_snapshot_file
 
 # v2 predicate: only unambiguous agent-written code sources may be pruned.
 # Non-code assets in src dirs (.sql/.pcss/SPI/meson.build/...) are
@@ -172,6 +173,26 @@ def normalize_tar_members(names: Iterable[str]) -> Set[str]:
             continue
         normalized.add(name)
     return normalized
+
+
+def resolve_prune_enablement(
+    flag: Optional[bool], has_partition: bool
+) -> "tuple[bool, str]":
+    """Compatibility-first, default-OFF enablement policy.
+
+    Returns (requested, reason):
+    - flag is None + partition present -> (False, "default-off"): preserve the
+      historical additive overlay so old and new trials remain comparable.
+    - flag is None + no partition -> (False, "legacy-no-partition"): pruning is
+      UNDEFINED for such metadata, not promised-and-broken — stay additive and
+      do NOT mark scoring_untrusted (backward compatibility for old datasets).
+    - explicit flag -> honored verbatim ("explicit"). Explicit True without a
+      partition still goes through the config-invalid fail-closed path in the
+    evaluator (that combination IS promised-and-broken).
+    """
+    if flag is None:
+        return (False, "default-off") if has_partition else (False, "legacy-no-partition")
+    return bool(flag), "explicit"
 
 
 def parse_status_porcelain_z(out: str) -> List[str]:
@@ -353,6 +374,7 @@ def check_snapshot_integrity(
     src_filter: SrcFileFilter,
     max_missing: int = 10,
     max_missing_frac: float = 0.10,
+    extra_build_manifests: Optional[Set[str]] = None,
 ) -> SnapshotIntegrityReport:
     """Sanity-check a snapshot against a reference tree (phase 1a).
 
@@ -369,7 +391,15 @@ def check_snapshot_integrity(
     caller must treat ok=False as fail-closed (do not silently grade), not
     merely "skip pruning" — see evaluator._maybe_prune_residue.
     """
-    expected = {p for p in reference_files if src_filter.should_include_in_snapshot(p)}
+    expected = {
+        p
+        for p in reference_files
+        if should_include_snapshot_file(
+            p,
+            src_filter,
+            extra_build_manifests=extra_build_manifests,
+        )
+    }
     missing = sorted(expected - tar_files)
     over_absolute = len(missing) > max_missing
     over_relative = len(expected) > 0 and (len(missing) / len(expected)) > max_missing_frac

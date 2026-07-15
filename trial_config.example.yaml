@@ -22,6 +22,12 @@ trial_name: my_experiment
 # Agent framework: claude-code | codex | gemini-cli | openhands
 agent: claude-code
 
+# Optional Claude Code CLI version. Use an exact version for reproducible
+# trials (auto-updates are disabled), or use the stable/latest release channel.
+# The requested selector and actual installed version are both recorded in
+# e2e_trial/<trial>/trial_metadata.json.
+# agent_version: 2.1.158
+
 # Model identifier. For Claude Code, use the bare ID (e.g. claude-opus-4-7)
 # or append [1m] for the 1M-context variant (claude-opus-4-7[1m]).
 model: claude-opus-4-7
@@ -38,6 +44,13 @@ timeout: 18000
 # native CLAUDE_CODE_AUTO_COMPACT_WINDOW; values above 200K are capped to
 # 200K, so this is the only useful setting). See docs/adding-a-model.md.
 # auto_compact_window: 200000
+
+# Build-failure scoring policy. Compatibility mode is the global default: keep
+# diagnostics, but score packages/modules that completed before another package
+# failed to compile. Set true for an explicitly strict fail-closed trial.
+# Runner timeouts and nonzero outer exits always remain fail-closed.
+# evaluation:
+#   build_failure_fail_closed: false
 
 # ─── Optional ───────────────────────────────────────────
 

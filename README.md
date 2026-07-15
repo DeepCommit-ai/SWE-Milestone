@@ -178,8 +178,8 @@ We welcome contributions! Whether it's adding support for new agents, new task d
 Welcome to cite our paper if you find SWE-Milestone useful!
 
 ```bibtex
-@misc{deng2026evoclawevaluatingaiagents,
-      title={EvoClaw: Evaluating AI Agents on Continuous Software Evolution},
+@misc{deng2026swemilestoneevaluatingaiagents,
+      title={SWE-Milestone: Evaluating AI Agents on Continuous Software Evolution},
       author={Gangda Deng and Zhaoling Chen and Zhongming Yu and Haoyang Fan and Yuhong Liu and Yuxin Yang and Dhruv Parikh and Rajgopal Kannan and Le Cong and Mengdi Wang and Qian Zhang and Viktor Prasanna and Xiangru Tang and Xingyao Wang},
       year={2026},
       eprint={2603.13428},

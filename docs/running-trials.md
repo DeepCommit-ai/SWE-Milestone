@@ -72,6 +72,13 @@ Two forms for `trial_name`:
 > monitor header's `context=` label reflects the effective window. Details:
 > [`adding-a-model.md`](./adding-a-model.md).
 
+> **Claude Code version (`agent_version`, claude-code only):** set an exact
+> version such as `agent_version: 2.1.158` to make the trial install and retain
+> that CLI version, or use the `stable` / `latest` release channel. Exact pins
+> disable Claude Code self-updates. `trial_metadata.json` records both the
+> requested selector (`requested_agent_version`) and the numeric version found
+> in the container (`agent_version`).
+
 > **Google Vertex AI (gemini-cli / claude-code):** Vertex doesn't use an API
 > key — it uses ADC. Set `vertex_ai: true` with `agent: gemini-cli` (Gemini
 > ids) or `agent: claude-code` (Claude ids); the ADC is copied into the
