@@ -4845,7 +4845,10 @@ fi
             return False, go_error
 
         # For Rust projects: replace agent's inline tests with GT tests
-        rust_files = get_rust_files_from_tar(self.patch_file)
+        try:
+            rust_files = get_rust_files_from_tar(self.patch_file)
+        except Exception as exc:
+            return False, f"Rust test filtering failed closed: {exc}"
         if rust_files:
             print(
                 f"🦀 Processing {len(rust_files)} Rust files for test region replacement (using {gt_test_suffix} tag)..."
@@ -4861,10 +4864,15 @@ fi
                 print(f"   Agent test regions removed: {filter_result['total_agent_tests_removed']}")
                 print(f"   GT test regions appended: {filter_result['total_gt_tests_appended']}")
             if filter_result["failed"] > 0:
-                print(f"   ⚠️  Failed: {filter_result['failed']} files")
-                for detail in filter_result["details"]:
-                    if not detail["success"] and not detail["skipped"]:
-                        print(f"      - {detail['file']}: {detail['reason']}")
+                failures = [
+                    f"{detail['file']}: {detail['reason']}"
+                    for detail in filter_result["details"]
+                    if not detail["success"] and not detail["skipped"]
+                ]
+                return False, (
+                    "Rust test filtering failed closed for "
+                    f"{filter_result['failed']} file(s): " + "; ".join(failures)
+                )
 
         return True, ""
 

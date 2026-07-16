@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import harness.e2e.evaluator as evaluator_module
 import harness.e2e.orchestrator as orchestrator_module
 import harness.e2e.run_milestone as run_milestone_module
 from harness.e2e.orchestrator import E2EOrchestrator, _run_evaluation_once
@@ -104,6 +105,53 @@ def _bare_evaluator(snapshot):
     evaluator.build_failure_fail_closed = False
     evaluator.container_name = "eval-container"
     return evaluator
+
+
+def test_rust_filter_failure_aborts_snapshot_application(tmp_path, monkeypatch):
+    evaluator = _bare_evaluator(tmp_path / "source_snapshot.tar")
+    evaluator._load_and_validate_snapshot_metadata = lambda: ({}, None)
+    evaluator._maybe_prune_residue = lambda **_kwargs: (True, "")
+    evaluator._restore_agent_manifest_upserts = lambda: (True, "")
+    evaluator._merge_manifest_upserts = lambda **_kwargs: (True, "")
+    evaluator._apply_manifest_deletions = lambda: (True, "")
+    evaluator._apply_exact_go_manifest_projection = lambda: (True, "")
+    evaluator._run_post_snapshot_script = lambda: (True, "")
+    evaluator._run_go_module_closure = lambda: (True, "")
+    monkeypatch.setattr(
+        evaluator_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _completed(),
+    )
+    monkeypatch.setattr(
+        evaluator_module,
+        "get_rust_files_from_tar",
+        lambda _path: ["src/lib.rs"],
+    )
+    monkeypatch.setattr(
+        evaluator_module,
+        "process_rust_files_in_container",
+        lambda **_kwargs: {
+            "processed": 0,
+            "skipped": 0,
+            "failed": 1,
+            "total_agent_tests_removed": 0,
+            "total_gt_tests_appended": 0,
+            "details": [
+                {
+                    "file": "src/lib.rs",
+                    "success": False,
+                    "skipped": False,
+                    "reason": "synthetic detector failure",
+                }
+            ],
+        },
+    )
+
+    ok, error = evaluator._apply_tar_to_container()
+
+    assert ok is False
+    assert "Rust test filtering failed closed" in error
+    assert "synthetic detector failure" in error
 
 
 def _bare_single_snapshot_runner(tmp_path, monkeypatch, tag_commits):
