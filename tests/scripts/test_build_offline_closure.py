@@ -1,8 +1,8 @@
-# scripts/test_build_offline_closure.py
 import sys, types
 from pathlib import Path
 import pytest
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# build_offline_closure.py lives in scripts/, which is not a package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import build_offline_closure as boc
 
 
@@ -2221,7 +2221,7 @@ def test_navidrome_config_offline_build_has_netgo_tag():
     defined ONLY under `-tags=netgo`, and the real eval builds with it. The closure
     gate's offline_build must match (else a spurious `undefined: buildtags.NETGO`
     misleads). Read the SHIPPED config to assert the go build carries `-tags=netgo`."""
-    cfg = (Path(__file__).resolve().parent.parent / "quarantine_configs"
+    cfg = (Path(__file__).resolve().parents[2] / "quarantine_configs"
            / "navidrome_navidrome_v0.57.0_v0.58.0.yaml").read_text()
     assert "go build -tags=netgo ./..." in cfg
     # guard against a regression to the plain `go build ./...` (no tags)

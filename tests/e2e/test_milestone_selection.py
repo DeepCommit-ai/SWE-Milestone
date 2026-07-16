@@ -1,12 +1,5 @@
-"""Tests for milestone_selection (count/percentage prefix, dependency-closed).
-
-Run with pytest, or standalone:  python harness/e2e/test_milestone_selection.py
-"""
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(__file__))
-from milestone_selection import (  # noqa: E402
+"""Tests for milestone_selection (count/percentage prefix, dependency-closed)."""
+from harness.e2e.milestone_selection import (
     parse_milestone_spec, topological_order, load_graph, select_prefix, read_base_ids,
 )
 
