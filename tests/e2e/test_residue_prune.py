@@ -371,7 +371,7 @@ def test_evaluation_result_fail_loud_defaults():
         "keep_list_hits": [],
         "skipped_reason": "",
     }
-    assert d["snapshot_integrity"] == {"ok": None, "missing_count": 0}
+    assert d["snapshot_integrity"] == {"ok": None, "missing_count": 0, "legacy_unverified": False}
 
 
 def test_scoring_untrusted_property():
@@ -480,7 +480,7 @@ def test_evaluation_result_fail_loud_populated():
     assert d["residue_prune"]["pruned_files_count"] == 2
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
     assert d["residue_prune"]["skipped_reason"] == "ls-tree-failed"
-    assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1}
+    assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1, "legacy_unverified": False}
 
 
 # ---------------------------------------------------------------------------

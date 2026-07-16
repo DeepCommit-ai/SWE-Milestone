@@ -997,6 +997,7 @@ class EvaluationResult:
     pruned_files: List[str] = field(default_factory=list)
     keep_list_hits: List[str] = field(default_factory=list)
     snapshot_integrity_ok: Optional[bool] = None  # None = check not run
+    snapshot_legacy_unverified: bool = False
     snapshot_missing_count: int = 0
     residue_prune_skipped_reason: str = ""  # "", ls-tree-failed, snapshot-integrity-failed, safety-abort, tar-unreadable, config-invalid
     manifest_evaluator_base: str = ""
@@ -1172,6 +1173,7 @@ class EvaluationResult:
         result["snapshot_integrity"] = {
             "ok": self.snapshot_integrity_ok,
             "missing_count": self.snapshot_missing_count,
+            "legacy_unverified": self.snapshot_legacy_unverified,
         }
         result["manifest_overlay"] = {
             "evaluator_base": self.manifest_evaluator_base,
@@ -1647,6 +1649,10 @@ def generate_filtered_evaluation(
 
 
 class PatchEvaluator:
+    # Class-level defaults so provenance enforcement stays fail-closed even on
+    # partially-constructed instances (tests build these via object.__new__).
+    allow_legacy_snapshot = False
+    snapshot_legacy_unverified = False
     """Evaluates patches by applying them to Docker containers and running tests."""
 
     def __init__(
@@ -1665,7 +1671,13 @@ class PatchEvaluator:
         runtime_policy_path: Optional[Path] = None,
         runtime_policy_sha256: Optional[str] = None,
         runtime_policy_mode: Optional[str] = None,
+        allow_legacy_snapshot: bool = False,
     ):
+        # Explicit escape hatch for pre-sidecar (pre-2026-07-10) snapshots:
+        # skips integrity/provenance validation and records the downgrade in
+        # the result (snapshot_integrity.legacy_unverified). Never the default.
+        self.allow_legacy_snapshot = allow_legacy_snapshot
+        self.snapshot_legacy_unverified = False
         self.workspace_root = workspace_root
         self.milestone_id = milestone_id
         self.patch_file = patch_file
@@ -1841,6 +1853,7 @@ class PatchEvaluator:
             "pruned_files": [],
             "keep_list_hits": [],
             "snapshot_integrity_ok": None,
+            "snapshot_legacy_unverified": False,
             "snapshot_missing_count": 0,
             "residue_prune_skipped_reason": "config-invalid" if self._prune_config_invalid else "",
             "manifest_upserts_count": 0,
@@ -2403,6 +2416,27 @@ if test -x /usr/bin/git.real; then git_bin=/usr/bin/git.real; fi
 
         sidecar = self.patch_file.parent / (self.patch_file.stem + ".integrity.json")
         if not sidecar.exists():
+            if self.allow_legacy_snapshot:
+                # Legacy snapshot (predates the integrity sidecar): proceed
+                # UNVERIFIED with an empty manifest overlay — the pre-sidecar
+                # evaluation semantics — and record the downgrade permanently
+                # in the result. Deliberately loud, never silent.
+                print(
+                    "⚠️  LEGACY snapshot: integrity sidecar missing at "
+                    f"{sidecar}; proceeding UNVERIFIED (--allow-legacy-snapshot)"
+                )
+                self.snapshot_legacy_unverified = True
+                data: Dict[str, Any] = {
+                    "legacy_unverified": True,
+                    "schema_version": None,
+                    "ok": None,
+                    "capture_filter": None,
+                    "go_manifest_projection": None,
+                }
+                overlay = ManifestOverlay.create("0" * 40)
+                self._snapshot_metadata = data
+                self._manifest_overlay = overlay
+                return data, overlay
             raise RuntimeError(
                 f"Snapshot metadata sidecar is missing: {sidecar}; recapture required"
             )
@@ -3239,6 +3273,7 @@ printf 'merged\n'
             extra_build_manifests=self._load_capture_build_manifests(),
         )
         meta["snapshot_integrity_ok"] = integrity.ok
+        meta["snapshot_legacy_unverified"] = self.snapshot_legacy_unverified
         meta["snapshot_missing_count"] = integrity.missing_count
         if not integrity.ok:
             print(
@@ -5517,6 +5552,7 @@ fi
             pruned_files=self._eval_meta["pruned_files"],
             keep_list_hits=self._eval_meta["keep_list_hits"],
             snapshot_integrity_ok=self._eval_meta["snapshot_integrity_ok"],
+            snapshot_legacy_unverified=self._eval_meta.get("snapshot_legacy_unverified", False),
             snapshot_missing_count=self._eval_meta["snapshot_missing_count"],
             residue_prune_skipped_reason=self._eval_meta["residue_prune_skipped_reason"],
             manifest_evaluator_base=self._eval_meta["manifest_evaluator_base"],
@@ -5737,6 +5773,17 @@ Example:
         help="Frozen runtime policy mode",
     )
     build_failure_policy = parser.add_mutually_exclusive_group()
+    parser.add_argument(
+        "--allow-legacy-snapshot",
+        action="store_true",
+        help=(
+            "Explicit escape hatch for pre-sidecar snapshots (no "
+            "source_snapshot.integrity.json): skip integrity/provenance "
+            "validation and permanently record "
+            "snapshot_integrity.legacy_unverified=true in the result. "
+            "Results are NOT promotion-grade."
+        ),
+    )
     build_failure_policy.add_argument(
         "--allow-partial-build-reports",
         dest="build_failure_fail_closed",
@@ -5795,6 +5842,7 @@ Example:
         output_dir=output_dir,
         keep_container=getattr(args, "keep_container", False),
         build_failure_fail_closed=args.build_failure_fail_closed,
+        allow_legacy_snapshot=args.allow_legacy_snapshot,
         repo_config_path=args.repo_config,
         repo_config_sha256=args.repo_config_sha256,
         runtime_policy_path=args.runtime_policy,
@@ -5869,6 +5917,7 @@ Example:
         result.pruned_files = meta["pruned_files"]
         result.keep_list_hits = meta["keep_list_hits"]
         result.snapshot_integrity_ok = meta["snapshot_integrity_ok"]
+        result.snapshot_legacy_unverified = meta.get("snapshot_legacy_unverified", False)
         result.snapshot_missing_count = meta["snapshot_missing_count"]
         result.residue_prune_skipped_reason = meta["residue_prune_skipped_reason"]
         result.manifest_evaluator_base = meta.get("manifest_evaluator_base", "")
