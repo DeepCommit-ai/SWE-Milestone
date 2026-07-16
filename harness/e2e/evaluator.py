@@ -2085,7 +2085,10 @@ class PatchEvaluator:
         if self._go_module_closure_requested() and self.patch_file.suffix == ".tar":
             metadata, _ = self._load_and_validate_snapshot_metadata()
             if self._go_module_closure_enabled():
-                snapshot_agent_image_id = metadata["agent_base_image_id"]
+                # Legacy snapshots carry no exact-replay provenance; fall back
+                # to the pre-sidecar (non-exact) closure path with the
+                # downgrade already recorded on the result.
+                snapshot_agent_image_id = metadata.get("agent_base_image_id") or ""
 
         effective_image, milestone_image_id, closure_image_id, effective_image_id = (
             ensure_offline_evaluation_image(
