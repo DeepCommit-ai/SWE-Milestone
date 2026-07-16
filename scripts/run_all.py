@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
+from harness.e2e.data_version import check_data_version
 from harness.e2e.env_guard import reject_legacy_env
 from harness.e2e.runtime_policy_binding import (
     RUNTIME_POLICY_MODE_UNPROTECTED,
@@ -307,6 +308,12 @@ def main():
               "or set SWE_MILESTONE_DATA_ROOT in .env_private (see README).", file=sys.stderr)
         sys.exit(1)
     data_root = Path(os.path.expandvars(str(_dr))).expanduser().resolve()
+
+    # Benchmark-version gate (docs/versioning.md): verify the data checkout
+    # against the version tag before spawning any per-repo worker. Explicit
+    # SWE_MILESTONE_IMAGE_TAG refuses on mismatch; the default pin warns.
+    check_data_version(data_root, context="run_all")
+
     yaml_trial_name = cfg["trial_name"]
     agent = cfg.get("agent", "claude-code")
     model = cfg.get("model", "claude-sonnet-4-5-20250929")

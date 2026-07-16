@@ -150,6 +150,8 @@ def test_run_all_resolves_each_fresh_repo_once(
     monkeypatch.setattr(run_all, "resolve_runtime_policy", resolve_once)
     monkeypatch.setattr(run_all, "image_for_runtime_policy", lambda _policy: "image:pin")
     monkeypatch.setattr(run_all, "reject_legacy_env", lambda: None)
+    # The version gate shells out to git; this test's Popen stub would break it.
+    monkeypatch.setattr(run_all, "check_data_version", lambda *_a, **_k: None)
     monkeypatch.setattr(
         run_all.subprocess,
         "Popen",

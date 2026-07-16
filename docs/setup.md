@@ -21,7 +21,14 @@ Workspace data (metadata, SRS documents, test classifications) is hosted on Hugg
 ```bash
 git lfs install
 git clone https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data
+cd SWE-Milestone-data && git checkout v1.0   # pin the benchmark data version
 ```
+
+The data repo carries the same `vX.Y` version tags as the Docker images
+(see [versioning.md](versioning.md)). Trials verify at launch that the data
+checkout matches the pinned version (`SWE_MILESTONE_IMAGE_TAG`, default
+`v1.0`) and record the verdict in `trial_metadata.json`; align a stale
+checkout with `./scripts/pull_data.sh --checkout`.
 
 The dataset contains one directory per repository:
 

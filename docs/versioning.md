@@ -17,6 +17,30 @@ pull/push plans) + `manifests/digests-<v>.tsv` (content freeze — diff two
 versions to prove exactly which images changed). Digests and commit SHAs are
 identity; tags are labels.
 
+## Data version
+
+The workspace data (SWE-Milestone-data git clone) is the other score-moving
+input, so it carries the **same `vX.Y` tags** as the images. One knob pins
+both: `SWE_MILESTONE_IMAGE_TAG` (default `v1.0`).
+
+At launch (`scripts/run_all.py` and `harness/e2e/run_e2e.py`),
+`harness/e2e/data_version.py` verifies — by read-only git fact check, never a
+declaration file — that the data checkout's HEAD is the commit the version
+tag points at, and `run_e2e` persists the verdict in `trial_metadata.json`:
+
+```json
+"benchmark_version": "v1.0",
+"data_version": {"state": "match", "commit": "<sha>", "expected_tag": "v1.0",
+                 "explicit_pin": false, "checked": true}
+```
+
+Enforcement mirrors `resolve_image()`: with the **default** pin a mismatch /
+missing tag / non-git data root prints a loud warning and the run continues
+(development must not be blocked); with an **explicit** `SWE_MILESTONE_IMAGE_TAG`
+any non-match refuses the launch. `SWE_MILESTONE_DATA_VERSION_CHECK=off` is the
+escape hatch, recorded as `checked: false`. Align a stale checkout with
+`./scripts/pull_data.sh --checkout` (report-only without the flag).
+
 ## Bump rules
 
 | Change | Bump |
@@ -91,6 +115,9 @@ done > manifests/digests-v1.0.tsv
 ./scripts/pull_images.sh --dry-run
 docker manifest inspect <hub_ref>        # digest must equal the frozen value
 python3 scripts/verify_quarantine.py --repo <short>
+
+# 6. Tag the data repo with the SAME version (from the release data checkout)
+git -C <SWE-Milestone-data> tag v1.0 && git -C <SWE-Milestone-data> push origin v1.0
 ```
 
 After release: bump `DEFAULT_IMAGE_TAG` in `image_version.py` (if not already

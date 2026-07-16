@@ -2387,6 +2387,24 @@ Example:
     e2e_trial_dir = workspace_root / "e2e_trial"
     e2e_trial_dir.mkdir(parents=True, exist_ok=True)
 
+    # Benchmark-version gate (docs/versioning.md): verify the data checkout
+    # (workspace_root lives inside the data repo) and the image tag against
+    # the pinned version BEFORE any trial state exists — an explicit-pin
+    # refusal must not leave behind a populated trial dir that blocks the
+    # retry. The verdicts are persisted into trial_metadata below so the
+    # version a score belongs to is recorded, not inferred.
+    from harness.e2e.data_version import (
+        check_data_version,
+        check_image_tag_consistency,
+    )
+
+    version_meta = check_data_version(Path(args.workspace_root), context="run_e2e")
+    image_check_meta = (
+        check_image_tag_consistency(str(args.image), context="run_e2e")
+        if args.image
+        else None
+    )
+
     # Generate next trial name with auto-incrementing suffix
     trial_base_name = args.trial_name if args.trial_name else "agent_run"
     trial_name = get_next_trial_name(trial_base_name, e2e_trial_dir)
@@ -2571,6 +2589,13 @@ Example:
         "trial_name": trial_name,
         "repo_name": args.repo_name,
         "milestone_version": args.milestone_version,
+        # Benchmark version this trial claims to run on (vX.Y, the image tag —
+        # docs/versioning.md), plus the verified state of the data checkout
+        # and of the image tag (a :latest fallback shows up here as a
+        # structured mismatch, not just a transient launch warning).
+        "benchmark_version": version_meta["benchmark_version"],
+        "data_version": version_meta["data_version"],
+        "image_tag_check": image_check_meta,
         "image": args.image,
         "model": args.model,
         "agent_name": args.agent,
