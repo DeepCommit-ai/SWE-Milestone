@@ -2925,7 +2925,15 @@ if test -x /usr/bin/git.real; then git_bin=/usr/bin/git.real; fi
         return value
 
     def _go_module_closure_enabled(self) -> bool:
-        """Whether exact closure is configured for this repository."""
+        """Whether exact closure is configured for this repository.
+
+        Legacy snapshots carry no go_manifest_projection / exact-replay
+        provenance, so the exact closure cannot run; fall back to the
+        pre-sidecar evaluation path (module cache baked into the image).
+        The downgrade is already recorded on the result.
+        """
+        if self.snapshot_legacy_unverified:
+            return False
         return self._go_module_closure_requested()
 
     def _merge_manifest_upserts(self, base_suffix: str = "end") -> Tuple[bool, str]:
