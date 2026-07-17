@@ -1,6 +1,6 @@
 # Running on Google Vertex AI
 
-EvoClaw can drive **gemini-cli** (Gemini models) and **claude-code** (Claude
+SWE-Milestone can drive **gemini-cli** (Gemini models) and **claude-code** (Claude
 models) against **Google Vertex AI**. Enabled by a single flag in the trial
 config; `run_all.py` handles the rest.
 
@@ -17,7 +17,7 @@ config; `run_all.py` handles the rest.
 Vertex AI does **not** use a static API key. It authenticates with **ADC**
 (Application Default Credentials — an OAuth token that **expires hourly**).
 The agent refreshes that token itself (gemini-cli's google-genai SDK /
-claude-code's google-auth), so EvoClaw just copies the host's ADC file into the
+claude-code's google-auth), so SWE-Milestone just copies the host's ADC file into the
 agent container (read-only) and whitelists the two Google endpoints it needs
 (`aiplatform.googleapis.com`, `oauth2.googleapis.com`).
 
@@ -33,7 +33,7 @@ mode — there is no key and no proxy.
 
 Unlike third-party endpoints (Fireworks, OpenRouter, …) where you `export
 UNIFIED_API_KEY=sk-...`, Vertex authenticates with **ADC**, a credential file
-created once on the host. EvoClaw reads it automatically.
+created once on the host. SWE-Milestone reads it automatically.
 
 ### One-time setup (per host / per account)
 
@@ -109,7 +109,7 @@ agent: claude-code
 model: claude-opus-4-8       # the Vertex publisher model id (no @version needed)
 vertex_ai: true
 vertex_location: global      # Claude models are region-specific; see the quota note below
-default_haiku_model: claude-opus-4-8   # keep background/subagent calls on Vertex too
+default_agent_model: claude-opus-4-8   # keep background/subagent calls on Vertex too
 reasoning_effort: max        # honored in current claude-code (verified 2.1.158); see docs/adding-a-model.md
 timeout: 18000
 ```
@@ -122,7 +122,7 @@ timeout: 18000
 
 ## How it works
 
-When `vertex_ai: true`, `run_all.py` sets `EVOCLAW_VERTEX` + project/location in
+When `vertex_ai: true`, `run_all.py` sets `SWE_MILESTONE_VERTEX` + project/location in
 the env the workers inherit, then the agent framework wires its native Vertex
 mode:
 

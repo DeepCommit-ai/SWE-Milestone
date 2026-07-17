@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -9,6 +10,55 @@ from harness.e2e.agents.base import AgentFramework, register_framework
 from harness.e2e.model_aliases import resolve_model_alias
 
 logger = logging.getLogger(__name__)
+
+_CLAUDE_CODE_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
+_CLAUDE_CODE_VERSION_CHANNELS = {"stable", "latest"}
+
+
+def validate_claude_code_version(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize a Claude Code installer version selector."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value in _CLAUDE_CODE_VERSION_CHANNELS or _CLAUDE_CODE_VERSION_RE.fullmatch(value):
+        return value
+    raise ValueError(
+        "Claude Code agent_version must be a semantic version such as "
+        "'2.1.158', or one of: latest, stable"
+    )
+
+
+def parse_claude_code_version(output: str) -> Optional[str]:
+    """Extract the numeric version from ``claude --version`` output."""
+    match = _CLAUDE_CODE_VERSION_RE.search(output or "")
+    return match.group(1) if match else None
+
+
+def validate_tool_search_setting(value) -> Optional[str]:
+    """Validate/normalize the trial-config ``enable_tool_search`` value.
+
+    Returns the string claude-code's native ENABLE_TOOL_SEARCH env var
+    accepts: "true", "false", "auto", or "auto:N" (N = percent of the
+    context window, 0-100). YAML booleans are normalized to "true"/"false".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text in ("true", "false", "auto"):
+        return text
+    if text.startswith("auto:"):
+        try:
+            pct = float(text[5:])
+        except ValueError:
+            pct = None
+        if pct is not None and 0 <= pct <= 100:
+            return text
+    raise ValueError(
+        "enable_tool_search must be true, false, auto, or auto:N "
+        f"(N = 0-100, percent of the context window); got {value!r}"
+    )
 
 
 # Vertex (native CLAUDE_CODE_USE_VERTEX): copy the mounted host ADC into
@@ -50,18 +100,19 @@ class ClaudeCodeFramework(AgentFramework):
     2. File mode: Uses ~/.claude/.credentials.json file mount
     3. Vertex mode: Claude Code's native CLAUDE_CODE_USE_VERTEX path — talks to
        Vertex AI's Anthropic endpoint via ADC (no API key). Selected when
-       run_all.py sets EVOCLAW_VERTEX (vertex_ai: true in the trial config).
+       run_all.py sets SWE_MILESTONE_VERTEX (vertex_ai: true in the trial config).
 
     API mode takes precedence when UNIFIED_API_KEY is set; Vertex mode is
-    selected by EVOCLAW_VERTEX and ignores the API key / base URL.
+    selected by SWE_MILESTONE_VERTEX and ignores the API key / base URL.
 
     Environment variables:
         UNIFIED_API_KEY: API key (mapped to ANTHROPIC_API_KEY in container)
         UNIFIED_BASE_URL: Base URL (mapped to ANTHROPIC_BASE_URL in container)
-        UNIFIED_DEFAULT_HAIKU_MODEL: Override for all of Claude Code's
-            class-based model slots (haiku / sonnet / opus / subagent /
-            global default). A single yaml field drives all five env vars
-            to the same value — see get_container_env_vars().
+        UNIFIED_DEFAULT_AGENT_MODEL: Override for ALL of Claude Code's
+            class-based model slots (haiku / sonnet / opus / fable /
+            subagent / global default). A single yaml field
+            (`default_agent_model`) drives all these env vars to the same
+            value — see get_container_env_vars().
     """
 
     FRAMEWORK_NAME = "claude-code"
@@ -82,6 +133,7 @@ class ClaudeCodeFramework(AgentFramework):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        agent_version: Optional[str] = None,
         **kwargs,
     ):
         """Initialize Claude Code framework.
@@ -92,6 +144,7 @@ class ClaudeCodeFramework(AgentFramework):
             reasoning_effort: Reasoning effort level ("low", "medium", "high", "xhigh").
                              Mapped to Claude Code CLI --effort flag.
                              "xhigh" is mapped to "max" for Claude Code.
+            agent_version: Exact Claude Code CLI version, or ``stable``/``latest``.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
@@ -103,30 +156,56 @@ class ClaudeCodeFramework(AgentFramework):
         # max transmits faithfully and is honored, ~2.6x low's thinking). Unset
         # stays a safe default for any older pinned claude.
         self._reasoning_effort = reasoning_effort
+        self._agent_version = validate_claude_code_version(agent_version)
         # Apply short-name aliasing (e.g. "kimi-k2.6" →
         # "openrouter/moonshotai/kimi-k2.6") so every env var and --model flag
         # downstream carries the canonical ID the all-hands LiteLLM proxy
         # expects. Passthrough for unknown/native names.
-        raw_haiku = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
-        self._default_haiku_model = resolve_model_alias(raw_haiku) if raw_haiku else None
-        # Vertex AI mode (run_all.py sets EVOCLAW_VERTEX when vertex_ai: true).
+        raw_agent_model = os.environ.get("UNIFIED_DEFAULT_AGENT_MODEL")
+        self._default_agent_model = (
+            resolve_model_alias(raw_agent_model) if raw_agent_model else None
+        )
+        # Vertex AI mode (run_all.py sets SWE_MILESTONE_VERTEX when vertex_ai: true).
         # Claude Code has built-in Vertex support (CLAUDE_CODE_USE_VERTEX): it
         # talks to Vertex's Anthropic endpoint directly using ADC — no API key,
         # no proxy. The `model` stays the bare Vertex id (e.g. claude-opus-4-8);
         # CLOUD_ML_REGION may be a region (us-east5, ...) or "global".
-        self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
-        self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
-        self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
-        # Auto-compaction window: run_all.py sets EVOCLAW_AUTO_COMPACT_WINDOW
+        self._vertex = bool(os.environ.get("SWE_MILESTONE_VERTEX"))
+        self._vertex_project = os.environ.get("SWE_MILESTONE_VERTEX_PROJECT")
+        self._vertex_location = os.environ.get("SWE_MILESTONE_VERTEX_LOCATION", "global")
+        # Auto-compaction window: run_all.py sets SWE_MILESTONE_AUTO_COMPACT_WINDOW
         # from the trial config `auto_compact_window`. Passed through to the
         # container as the native CLAUDE_CODE_AUTO_COMPACT_WINDOW so claude-code
         # compacts context at this token budget. Native agent behaviour — does
         # not alter the model ID or request payload sent to the provider.
-        self._auto_compact_window = os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW")
+        self._auto_compact_window = os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW")
+        # Tool Search (deferred tool loading): run_all.py sets
+        # SWE_MILESTONE_ENABLE_TOOL_SEARCH from the trial config
+        # `enable_tool_search`, already validated to "true"/"false"/"auto"/
+        # "auto:N". Passed through as claude-code's native ENABLE_TOOL_SEARCH.
+        # Third-party Anthropic-compatible endpoints that don't forward
+        # tool_reference blocks (e.g. Kimi) require "false"; pinning it also
+        # keeps the tool-schema context composition identical across endpoints
+        # instead of depending on claude-code's endpoint auto-detection.
+        self._enable_tool_search = os.environ.get("SWE_MILESTONE_ENABLE_TOOL_SEARCH")
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
         return self._reasoning_effort
+
+    def get_requested_version(self) -> Optional[str]:
+        return self._agent_version
+
+    def get_version_command(self) -> List[str]:
+        return ["claude", "--version"]
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        return parse_claude_code_version(output)
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        if self._agent_version in _CLAUDE_CODE_VERSION_CHANNELS:
+            return True
+        return self._agent_version is None or actual_version == self._agent_version
 
     def _build_effort_args(self) -> List[str]:
         """Return Claude Code CLI args for reasoning effort.
@@ -153,8 +232,8 @@ class ClaudeCodeFramework(AgentFramework):
         Maps unified env vars to Claude-specific env vars:
         - UNIFIED_API_KEY -> ANTHROPIC_API_KEY
         - UNIFIED_BASE_URL -> ANTHROPIC_BASE_URL
-        - UNIFIED_DEFAULT_HAIKU_MODEL -> all five of Claude Code's
-          class-based model slots (see below)
+        - UNIFIED_DEFAULT_AGENT_MODEL -> all of Claude Code's class-based
+          model slots (see below)
 
         Returns:
             List of -e arguments for docker run
@@ -183,9 +262,9 @@ class ClaudeCodeFramework(AgentFramework):
                 env_vars.extend(["-e", f"ANTHROPIC_API_KEY={self._api_key}"])
             if self._base_url:
                 env_vars.extend(["-e", f"ANTHROPIC_BASE_URL={self._base_url}"])
-        if self._default_haiku_model:
+        if self._default_agent_model:
             # Route ALL of Claude Code's class-based model slots to the same
-            # model. Claude Code has five decision points where it picks a
+            # model. Claude Code has several decision points where it picks a
             # model by "class" rather than using --model:
             #   HAIKU  — background tasks (auto-memory, skill listing,
             #            context management)
@@ -193,23 +272,26 @@ class ClaudeCodeFramework(AgentFramework):
             #            "sonnet class"
             #   OPUS   — reasoning-heavy fallback
             #   SUBAGENT — Agent/Task-tool spawns (claude-code specific)
+            #   FABLE  — Fable/Mythos-class slot (added in newer claude-code;
+            #            harmless no-op for older versions)
             #   ANTHROPIC_MODEL — global default when --model is not passed
             #                     (affects nested claude invocations)
             # Leaving any of these unset lets Claude Code fall back to
             # api.anthropic.com with its hard-coded default (e.g.,
             # claude-haiku-4-5), which (a) bypasses the configured
             # UNIFIED_BASE_URL and (b) bills a separate Anthropic account.
-            # Pointing all five at default_haiku_model keeps every request
+            # Pointing all of them at default_agent_model keeps every request
             # on the same endpoint, which is especially critical for
             # third-party proxies (Z.AI, all-hands, OpenRouter).
             for env_name in (
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL",
                 "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
                 "CLAUDE_CODE_SUBAGENT_MODEL",
                 "ANTHROPIC_MODEL",
             ):
-                env_vars.extend(["-e", f"{env_name}={self._default_haiku_model}"])
+                env_vars.extend(["-e", f"{env_name}={self._default_agent_model}"])
         # Belt-and-suspenders: also set CLAUDE_CODE_EFFORT_LEVEL alongside the
         # `--effort` CLI flag. Workaround for github.com/anthropics/claude-code
         # issue #41028 where the CLI flag is parsed but not propagated to the
@@ -219,7 +301,7 @@ class ClaudeCodeFramework(AgentFramework):
                 "-e", f"CLAUDE_CODE_EFFORT_LEVEL={self.EFFORT_MAP[self._reasoning_effort]}",
             ])
         # Auto-compaction window (native claude-code env var). Set from trial
-        # config `auto_compact_window` via run_all.py's EVOCLAW_AUTO_COMPACT_WINDOW.
+        # config `auto_compact_window` via run_all.py's SWE_MILESTONE_AUTO_COMPACT_WINDOW.
         # claude-code triggers context compaction at this token budget; the value
         # is capped at the model's context window (may be 200K for a third-party
         # model whose ID claude-code can't pattern-match).
@@ -227,6 +309,22 @@ class ClaudeCodeFramework(AgentFramework):
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={self._auto_compact_window}",
             ])
+        # Tool Search pin (native claude-code env var). Set from trial config
+        # `enable_tool_search` via run_all.py's SWE_MILESTONE_ENABLE_TOOL_SEARCH.
+        # Re-validate here so a hand-set env var can't smuggle an arbitrary
+        # string into the container environment.
+        if self._enable_tool_search:
+            env_vars.extend([
+                "-e",
+                f"ENABLE_TOOL_SEARCH={validate_tool_search_setting(self._enable_tool_search)}",
+            ])
+        # An exact version is a reproducibility pin, so prevent background
+        # self-updates between recovery invocations. Do not use
+        # DISABLE_UPDATES here: the official installer also honors it and then
+        # silently skips the initial installation. Release channels retain
+        # their normal within-channel updates.
+        if self._agent_version and self._agent_version not in _CLAUDE_CODE_VERSION_CHANNELS:
+            env_vars.extend(["-e", "DISABLE_AUTOUPDATER=1"])
         # Quarantine mode: force pip to the offline wheelhouse (shared base
         # helper so gemini-cli & co. get the same treatment).
         env_vars.extend(self.get_quarantine_env_vars())
@@ -323,6 +421,7 @@ class ClaudeCodeFramework(AgentFramework):
 try:
     import subprocess
     import shutil
+    import re
 
     def run_cmd(cmd, shell=False):
         try:
@@ -333,12 +432,25 @@ try:
         except Exception as e:
             return False, '', str(e)
 
-    # Check if claude is already installed and working
+    requested_version = {self._agent_version!r}
+
+    # Check if claude is already installed and working. Exact matches can be
+    # reused; a release channel is re-applied so the installer selects the
+    # current version for that channel.
     success, version, _ = run_cmd(['claude', '--version'])
-    if success:
+    installed_match = re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', version) if success else None
+    installed_version = installed_match.group(1) if installed_match else None
+    needs_install = not success
+    if requested_version in ('stable', 'latest'):
+        needs_install = True
+    elif requested_version and installed_version != requested_version:
+        needs_install = True
+
+    if not needs_install:
         print(f"Claude Code already installed: {{version}}")
     else:
-        print("Installing Claude Code standalone binary...")
+        target_label = requested_version or 'latest'
+        print(f"Installing Claude Code standalone binary (target={{target_label}})...")
 
         # Ensure curl is available
         if not shutil.which('curl'):
@@ -346,11 +458,23 @@ try:
             run_cmd(['apt-get', 'update'])
             run_cmd(['apt-get', 'install', '-y', 'curl', 'ca-certificates'])
 
-        # Install via standalone installer (no Node.js required)
-        success, stdout, stderr = run_cmd(
-            'curl -fsSL https://claude.ai/install.sh | bash',
-            shell=True
+        # Install via standalone installer (no Node.js required). Download and
+        # invoke separately so the validated version is passed as an argv item,
+        # without interpolating it into a shell command.
+        installer = subprocess.run(
+            ['curl', '-fsSL', 'https://claude.ai/install.sh'],
+            capture_output=True, text=True, timeout=300
         )
+        if installer.returncode != 0:
+            raise RuntimeError(f"Failed to download Claude Code installer: {{installer.stderr}}")
+        install_cmd = ['bash', '-s']
+        if requested_version:
+            install_cmd.append(requested_version)
+        install_result = subprocess.run(
+            install_cmd, input=installer.stdout, capture_output=True, text=True, timeout=300
+        )
+        success = install_result.returncode == 0
+        stdout, stderr = install_result.stdout.strip(), install_result.stderr.strip()
         if success:
             import os
 
@@ -367,6 +491,13 @@ try:
 
             success, version, _ = run_cmd(['/usr/local/bin/claude', '--version'])
             print(f"Claude Code ready: {{version}}")
+            ready_match = re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', version) if success else None
+            ready_version = ready_match.group(1) if ready_match else None
+            if requested_version not in (None, 'stable', 'latest') and ready_version != requested_version:
+                raise RuntimeError(
+                    f"Claude Code version mismatch: requested {{requested_version}}, "
+                    f"installed {{ready_version or version or 'unknown'}}"
+                )
         else:
             print(f"Failed to install Claude Code: {{stderr}}")
             raise Exception("Claude Code installation failed")

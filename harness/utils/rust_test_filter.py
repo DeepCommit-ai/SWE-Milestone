@@ -14,12 +14,36 @@ Only processes .rs files that were part of the filtered src snapshot.
 """
 
 import logging
+import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+class RustTestFilterError(RuntimeError):
+    """Raised when agent tests cannot be separated from production Rust safely."""
+
+
+@dataclass(frozen=True)
+class _RustTestRegion:
+    start: int
+    end: int
+    reason: str
+    identity: Tuple[str, str]
+    nested: bool
+    scope_path: Optional[Tuple[Tuple[str, str, int], ...]]
+    insertion_safe: bool
+
+
+@dataclass(frozen=True)
+class _RustScope:
+    start: int
+    end: int
+    path: Tuple[Tuple[str, str, int], ...]
 
 
 def _run_docker_exec(container_name: str, command: str, check: bool = True) -> Tuple[bool, str, str]:
@@ -62,6 +86,16 @@ def _read_file_from_container(container_name: str, file_path: str) -> Optional[s
     return stdout
 
 
+# git-show stderr markers that prove the PATH is absent at the ref (the only
+# case where "treat as new file" is sound). Anything else — bad/missing ref,
+# docker hiccup, repo corruption — must fail closed, not masquerade as a new
+# file with no ground-truth tests to graft.
+_GIT_PATH_ABSENT_MARKERS = (
+    "does not exist in",
+    "exists on disk, but not in",
+)
+
+
 def _read_file_from_git_ref(container_name: str, file_path: str, ref: str) -> Optional[str]:
     """
     Read a file from a git ref in the container.
@@ -72,16 +106,25 @@ def _read_file_from_git_ref(container_name: str, file_path: str, ref: str) -> Op
         ref: Git ref (tag, branch, commit)
 
     Returns:
-        File content or None if file doesn't exist at that ref
+        File content, or None only when git proves the path does not exist
+        at that ref.
+
+    Raises:
+        RustTestFilterError: on any other git/docker failure, so callers
+        cannot fail open by treating an unread ground-truth file as new.
     """
     success, stdout, stderr = _run_docker_exec(
         container_name, f"cd /testbed && git show {ref}:{file_path}", check=False
     )
 
-    if not success:
+    if success:
+        return stdout
+    if any(marker in stderr for marker in _GIT_PATH_ABSENT_MARKERS):
         return None
-
-    return stdout
+    raise RustTestFilterError(
+        f"git show {ref}:{file_path} failed without a missing-path error: "
+        f"{stderr.strip()[:300]}"
+    )
 
 
 def _write_file_to_container(
@@ -153,54 +196,262 @@ def _write_file_to_container(
         Path(temp_path).unlink(missing_ok=True)
 
 
-def find_test_ranges_from_content(content: str, file_path: str, only_root_level: bool = True) -> List[Tuple[int, int]]:
-    """
-    Find test code ranges in Rust file content.
+def _scope_header(kind: str, text: str) -> str:
+    """Return a stable-enough identity for a Rust declaration scope."""
+    header = text.split("{", 1)[0]
+    header = re.sub(r"\s+", " ", header).strip()
+    if kind == "mod":
+        match = re.search(r"\bmod\s+([A-Za-z_]\w*)", header)
+        return match.group(1) if match else header
+    if kind in ("trait", "struct", "enum", "union"):
+        match = re.search(rf"\b{kind}\s+([A-Za-z_]\w*)", header)
+        return match.group(1) if match else header
+    if kind == "fn":
+        match = re.search(r"\bfn\s+([A-Za-z_]\w*)", header)
+        return match.group(1) if match else header
+    if kind == "impl":
+        match = re.search(r"\bimpl\b", header)
+        if not match:
+            return header
+        body = header[match.end() :].lstrip()
+        # Generic parameter bounds and a trailing where-clause are not scope
+        # identity.  Agents may change them while keeping the same impl target.
+        if body.startswith("<"):
+            depth = 0
+            for index, char in enumerate(body):
+                if char == "<":
+                    depth += 1
+                elif char == ">":
+                    depth -= 1
+                    if depth == 0:
+                        body = body[index + 1 :].lstrip()
+                        break
+        body = re.split(r"\s+where\s+", body, maxsplit=1)[0]
+        return re.sub(r"\s+", " ", body).strip()
+    return header
 
-    This is a wrapper that uses the test_detector module.
 
-    Args:
-        content: File content as string
-        file_path: File path (used to determine if it's a .rs file)
-        only_root_level: If True, only return test regions at file root level.
-                         Test regions nested inside mod/impl/trait blocks are excluded.
-                         These cannot be safely moved to end of file.
+def _build_scope_tree(
+    ranges_by_kind: Dict[str, List[Tuple[int, int, str]]]
+) -> List[_RustScope]:
+    """Build comparable module/impl/trait paths for nested item placement."""
+    raw_scopes = []
+    for kind, node_kind in (
+        ("mod", "mod_item"),
+        ("impl", "impl_item"),
+        ("trait", "trait_item"),
+        ("foreign", "foreign_mod_item"),
+        ("struct", "struct_item"),
+        ("enum", "enum_item"),
+        ("union", "union_item"),
+        ("fn", "function_item"),
+    ):
+        for start, end, text in ranges_by_kind[node_kind]:
+            # External ``mod foo;`` has no scope body and cannot contain tests.
+            if kind == "mod" and "{" not in text:
+                continue
+            raw_scopes.append((start, end, kind, _scope_header(kind, text)))
 
-    Returns:
-        List of (start_line, end_line) tuples (1-indexed, inclusive)
-    """
+    built: List[_RustScope] = []
+    sibling_counts: Dict[
+        Tuple[Tuple[Tuple[str, str, int], ...], str, str], int
+    ] = {}
+    for start, end, kind, header in sorted(raw_scopes, key=lambda item: (item[0], -item[1])):
+        parents = [
+            scope
+            for scope in built
+            if scope.start <= start and end <= scope.end
+            and (scope.start, scope.end) != (start, end)
+        ]
+        parent_path = min(parents, key=lambda scope: scope.end - scope.start).path if parents else ()
+        counter_key = (parent_path, kind, header)
+        ordinal = sibling_counts.get(counter_key, 0)
+        sibling_counts[counter_key] = ordinal + 1
+        built.append(
+            _RustScope(
+                start=start,
+                end=end,
+                path=parent_path + ((kind, header, ordinal),),
+            )
+        )
+    return built
+
+
+def _region_identity(content: str, start: int, end: int, reason: str) -> Tuple[str, str]:
+    """Identify a test item independently of its implementation body."""
+    snippet = "\n".join(content.split("\n")[start - 1 : end])
+    patterns = (
+        ("fn", r"\bfn\s+([A-Za-z_]\w*)"),
+        ("mod", r"\bmod\s+([A-Za-z_]\w*)"),
+        ("const", r"\bconst\s+([A-Za-z_]\w*)"),
+        ("static", r"\bstatic\s+(?:mut\s+)?([A-Za-z_]\w*)"),
+        ("type", r"\btype\s+([A-Za-z_]\w*)"),
+        ("struct", r"\bstruct\s+([A-Za-z_]\w*)"),
+        ("enum", r"\benum\s+([A-Za-z_]\w*)"),
+        ("union", r"\bunion\s+([A-Za-z_]\w*)"),
+        ("trait", r"\btrait\s+([A-Za-z_]\w*)"),
+        ("macro", r"\bmacro_rules!\s*([A-Za-z_]\w*)"),
+        (
+            "field",
+            r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:",
+        ),
+    )
+    for kind, pattern in patterns:
+        match = re.search(pattern, snippet)
+        if match:
+            return kind, match.group(1)
+    impl_match = re.search(r"\bimpl\b([^\{]*)\{", snippet, re.DOTALL)
+    if impl_match:
+        return "impl", re.sub(r"\s+", " ", impl_match.group(1)).strip()
+    macro_match = re.search(
+        r"(?:^|\n)\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)!", snippet
+    )
+    if macro_match:
+        return "macro-invocation", macro_match.group(1)
+    # Unknown items remain auditable and can still be paired when their header
+    # is unchanged.  Exclude bodies so a correct alternative implementation is
+    # not rejected merely because test code differs.
+    header = re.sub(r"\s+", " ", snippet.split("{", 1)[0]).strip()
+    return reason, header
+
+
+def _analyze_test_regions(
+    content: str,
+    file_path: str,
+) -> Tuple[
+    List[_RustTestRegion],
+    Dict[Tuple[Tuple[str, str, int], ...], _RustScope],
+]:
+    """Detect tests and retain the declaration scope of every nested item."""
     if not file_path.endswith(".rs"):
-        return []
+        return [], {}
 
-    from harness.prepare_repo.split_test_patches.test_detector import find_test_code_ranges
-    import tempfile
-    import os
+    from harness.prepare_repo.split_test_patches.test_detector import (
+        RustTestDetectionError,
+        _get_kind_ranges_by_kind,
+        _is_inside_any_block,
+        find_test_code_ranges,
+    )
 
-    # Write content to temp file for ast-grep analysis
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".rs", delete=False, encoding="utf-8") as tmp:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".rs", delete=False, encoding="utf-8"
+        ) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
-
         try:
-            ranges_with_reason = find_test_code_ranges(tmp_path, only_root_level=only_root_level)
-
-            # Filter out doc tests (must stay with the item they document)
-            return [(start, end) for start, end, reason in ranges_with_reason if "doc test" not in reason]
+            raw_regions = [
+                item
+                for item in find_test_code_ranges(
+                    tmp_path, only_root_level=False, strict=True
+                )
+                if "doc test" not in item[2]
+            ]
+            structural_ranges = _get_kind_ranges_by_kind(
+                tmp_path,
+                [
+                    "declaration_list",
+                    "block",
+                    "mod_item",
+                    "impl_item",
+                    "trait_item",
+                    "foreign_mod_item",
+                    "struct_item",
+                    "enum_item",
+                    "union_item",
+                    "function_item",
+                    "field_declaration_list",
+                    "field_initializer_list",
+                    "enum_variant_list",
+                    "match_block",
+                ],
+                strict=True,
+            )
+            declaration_lists = [
+                (start, end)
+                for start, end, _ in structural_ranges["declaration_list"]
+            ]
+            safe_nested_containers = declaration_lists + [
+                (start, end)
+                for kind in ("field_declaration_list", "enum_variant_list")
+                for start, end, _ in structural_ranges[kind]
+            ]
+            unsafe_nested_containers = [
+                (start, end)
+                for kind in ("block", "field_initializer_list", "match_block")
+                for start, end, _ in structural_ranges[kind]
+            ]
+            nested_containers = safe_nested_containers + unsafe_nested_containers
+            scopes = _build_scope_tree(structural_ranges)
         finally:
-            os.unlink(tmp_path)
+            Path(tmp_path).unlink(missing_ok=True)
 
-    except Exception as e:
-        logger.warning(f"Failed to find test ranges: {e}")
-        return []
+        regions = []
+        for start, end, reason in raw_regions:
+            nested = _is_inside_any_block(start, nested_containers)
+            insertion_safe = nested and not _is_inside_any_block(
+                start, unsafe_nested_containers
+            )
+            containing_scopes = [
+                scope for scope in scopes if scope.start <= start and end <= scope.end
+            ]
+            scope_path = (
+                min(containing_scopes, key=lambda scope: scope.end - scope.start).path
+                if containing_scopes
+                else None
+            )
+            regions.append(
+                _RustTestRegion(
+                    start=start,
+                    end=end,
+                    reason=reason,
+                    identity=_region_identity(content, start, end, reason),
+                    nested=nested,
+                    scope_path=scope_path,
+                    insertion_safe=insertion_safe,
+                )
+            )
+        return regions, {scope.path: scope for scope in scopes}
+    except RustTestFilterError:
+        raise
+    except RustTestDetectionError as exc:
+        raise RustTestFilterError(f"failed to detect Rust tests in {file_path}: {exc}") from exc
+    except Exception as exc:
+        raise RustTestFilterError(f"failed to inspect Rust tests in {file_path}: {exc}") from exc
 
 
-def _is_doc_comment_or_empty(line: str) -> bool:
-    """Check if a line is a doc comment or empty/whitespace."""
+def find_test_ranges_from_content(
+    content: str,
+    file_path: str,
+    only_root_level: bool = True,
+    *,
+    reject_nested: bool = True,
+) -> List[Tuple[int, int]]:
+    """Find Rust test ranges, failing closed on unsupported nested contexts."""
+    regions, _ = _analyze_test_regions(content, file_path)
+    nested = [region for region in regions if region.nested]
+    if only_root_level and nested and reject_nested:
+        sample = ", ".join(
+            f"{region.start}-{region.end} ({region.reason})" for region in nested[:5]
+        )
+        raise RustTestFilterError(
+            f"nested Rust test regions in {file_path} require scope-preserving replacement: "
+            f"{sample}"
+        )
+    selected = [region for region in regions if not only_root_level or not region.nested]
+    return [(region.start, region.end) for region in selected]
+
+
+def _is_outer_doc_comment_or_empty(line: str) -> bool:
+    """Check for whitespace or an outer line-doc comment.
+
+    ``//!`` is deliberately excluded: it documents the enclosing module/crate,
+    not the following test item.
+    """
     stripped = line.strip()
     if not stripped:
         return True
-    return stripped.startswith("///") or stripped.startswith("//!")
+    return stripped.startswith("///")
 
 
 def _expand_range_to_include_doc_comments(lines: List[str], start: int, end: int) -> Tuple[int, int]:
@@ -228,8 +479,30 @@ def _expand_range_to_include_doc_comments(lines: List[str], start: int, end: int
     # Scan backwards from start to find doc comments
     while start_idx > 0:
         prev_line = lines[start_idx - 1]
-        if _is_doc_comment_or_empty(prev_line):
+        if _is_outer_doc_comment_or_empty(prev_line):
             start_idx -= 1
+        elif prev_line.strip().endswith("*/"):
+            # Include an outer /** ... */ block, but never an inner /*! ... */
+            # module doc or an ordinary block comment. Walk up only within
+            # THIS block: stop at the line that opens it, and bail if another
+            # block's terminator appears first — scanning past the opener
+            # would swallow unrelated production code into the test range.
+            block_start = start_idx - 1
+            if "/*" not in lines[block_start]:
+                block_start -= 1
+                while block_start >= 0 and "/*" not in lines[block_start]:
+                    if "*/" in lines[block_start]:
+                        block_start = -1
+                        break
+                    block_start -= 1
+            if (
+                block_start >= 0
+                and "/**" in lines[block_start]
+                and "/*!" not in lines[block_start]
+            ):
+                start_idx = block_start
+            else:
+                break
         else:
             break
 
@@ -320,22 +593,109 @@ def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str)
     stats = {
         "agent_test_regions_removed": 0,
         "gt_test_regions_appended": 0,
+        "nested_test_regions_replaced": 0,
+        "nested_test_regions_inserted": 0,
     }
 
-    # Find test regions in both files
-    # Use only_root_level=True to exclude test regions nested inside mod/impl/trait blocks
-    # (e.g., nested test modules or #[cfg(test)] fn methods that cannot be moved to file end)
-    agent_test_ranges = find_test_ranges_from_content(agent_content, file_path, only_root_level=True)
-    gt_test_ranges = find_test_ranges_from_content(gt_content, file_path, only_root_level=True)
+    agent_regions, agent_scopes = _analyze_test_regions(agent_content, file_path)
+    gt_regions, _ = _analyze_test_regions(gt_content, file_path)
+    agent_root = [region for region in agent_regions if not region.nested]
+    gt_root = [region for region in gt_regions if not region.nested]
+    agent_nested = [region for region in agent_regions if region.nested]
+    gt_nested = [region for region in gt_regions if region.nested]
 
-    stats["agent_test_regions_removed"] = len(agent_test_ranges)
-    stats["gt_test_regions_appended"] = len(gt_test_ranges)
+    stats["agent_test_regions_removed"] = len(agent_regions)
+    stats["gt_test_regions_appended"] = len(gt_regions)
 
-    # Remove agent test regions
-    src_only = remove_test_regions(agent_content, agent_test_ranges)
+    def region_text(content: str, region: _RustTestRegion) -> str:
+        return "\n".join(content.split("\n")[region.start - 1 : region.end])
 
-    # Extract GT test regions
-    gt_tests = extract_test_regions(gt_content, gt_test_ranges)
+    gt_by_key: Dict[
+        Tuple[Tuple[Tuple[str, str, int], ...], Tuple[str, str]],
+        List[_RustTestRegion],
+    ] = {}
+    for region in gt_nested:
+        if region.scope_path is None:
+            raise RustTestFilterError(
+                f"nested GT test {region.identity} in {file_path}:{region.start} "
+                "is inside an unsupported lexical scope"
+            )
+        gt_by_key.setdefault((region.scope_path, region.identity), []).append(region)
+
+    # Line edits are expressed against the original agent file and applied from
+    # bottom to top, so replacing one nested item cannot shift another range.
+    replacement_ops: List[Tuple[int, int, str]] = [
+        (region.start, region.end, "") for region in agent_root
+    ]
+    paired_counts: Dict[
+        Tuple[Tuple[Tuple[str, str, int], ...], Tuple[str, str]], int
+    ] = {}
+    for region in agent_nested:
+        if region.scope_path is None:
+            raise RustTestFilterError(
+                f"nested agent test {region.identity} in {file_path}:{region.start} "
+                "is inside an unsupported lexical scope"
+            )
+        key = (region.scope_path, region.identity)
+        index = paired_counts.get(key, 0)
+        candidates = gt_by_key.get(key, [])
+        replacement = region_text(gt_content, candidates[index]) if index < len(candidates) else ""
+        if replacement:
+            stats["nested_test_regions_replaced"] += 1
+        replacement_ops.append((region.start, region.end, replacement))
+        paired_counts[key] = index + 1
+
+    missing_by_scope: Dict[Tuple[Tuple[str, str, int], ...], List[_RustTestRegion]] = {}
+    for key, regions in gt_by_key.items():
+        used = paired_counts.get(key, 0)
+        if used < len(regions):
+            missing = regions[used:]
+            unsafe = [region for region in missing if not region.insertion_safe]
+            if unsafe:
+                sample = ", ".join(
+                    f"{region.identity}@{region.start}" for region in unsafe[:5]
+                )
+                raise RustTestFilterError(
+                    f"cannot insert nested GT test nodes inside a lexical expression "
+                    f"scope in {file_path}: {sample}"
+                )
+            missing_by_scope.setdefault(key[0], []).extend(missing)
+
+    insertion_ops: List[Tuple[int, str]] = []
+    for scope_path, regions in missing_by_scope.items():
+        agent_scope = agent_scopes.get(scope_path)
+        if agent_scope is None:
+            rendered_scope = " / ".join(
+                f"{kind}:{header}[{ordinal}]" for kind, header, ordinal in scope_path
+            )
+            raise RustTestFilterError(
+                f"cannot place nested GT tests in {file_path}: agent scope "
+                f"{rendered_scope!r} does not exist"
+            )
+        snippets = [
+            region_text(gt_content, region)
+            for region in sorted(regions, key=lambda item: item.start)
+        ]
+        insertion_ops.append((agent_scope.end, "\n\n".join(snippets)))
+        stats["nested_test_regions_inserted"] += len(snippets)
+
+    lines = agent_content.split("\n")
+    edits: List[Tuple[int, int, List[str], int]] = []
+    for start, end, replacement in replacement_ops:
+        replacement_lines = replacement.split("\n") if replacement else []
+        edits.append((start - 1, end, replacement_lines, 0))
+    for scope_end, insertion in insertion_ops:
+        # Insert immediately before the scope's closing-brace line.
+        edits.append((scope_end - 1, scope_end - 1, [""] + insertion.split("\n") + [""], 1))
+    for start_idx, end_idx, replacement_lines, _ in sorted(
+        edits, key=lambda edit: (edit[0], edit[3]), reverse=True
+    ):
+        lines[start_idx:end_idx] = replacement_lines
+    src_only = "\n".join(lines)
+
+    gt_tests = extract_test_regions(
+        gt_content, [(region.start, region.end) for region in gt_root]
+    )
 
     # Merge: src + blank lines + GT tests
     if gt_tests.strip():
@@ -359,7 +719,7 @@ def replace_agent_tests_with_ground_truth(
     file_path: str,
     milestone_id: str,
     gt_tag_suffix: str = "end",
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Replace agent's test regions with ground truth tests for a single file.
 
@@ -400,8 +760,11 @@ def replace_agent_tests_with_ground_truth(
 
     if gt_content is None:
         # File doesn't exist in GT - might be a new file created by agent
-        # Just remove agent's test blocks if any (only root-level ones)
-        agent_test_ranges = find_test_ranges_from_content(agent_content, file_path, only_root_level=True)
+        # Removing a nested item in place is safe; only relocating it would
+        # lose scope.  Strip every agent-authored test region from a new file.
+        agent_test_ranges = find_test_ranges_from_content(
+            agent_content, file_path, only_root_level=False
+        )
         if agent_test_ranges:
             src_only = remove_test_regions(agent_content, agent_test_ranges)
             if _write_file_to_container(container_name, file_path, src_only):
@@ -440,7 +803,7 @@ def process_rust_files_in_container(
     milestone_id: str,
     rust_files: List[str],
     gt_tag_suffix: str = "end",
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Process all Rust files to replace agent tests with GT tests.
 
@@ -463,7 +826,22 @@ def process_rust_files_in_container(
     }
 
     for file_path in rust_files:
-        file_result = replace_agent_tests_with_ground_truth(container_name, file_path, milestone_id, gt_tag_suffix)
+        try:
+            file_result = replace_agent_tests_with_ground_truth(
+                container_name, file_path, milestone_id, gt_tag_suffix
+            )
+        except Exception as exc:
+            # Security boundary: a detector/tool failure is not equivalent to
+            # "this file has no tests".  Report a failed file so the evaluator
+            # can invalidate the cell before running any tests.
+            file_result = {
+                "file": file_path,
+                "success": False,
+                "skipped": False,
+                "reason": f"Rust test filtering failed closed: {exc}",
+                "agent_test_regions_removed": 0,
+                "gt_test_regions_appended": 0,
+            }
         results["details"].append(file_result)
 
         if file_result["skipped"]:
@@ -498,6 +876,6 @@ def get_rust_files_from_tar(tar_path: Path) -> List[str]:
                 if member.isfile() and member.name.endswith(".rs"):
                     rust_files.append(member.name)
     except Exception as e:
-        logger.error(f"Failed to read tar file: {e}")
+        raise RustTestFilterError(f"failed to enumerate Rust files in snapshot: {e}") from e
 
     return rust_files

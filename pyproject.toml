@@ -1,7 +1,7 @@
 [project]
-name = "evoclaw"
+name = "swe-milestone"
 version = "0.1.0"
-description = "EvoClaw: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
+description = "SWE-Milestone: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,9 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "ruff>=0.1.0",
+    # Rust test-region detection (harness/prepare_repo + rust_test_filter)
+    # shells out to the ast-grep CLI; the PyPI wheel ships the binary.
+    "ast-grep-cli>=0.26",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -21,6 +24,13 @@ packages = ["harness"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# All tests live under tests/ (mirroring the source tree). Keeping testpaths
+# pinned there stops pytest from collecting the test_*-named SOURCE modules
+# inside harness/ (test_masking.py, test_id_normalizer.py, test_executor.py,
+# test_detector.py — implementation code for handling repo tests).
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120

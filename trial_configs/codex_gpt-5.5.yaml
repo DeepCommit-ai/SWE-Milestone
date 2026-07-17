@@ -1,7 +1,9 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: codex_gpt-5.5
 agent: codex
 model: gpt-5.5
 timeout: 18000
 reasoning_effort: xhigh
 
+# Uncomment to pin the codex CLI version instead of installing latest.
+# agent_version: 0.144.5

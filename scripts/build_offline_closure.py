@@ -1,8 +1,21 @@
 """Unified offline closure builder. Union all milestone images' deps into a
-self-contained <repo>/base-offline:latest. See
-docs/superpowers/specs/2026-06-23-offline-closure-builder-design.md."""
-import argparse, glob as _glob, subprocess, sys, yaml
+self-contained swe-milestone/<repo_full>__base-offline:latest image.
+See docs/quarantine.md (build + validation protocol)."""
+import argparse, glob as _glob, shlex, subprocess, sys, yaml
 from pathlib import Path
+
+# Naming authority (single source): harness/e2e/image_version.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from harness.e2e.image_version import PREFIX, SEP, local_ref, resolve_image
+from harness.e2e.quarantine import normalize_maven_plugin_probes
+
+
+def _base_image(repo_lower: str) -> str:
+    """Pinned base-image ref for FROM/probe lines. resolve_image honors the
+    SWE_MILESTONE_IMAGE_TAG pin (loud :latest fallback only on the default pin) —
+    fixes the old hardcoded :latest that bypassed version pinning."""
+    return resolve_image(local_ref(repo_lower, "base"))
+
 
 def assert_no_self_packages(staging_dir: Path, forbid_globs: list[str]) -> None:
     offending = []
@@ -19,7 +32,8 @@ def discover_milestone_images(repo_lower: str, _docker_images: str | None = None
         _docker_images = subprocess.run(
             ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
             capture_output=True, text=True, check=True).stdout
-    prefix = f"{repo_lower}/"
+    # New scheme: swe-milestone/<repo_lower>__<milestone>:<tag>
+    prefix = f"{PREFIX}/{repo_lower}{SEP}"
     seen = {}
     for line in _docker_images.splitlines():
         line = line.strip()
@@ -169,7 +183,7 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
     cargo_home_cfg = "/usr/local/cargo/config.toml"
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS vendor_builder",
+        f"FROM {_base_image(repo_lower)} AS vendor_builder",
     ]
     for i, m in enumerate(milestones):
         lines.append(f"COPY --from={m} /testbed /tb/m{i}")
@@ -224,7 +238,7 @@ def assemble_cargo_dockerfile(repo_lower: str, milestones: list[str],
         sync_manifests.append(extra_vendor_manifest)
     vendor = cargo_vendor_cmd(sync_manifests, vendor_dir)
     lines.append(f"RUN cd /tb/m0 && {vendor}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=vendor_builder {vendor_dir} {vendor_dir}")
     config = cargo_config_toml(vendor_dir)
     # Emit the config via a SINGLE-physical-line RUN: literal newlines in the
@@ -290,7 +304,7 @@ def cargo_pinned_channels(repo_lower: str, milestones: list[str],
     the highest is last (a stable, deterministic default pick).
     """
     chans = set()
-    base = f"{repo_lower}/base:latest"
+    base = f"{_base_image(repo_lower)}"
     for img in [base, *milestones]:
         ch = _probe(img)
         if ch:
@@ -389,7 +403,7 @@ def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
 
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # Install ALL pinned toolchains BEFORE any fetch: `cargo fetch` inside a workspace
     # honours its rust-toolchain.toml, so the pinned channel must exist or rustup
@@ -419,7 +433,7 @@ def assemble_cargo_rawcache_dockerfile(repo_lower: str, milestones: list[str],
     fetches = " && ".join(f"cd {d} && cargo fetch" for d in fetch_dirs)
     lines.append(f"RUN {fetches}")
 
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     # COPY the WHOLE warmed $CARGO_HOME (registry cache/index/src + git db/checkouts)
     # forward. Unlike vendor there is no config.toml redirect — the real registry
     # index is preserved, so `cargo build --offline` resolves from the cache.
@@ -1321,12 +1335,12 @@ def assemble_pip_dockerfile(repo_lower: str, reqs_basename: str,
     """
     return (
         "# syntax=docker/dockerfile:1\n"
-        f"FROM {repo_lower}/base:latest AS wheel_builder\n"
+        f"FROM {_base_image(repo_lower)} AS wheel_builder\n"
         f"COPY {reqs_basename} {reqs_in_image}\n"
         # ONLINE download of the whole union into the wheelhouse. One version per
         # package upstream, so no ResolutionImpossible.
         f"RUN pip download -r {reqs_in_image} -d {wheelhouse}\n"
-        f"FROM {repo_lower}/base:latest AS final\n"
+        f"FROM {_base_image(repo_lower)} AS final\n"
         f"COPY --from=wheel_builder {wheelhouse} {wheelhouse}\n"
         f"COPY {reqs_basename} {reqs_in_image}\n")
 
@@ -1427,7 +1441,7 @@ def run_pip_offline_gate(staging_tag: str, offline_build: str) -> None:
         sys.exit(1)
 
 def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths: list[str]) -> str:
-    lines = ["# syntax=docker/dockerfile:1", f"FROM {repo_lower}/base:latest AS builder",
+    lines = ["# syntax=docker/dockerfile:1", f"FROM {_base_image(repo_lower)} AS builder",
              "RUN command -v rsync || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)"]
     for i, m in enumerate(milestones):
         for j, cp in enumerate(cache_paths):
@@ -1437,7 +1451,7 @@ def render_union_dockerfile(repo_lower: str, milestones: list[str], cache_paths:
         f"mkdir -p /staging{cp} && rsync -a /milestone_{i}_{j}{cp}/ /staging{cp}/"
         for i in range(len(milestones)) for j, cp in enumerate(cache_paths))
     lines.append(f"RUN mkdir -p /staging && {merge or 'true'}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     for cp in cache_paths:
         lines.append(f"COPY --from=builder /staging{cp} {cp}")
     return "\n".join(lines) + "\n"
@@ -1557,7 +1571,7 @@ def _go_fetch_stage(repo_lower: str, milestones: list[str], tc: str,
     milestone (small context). `modsrc_dir` is where in the milestone image the
     manifests live (/testbed; navidrome's go module also roots at /testbed).
     """
-    lines = [f"FROM {repo_lower}/base:latest AS go_fetch"]
+    lines = [f"FROM {_base_image(repo_lower)} AS go_fetch"]
     # Clean-replace the toolchain BEFORE downloading (right go resolves the graph;
     # GOTOOLCHAIN=local forbids an auto-toolchain fetch from proxy.golang.org).
     lines.append("RUN rm -rf /usr/local/go")
@@ -1633,7 +1647,8 @@ def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
     if not online_fetch:
         tail = ("RUN rm -rf /usr/local/go\n"
                 f"COPY --from={tc} /usr/local/go /usr/local/go\n"
-                "ENV GOTOOLCHAIN=local\n")
+                "ENV GOTOOLCHAIN=local\n"
+                f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n")
         return union + tail
     # Online-fetch path (default). render_union_dockerfile emits `# syntax=...` then
     # `FROM ... AS builder` (rsync union) then `FROM ... AS final` (COPY the unioned
@@ -1658,7 +1673,8 @@ def assemble_go_dockerfile(repo_lower: str, milestones: list[str],
     tail = (f"COPY --from=go_fetch {modcache} {modcache}\n"
             "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
-            "ENV GOTOOLCHAIN=local\n")
+            "ENV GOTOOLCHAIN=local\n"
+            f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n")
     return syntax + fetch_stage + union_body + tail
 
 
@@ -1706,12 +1722,66 @@ _MVN_FETCH_LINT_SKIPS = (
     "-Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true"
 )
 
+_DEFAULT_MAVEN_PLUGIN_PROBES = [
+    {"pom": "pom.xml", "goal": "spotless:check", "timeout_seconds": 120},
+]
 
-def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str:
+
+def maven_plugin_probe_cmd(
+    testbed_dir: str,
+    probe: dict,
+    m2_repo: str = _M2_REPO_DIR,
+    *,
+    offline: bool,
+) -> str:
+    """Render one safe Maven module/plugin initialization probe."""
+    pom = shlex.quote(probe["pom"])
+    goal = shlex.quote(probe["goal"])
+    offline_flag = "-o " if offline else ""
+    return (
+        f"cd {shlex.quote(testbed_dir)} && mvn -q {offline_flag}-N -f {pom} {goal} "
+        f"-Dspotless.check.skip=false -Dcheckstyle.skip=true -Drat.skip=true "
+        f"-Dmaven.gitcommitid.skip=true -Dmaven.repo.local={shlex.quote(m2_repo)}"
+    )
+
+
+def combine_maven_offline_build(
+    offline_build: str,
+    probes: list[dict],
+    m2_repo: str = _M2_REPO_DIR,
+) -> str:
+    """Run the normal closure gate and every plugin probe without masking errors.
+
+    All commands execute even when a mid-migration source checkpoint fails. The
+    final non-zero status lets the Maven classifier inspect the combined output:
+    any third-party offline-resolution error blocks publication, while a pure
+    compile/format source-state error remains diagnostic.
+    """
+    commands = [offline_build] + [
+        maven_plugin_probe_cmd("/testbed", probe, m2_repo, offline=True)
+        for probe in probes
+    ]
+    pieces = ["status=0"]
+    pieces.extend(f"( {command} ) || status=$?" for command in commands)
+    pieces.append('exit "$status"')
+    return "; ".join(pieces)
+
+
+def maven_online_fetch_cmd(
+    testbed_dir: str,
+    m2_repo: str = _M2_REPO_DIR,
+    plugin_probes: list[dict] | None = None,
+) -> str:
     """Render the per-milestone ONLINE declared-deps fetch RUN body (no `RUN `
     prefix), warming `m2_repo` from the reactor rooted at `testbed_dir`.
 
-    The fetch runs TWO maven goals against the milestone's FULL multi-module
+    Before resolving the reactor, Dubbo needs one source-defined bootstrap POM:
+    `dubbo-dependencies-bom`. Milestone images contain that self/B POM in their
+    local cache, but copying milestone caches would leak answer artifacts. Instead
+    we install only the BOM POM from the copied source into the temporary fetch
+    cache. The final self@B removal and audit delete it before publication.
+
+    The fetch then runs THREE maven goals against the milestone's FULL multi-module
     reactor (dubbo is multi-module; `mvn` needs every module's pom to build the
     reactor model), both writing into the SHARED `-Dmaven.repo.local=<m2_repo>`:
 
@@ -1737,8 +1807,16 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
          source won't compile, so one un-buildable module never starves the rest of
          the cache; `-DskipTests` skips test EXECUTION (we only need test-SOURCES
          compiled, which still resolves+downloads the test-scope deps).
+      3. `-N spotless:check` (ONLINE, failure-tolerant) — resolves Spotless's
+         formatter implementation selected by the repository configuration.
+         These formatter artifacts are loaded dynamically by the plugin and are
+         not guaranteed to be included by `dependency:go-offline`; Dubbo's
+         Palantir formatter was the concrete gap. `-N` initializes the root
+         configuration without letting a formatting violation in milestone
+         source prevent the cache warm, and `spotless.check.skip=false` overrides
+         any inherited build-time skip flag.
 
-    Both goals are `-o`-free (this is the ONLINE build stage — repo1.maven.org /
+    All goals are `-o`-free (this is the ONLINE build stage — repo1.maven.org /
     Maven Central is a non-answer registry that serves third-party artifacts, safe to
     fetch from at BUILD time; the closure is sealed offline at eval). Each goal is
     `|| true`-guarded so a milestone whose reactor can't fully build (a mid-migration
@@ -1754,6 +1832,12 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
     published closure never serves the answer.
     """
     goals = (
+        # (0) Bootstrap only the source-defined BOM POM needed to construct the
+        # reactor model. It is temporary self/B material and is removed + audited
+        # in the final stage along with every other forbidden self coordinate.
+        f"if [ -f dubbo-dependencies-bom/pom.xml ]; then "
+        f"mvn -q -f dubbo-dependencies-bom/pom.xml install -DskipTests "
+        f"{_MVN_FETCH_LINT_SKIPS} -Dmaven.repo.local={m2_repo} || true ; fi ; "
         # (1) cheap broad pass: plugins + compile/runtime graph (resolution-only).
         f"mvn -q dependency:go-offline {_MVN_FETCH_LINT_SKIPS} "
         f"-Dmaven.repo.local={m2_repo} || true ; "
@@ -1762,14 +1846,33 @@ def maven_online_fetch_cmd(testbed_dir: str, m2_repo: str = _M2_REPO_DIR) -> str
         # -fae so a non-compiling module doesn't starve the rest; -DskipTests skips
         # test EXECUTION but still compiles test-sources (→ resolves test-scope deps).
         f"mvn -q -fae test-compile -DskipTests {_MVN_FETCH_LINT_SKIPS} "
+        f"-Dmaven.repo.local={m2_repo} || true ; "
+        # (3) Spotless loads formatter engines (notably palantir-java-format)
+        # dynamically, outside dependency:go-offline's reliable closure.
+        f"mvn -q -N spotless:check -Dspotless.check.skip=false "
+        f"-Dcheckstyle.skip=true -Drat.skip=true -Dmaven.gitcommitid.skip=true "
         f"-Dmaven.repo.local={m2_repo} || true"
     )
-    return f"cd {testbed_dir} && ( {goals} )"
+    probes = normalize_maven_plugin_probes(plugin_probes or _DEFAULT_MAVEN_PLUGIN_PROBES)
+    # The historical root probe above remains for byte-for-byte compatibility;
+    # do not render it twice when it is also the configured default.
+    extra_probe_cmds = []
+    for probe in probes:
+        if probe["pom"] == "pom.xml" and probe["goal"] == "spotless:check":
+            continue
+        extra_probe_cmds.append(
+            maven_plugin_probe_cmd(testbed_dir, probe, m2_repo, offline=False) + " || true"
+        )
+    body = f"cd {testbed_dir} && ( {goals} )"
+    if extra_probe_cmds:
+        body += " ; " + " ; ".join(extra_probe_cmds)
+    return body
 
 
 def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
                               cache_paths: list[str],
-                              forbid_globs: list[str]) -> str:
+                              forbid_globs: list[str],
+                              plugin_probes: list[dict] | None = None) -> str:
     """Maven closure Dockerfile: ONLINE-fetch the UNION of every milestone's
     *declared* deps into the local `.m2`, then bake it — the robust pattern pip
     (`pip download` the union freeze), cargo (`cargo vendor` the union of locks), and
@@ -1818,9 +1921,10 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     # (a single entry for dubbo); fall back to the canonical default if unset so the
     # assembly is always well-formed.
     m2_repo = (cache_paths or [_M2_REPO_DIR])[0]
+    probes = normalize_maven_plugin_probes(plugin_probes or _DEFAULT_MAVEN_PLUGIN_PROBES)
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # COPY each milestone's FULL /testbed (the whole reactor — every module pom is
     # needed to build the multi-module model).
@@ -1830,8 +1934,17 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
     # local repo (m2_repo). go-offline (compile+runtime+plugins) AND resolve
     # -DincludeScope=test (the test-scope deps go-offline misses, e.g. bcprov).
     for i in range(len(milestones)):
-        lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo)}")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+        lines.append(f"RUN {maven_online_fetch_cmd(f'/tb/m{i}', m2_repo, probes)}")
+    # Milestone checkpoints may deliberately have a temporarily unresolvable
+    # self/B reactor model, so their best-effort Spotless warm can stop before
+    # plugin initialization. The fetch_builder's own /testbed is the valid
+    # base/A tree: warm its active JDK profile as the guaranteed formatter seed.
+    # The final-stage offline command below is still the fail-closed proof.
+    lines.append(
+        f"RUN cd /testbed && mvn -q -N spotless:check "
+        f"-Dspotless.check.skip=false -Dcheckstyle.skip=true -Drat.skip=true "
+        f"-Dmaven.gitcommitid.skip=true -Dmaven.repo.local={m2_repo}")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=fetch_builder {m2_repo} {m2_repo}")
     # maven-build-cache-extension offline marker fix: the jar IS in the closure `.m2`,
     # but its `_remote.repositories` reads `…-1.2.0.jar>central=` (empty RHS) → `mvn -o`
@@ -1845,6 +1958,26 @@ def assemble_maven_dockerfile(repo_lower: str, milestones: list[str],
         "RUN find "
         f"{m2_repo}/org/apache/maven/extensions/maven-build-cache-extension "
         "-name _remote.repositories -delete 2>/dev/null || true")
+    # Runtime agents use uid!=0 with primary GID 0. Bake the minimum parent
+    # traverse bit plus group read/write access into the closure image itself,
+    # so it is intrinsically usable even before container_setup's repair and
+    # fail-fast checks. This is defense in depth for legacy/custom launch paths.
+    lines.append("RUN chmod g+x /root && chmod -R g+rwX /root/.m2")
+    # Prove that the dynamically selected Spotless formatter is actually in the
+    # sealed cache. The base/A worktree is clean, and `-o` makes this a closure
+    # gate even though Docker build networking is available.
+    lines.append(
+        f"RUN cd /testbed && mvn -q -o -N -Dmaven.repo.local={m2_repo} "
+        "spotless:check -Dspotless.check.skip=false -Dcheckstyle.skip=true "
+        "-Drat.skip=true -Dmaven.gitcommitid.skip=true")
+    for probe in probes:
+        if probe["pom"] == "pom.xml" and probe["goal"] == "spotless:check":
+            continue
+        lines.append(
+            "RUN " + maven_plugin_probe_cmd(
+                "/testbed", probe, m2_repo, offline=True
+            )
+        )
     # self@B removal AFTER the fetch+COPY: the online fetch may have pulled dubbo's
     # OWN 3.3.6 artifacts into the cache; delete exactly the cache_forbid_globs so
     # the closure never serves the answer and the generic audit (same globs) passes.
@@ -1940,7 +2073,7 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
     cache_folder = str(PurePosixPath(yarn_cache).parent)
     lines = [
         "# syntax=docker/dockerfile:1",
-        f"FROM {repo_lower}/base:latest AS fetch_builder",
+        f"FROM {_base_image(repo_lower)} AS fetch_builder",
     ]
     # COPY only the two manifests from each milestone (small context, no source).
     for i, m in enumerate(milestones):
@@ -1954,7 +2087,7 @@ def assemble_npm_dockerfile(repo_lower: str, milestones: list[str],
                 f"--ignore-scripts --non-interactive")
         lines.append(
             f"RUN cd /m{i} && ( {base} --frozen-lockfile || {base} )")
-    lines.append(f"FROM {repo_lower}/base:latest AS final")
+    lines.append(f"FROM {_base_image(repo_lower)} AS final")
     lines.append(f"COPY --from=fetch_builder {yarn_cache} {yarn_cache}")
     # Bake any SRS-declared global npm tools (e.g. serve@14.2.5) into the final
     # image so milestones can use them without an offline install. Each tool is
@@ -2108,7 +2241,7 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
     # Simplest correct layout: prepend the npm_fetch stage, then the full go union,
     # then the toolchain + _cacache COPY tail appended to the (already-open) final
     # stage.
-    npm_lines = [f"FROM {repo_lower}/base:latest AS npm_fetch"]
+    npm_lines = [f"FROM {_base_image(repo_lower)} AS npm_fetch"]
     for i, m in enumerate(milestones):
         npm_lines.append(
             f"COPY --from={m} /testbed/ui/package.json "
@@ -2145,6 +2278,7 @@ def assemble_go_npm_dockerfile(repo_lower: str, milestones: list[str],
             "RUN rm -rf /usr/local/go\n"
             f"COPY --from={tc} /usr/local/go /usr/local/go\n"
             "ENV GOTOOLCHAIN=local\n"
+            f"ENV GOLANG_VERSION={str(target_go).removeprefix('go')}\n"
             f"COPY --from=npm_fetch {npm_cacache} {npm_cacache}\n"
             "RUN chmod -R a+rX /tmp/taglib 2>/dev/null || true\n"
             "RUN chmod 755 /root && chmod -R a+rX /root/.npm 2>/dev/null || true\n")
@@ -2470,8 +2604,8 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
         print(f"Error: no milestone images for {repo_lower} (run pull_images.sh)",
               file=sys.stderr)
         sys.exit(1)
-    staging_tag = f"{repo_lower}/base-offline:staging"
-    latest_tag = f"{repo_lower}/base-offline:latest"
+    staging_tag = local_ref(repo_lower, "base-offline", "staging")
+    latest_tag = local_ref(repo_lower, "base-offline", "latest")
 
     # DUAL go+npm (navidrome): a multi-ecosystem repo the single-id `_ecosystem_of`
     # rejects. Detect the set {go, npm} and route to the self-contained dual path
@@ -2586,8 +2720,11 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             # (same globs) matches nothing. The per-milestone B-source gate (mvn -o
             # test-compile) applies unchanged, with the maven classifier.
             cache_paths = cfg["cache_paths"]
+            maven_plugin_probes = normalize_maven_plugin_probes(
+                cfg.get("maven_plugin_probes") or _DEFAULT_MAVEN_PLUGIN_PROBES
+            )
             df = assemble_maven_dockerfile(repo_lower, milestones, cache_paths,
-                                           forbid_globs)
+                                           forbid_globs, maven_plugin_probes)
             _docker_build(df, staging_tag, project_root)
         elif eco == "npm":
             # ONLINE-fetch the UNION of every milestone's DECLARED deps into the
@@ -2675,10 +2812,17 @@ def build_closure(repo_lower: str, project_root: Path, push: bool = False,
             gate_classifier = classify_cargo_offline_build_failure
         else:
             gate_classifier = None
+        gate_build = offline_build
+        if eco == "maven":
+            gate_build = combine_maven_offline_build(
+                offline_build,
+                maven_plugin_probes,
+                (cfg.get("cache_paths") or [_M2_REPO_DIR])[0],
+            )
         source_state = []
         for i, m in enumerate(milestones, 1):
             print(f"offline gate [{i}/{len(milestones)}] {m} ...", flush=True)
-            result = run_offline_gate(staging_tag, m, offline_build,
+            result = run_offline_gate(staging_tag, m, gate_build,
                                      goproxy_off=gate_goproxy_off,
                                      classifier=gate_classifier)
             if result == "SOURCE_STATE":

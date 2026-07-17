@@ -1,6 +1,6 @@
 # Adding a New Model to an Existing Agent
 
-This guide covers running a **new model** on one of the four agents EvoClaw
+This guide covers running a **new model** on one of the four agents SWE-Milestone
 already supports (`claude-code`, `codex`, `gemini-cli`, `openhands`).
 
 > Adding a new **agent framework** (a new adapter) is a different, larger task —
@@ -15,14 +15,14 @@ pricing row. Here's the whole process.
 
 ```yaml
 # trial_configs/<agent>_<model>.yaml
-data_root: /path/to/EvoClaw-data
+data_root: /path/to/SWE-Milestone-data
 trial_name: <agent>_<model>
 agent: claude-code            # claude-code | codex | gemini-cli | openhands
 model: <the endpoint's exact model id>
 timeout: 18000
 # reasoning_effort: high      # optional: low | medium | high | xhigh | max
 # auto_compact_window: 200000 # claude-code only: compact at 200K (omit = no compaction, ~1M); see note
-# default_haiku_model: <model># claude-code only: pin all model slots (see Step 5)
+# default_agent_model: <model># claude-code only: pin all model slots (see Step 5)
 ```
 
 ```bash
@@ -148,13 +148,16 @@ Claude Code picks a model **by class** at five decision points
 (HAIKU / SONNET / OPUS / SUBAGENT / global default) for background tasks,
 fallbacks, and subagent spawns. Left unset, those hit `api.anthropic.com` with
 hard-coded defaults (e.g. `claude-haiku-4-5`) — bypassing your endpoint and
-billing a separate account. Point all five at your model:
+billing a separate account. Point all of them at your model:
 
 ```yaml
-default_haiku_model: your-model
+default_agent_model: your-model
 ```
 
-(Despite the name, this drives all five slots.) **Vertex mode sets this
+(One value drives ALL of Claude Code's class-based slots:
+`ANTHROPIC_DEFAULT_HAIKU/SONNET/OPUS/FABLE_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`, `ANTHROPIC_MODEL`. Renamed from
+`default_haiku_model`, which is now a hard error.) **Vertex mode sets this
 automatically** to the trial `model`, so background/subagent calls stay on the
 one model you enabled on Vertex.
 
@@ -209,13 +212,13 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST \
 **2. Config** (`trial_configs/claude-code_opus-4.8.yaml`):
 
 ```yaml
-data_root: /path/to/EvoClaw-data
+data_root: /path/to/SWE-Milestone-data
 trial_name: claude-code_opus-4.8
 agent: claude-code
 model: claude-opus-4-8
 vertex_ai: true
 vertex_location: global
-default_haiku_model: claude-opus-4-8
+default_agent_model: claude-opus-4-8
 reasoning_effort: max        # ⚠️ see #48051 above; unset = built-in xhigh
 timeout: 18000
 ```
@@ -226,7 +229,7 @@ timeout: 18000
 python scripts/run_all.py --config trial_configs/claude-code_opus-4.8.yaml
 ```
 
-`run_all.py` sets `EVOCLAW_VERTEX*`; `claude_code.py` then emits
+`run_all.py` sets `SWE_MILESTONE_VERTEX*`; `claude_code.py` then emits
 `CLAUDE_CODE_USE_VERTEX=1` + `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION`,
 mounts the host ADC read-only, and copies it into the agent user's home — Claude
 Code talks to Vertex directly.
@@ -240,6 +243,13 @@ Code talks to Vertex directly.
 - [ ] auth chosen: key + base URL **or** `vertex_ai: true` + ADC
 - [ ] endpoint domain in `WHITELISTED_DOMAINS` (if new)
 - [ ] pricing row in `pricing.py` (or a family match already covers it)
-- [ ] (claude-code) `default_haiku_model` set
+- [ ] (claude-code) `default_agent_model` set
 - [ ] `reasoning_effort` decided (mind claude-code #48051)
 - [ ] config created, launched, monitored
+
+---
+
+**After the trials finish:** surfacing results on the `:5000` dashboard is a
+separate pipeline in the sibling `analysis/` repo — see
+`analysis/docs/dashboard_migration.md` (migrate → register → refresh → build,
+plus the PYTHONPATH pitfall that silently under-reports cost).

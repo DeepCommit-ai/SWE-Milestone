@@ -17,16 +17,16 @@ you can call `run_e2e` directly. Same `flock` + `--force` semantics apply.
 # Fresh start (or wipe-and-restart with --force)
 python -m harness.e2e.run_e2e \
   --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
-  --image navidrome_navidrome_v0.57.0_v0.58.0/base:latest \
-  --srs-root /path/to/EvoClaw-data/navidrome_.../srs \
-  --workspace-root /path/to/EvoClaw-data/navidrome_... \
+  --image swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0 \
+  --srs-root /path/to/SWE-Milestone-data/navidrome_.../srs \
+  --workspace-root /path/to/SWE-Milestone-data/navidrome_... \
   --agent claude-code --model claude-sonnet-4-6 \
   --timeout 18000 --trial-name my_experiment_001 \
   --force
 
 # Resume an existing trial directly (container must exist)
 python -m harness.e2e.run_e2e \
-  --resume-trial /path/to/EvoClaw-data/.../e2e_trial/my_experiment_001
+  --resume-trial /path/to/SWE-Milestone-data/.../e2e_trial/my_experiment_001
 ```
 
 ### CLI Reference
@@ -63,9 +63,9 @@ For testing or debugging a single milestone in isolation:
 ```bash
 python -m harness.e2e.run_milestone \
   --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
-  --workspace-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0 \
+  --workspace-root /path/to/SWE-Milestone-data/navidrome_navidrome_v0.57.0_v0.58.0 \
   --milestone-id milestone_001 \
-  --srs-path /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0/srs/milestone_001/SRS.md \
+  --srs-path /path/to/SWE-Milestone-data/navidrome_navidrome_v0.57.0_v0.58.0/srs/milestone_001/SRS.md \
   --agent claude-code \
   --model claude-sonnet-4-6
 ```
@@ -78,7 +78,7 @@ python -m harness.e2e.run_milestone \
 
 ```bash
 python -m harness.e2e.collect_results \
-  --workspace-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0 \
+  --workspace-root /path/to/SWE-Milestone-data/navidrome_navidrome_v0.57.0_v0.58.0 \
   --trials my_experiment_001 \
   --trial-type e2e
 ```
@@ -89,7 +89,7 @@ Re-run evaluation against a previously captured `source_snapshot.tar`:
 
 ```bash
 python -m harness.e2e.evaluator \
-  --workspace-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0 \
+  --workspace-root /path/to/SWE-Milestone-data/navidrome_navidrome_v0.57.0_v0.58.0 \
   --milestone-id milestone_001 \
   --patch-file /path/to/trial/evaluation/milestone_001/source_snapshot.tar \
   --baseline-classification /path/to/test_results/milestone_001/milestone_001_classification.json \
@@ -101,7 +101,7 @@ python -m harness.e2e.evaluator \
 ## E2E Config (`e2e_config.yaml`)
 
 The `e2e_config.yaml` (at `harness/e2e/e2e_config.yaml`) controls evaluation
-behavior. The default is the EvoClaw Benchmark configuration:
+behavior. The default is the SWE-Milestone Benchmark configuration:
 
 ```yaml
 dag_unlock:

@@ -14,11 +14,11 @@ For single-milestone debugging, raw `run_e2e` invocation, result collection,
 
 ```bash
 # 1. Host paths — set once, auto-loaded every run (persists across shells)
-cp .env .env_private                     # then set EVOCLAW_DATA_ROOT in .env_private
+cp .env .env_private                     # then set SWE_MILESTONE_DATA_ROOT in .env_private
 
 # 2. Trial config
 cp trial_config.example.yaml trial_config.yaml
-# Edit: trial_name, agent, model  (data_root defaults to ${EVOCLAW_DATA_ROOT})
+# Edit: trial_name, agent, model  (data_root defaults to ${SWE_MILESTONE_DATA_ROOT})
 
 # 3. API credentials  (skip for Vertex/ADC; can also live in .env_private)
 export UNIFIED_API_KEY="sk-..."
@@ -33,7 +33,7 @@ python scripts/run_all.py --config trial_config.yaml
 
 `run_all.py` spawns one detached `run_e2e` per repo (each in its own session via
 `setsid()`) and exits. **No `nohup` needed.** Each worker writes to
-`.evoclaw/<repo>.log`.
+`.swe-milestone/<repo>.log`.
 
 > **Resource note:** All 7 repos in parallel = up to **35 Docker containers**
 > (1 agent + up to 4 concurrent eval per repo). Use `--repos a b c` to narrow
@@ -55,14 +55,16 @@ Two forms for `trial_name`:
 | `my_experiment_002` (fixed `_NNN`) | Used as-is; `--force` / `--new` only affect lifecycle, not the name |
 
 > **Third-party endpoints:** When Claude Code talks to a non-Anthropic endpoint
-> (Z.AI, DeepSeek, all-hands proxy, …), set `default_haiku_model` to your main
-> model name. Claude Code has *five* class-based model slots (HAIKU / SONNET
-> / OPUS / SUBAGENT / global default) that each fall back to a hard-coded
-> Anthropic default (e.g., `claude-haiku-4-5`) when unset — those requests
-> hit `api.anthropic.com` directly, bypassing your `UNIFIED_BASE_URL` and
-> billing a separate Anthropic account. `default_haiku_model` (despite the
-> name) points all five slots at the same model, keeping every request on
-> your proxy.
+> (Z.AI, DeepSeek, all-hands proxy, …), set `default_agent_model` to your main
+> model name. Claude Code has several class-based model slots
+> (`ANTHROPIC_DEFAULT_HAIKU_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` /
+> `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL` /
+> `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_MODEL`) that each fall back to a
+> hard-coded Anthropic default (e.g., `claude-haiku-4-5`) when unset — those
+> requests hit `api.anthropic.com` directly, bypassing your `UNIFIED_BASE_URL`
+> and billing a separate Anthropic account. `default_agent_model` overrides
+> all of these slots with the one value, keeping every request on your proxy.
+> (Renamed from `default_haiku_model`; the old field name is a hard error.)
 
 > **Context compaction (`auto_compact_window`, claude-code only):** by default
 > claude-code runs with **no compaction** — context grows to the endpoint's
@@ -71,6 +73,16 @@ Two forms for `trial_name`:
 > values above 200K are capped, so `200000` is the only useful setting). The
 > monitor header's `context=` label reflects the effective window. Details:
 > [`adding-a-model.md`](./adding-a-model.md).
+
+> **Agent CLI version (`agent_version` — claude-code, codex, gemini-cli):**
+> set an exact version such as `agent_version: 2.1.158` to make the trial
+> install and retain that CLI version. claude-code also accepts the `stable` /
+> `latest` release channels (exact pins disable its self-updates); codex and
+> gemini-cli accept an exact semver or `latest` (npm re-resolves the newest
+> release at container setup). A pinned version that cannot be verified inside
+> the container is fatal. `trial_metadata.json` records both the requested
+> selector (`requested_agent_version`) and the numeric version found in the
+> container (`agent_version`).
 
 > **Google Vertex AI (gemini-cli / claude-code):** Vertex doesn't use an API
 > key — it uses ADC. Set `vertex_ai: true` with `agent: gemini-cli` (Gemini
@@ -195,7 +207,7 @@ working slowly".
 TRIAL=my_experiment_001
 REPO=BurntSushi_ripgrep_14.1.1_15.0.0      # full repo dir name
 CONT="${REPO}-${TRIAL}"
-TRIAL_DIR=/path/to/EvoClaw-data/$REPO/e2e_trial/$TRIAL
+TRIAL_DIR=/path/to/SWE-Milestone-data/$REPO/e2e_trial/$TRIAL
 
 # 1. Worker alive?  (substring-match the trial; --resume-trial workers don't
 #    have --repo-name in cmdline, so grep the trial name not the repo flag)
@@ -305,7 +317,7 @@ fresh side-steps the pathological state.
 > "the trial itself is wrong" (bad config / wrong model / corrupted state),
 > not for "the agent's network call hung".
 
-> **EvoClaw benchmark protocol**: trials are resumed until all milestones are
+> **SWE-Milestone benchmark protocol**: trials are resumed until all milestones are
 > submitted and evaluated, unless three consecutive resumes yield no new
 > submissions. Reproducibility studies should follow the same setting.
 
@@ -411,7 +423,7 @@ shell-exported var still wins):
 
 | Variable | Description |
 |---|---|
-| `EVOCLAW_DATA_ROOT` | Where you downloaded EvoClaw-data. Trial configs use `data_root: ${EVOCLAW_DATA_ROOT}`. |
+| `SWE_MILESTONE_DATA_ROOT` | Where you downloaded SWE-Milestone-data. Trial configs use `data_root: ${SWE_MILESTONE_DATA_ROOT}`. |
 
 > **Quarantine (anti-cheat) is zero-touch.** It auto-applies to any repo that has
 > a `quarantine_configs/<repo>.yaml` policy — nothing to pass per run (a `🔒` marker

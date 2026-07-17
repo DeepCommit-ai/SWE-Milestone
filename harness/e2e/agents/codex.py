@@ -7,7 +7,11 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional
 
-from harness.e2e.agents.base import AgentFramework, register_framework
+from harness.e2e.agents.base import (
+    AgentFramework,
+    register_framework,
+    validate_agent_cli_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ class CodexFramework(AgentFramework):
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         include_directories: Optional[List[str]] = None,
+        agent_version: Optional[str] = None,
         **kwargs,
     ):
         """Initialize Codex framework.
@@ -60,12 +65,29 @@ class CodexFramework(AgentFramework):
                              Passed to Codex CLI via model_reasoning_effort.
             include_directories: Extra directories to pass to codex (currently unused,
                                  accepted for interface compatibility with other frameworks).
+            agent_version: Exact Codex CLI version to pin, or ``latest``.
         """
         self.api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self.base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self.reasoning_effort = reasoning_effort or "xhigh"
+        self._agent_version = validate_agent_cli_version(agent_version, agent_label="Codex")
         self._codex_auth_file = Path.home() / ".codex" / "auth.json"
         self._codex_config_file = Path.home() / ".codex" / "config.toml"
+
+    def get_requested_version(self) -> Optional[str]:
+        return self._agent_version
+
+    def get_version_command(self) -> List[str]:
+        return ["codex", "--version"]
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        match = re.search(r"\b(\d+\.\d+\.\d+)\b", output or "")
+        return match.group(1) if match else None
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        if self._agent_version in (None, "latest"):
+            return True
+        return actual_version == self._agent_version
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort (default: xhigh)."""
@@ -164,7 +186,7 @@ class CodexFramework(AgentFramework):
         Returns:
             Python script as a string
         """
-        return """
+        script = """
 # === Codex: Install Codex CLI ===
 try:
     import subprocess
@@ -222,16 +244,27 @@ try:
             print(f"Failed to install Node.js: {stderr}")
             raise Exception("Node.js installation failed")
 
-    # Check if codex is already installed
+    # Check if codex is already installed. An exact requested version can be
+    # reused only when it matches; 'latest' always re-resolves via npm.
+    import re as _re
+    requested_version = __CODEX_AGENT_VERSION__
     result = subprocess.run(['which', 'codex'], capture_output=True, text=True)
-    if result.returncode == 0:
+    needs_install = result.returncode != 0
+    if requested_version == 'latest':
+        needs_install = True
+    elif requested_version and not needs_install:
+        ok, ver_out, _ = run_cmd(['codex', '--version'])
+        m = _re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', ver_out) if ok else None
+        if not m or m.group(1) != requested_version:
+            needs_install = True
+
+    if not needs_install:
         print(f"Codex already installed at: {result.stdout.strip()}")
     else:
-        print("Installing Codex CLI via npm...")
-
-        # Install codex globally
+        pkg = '@openai/codex' + (f'@{requested_version}' if requested_version else '')
+        print(f"Installing Codex CLI via npm ({pkg})...")
         install_result = subprocess.run(
-            ['npm', 'i', '-g', '@openai/codex'],
+            ['npm', 'i', '-g', pkg],
             capture_output=True,
             text=True
         )
@@ -295,6 +328,9 @@ try:
 except Exception as e:
     print(f"Error setting up Codex OAuth files: {e}")
 """
+        return script.replace(
+            "__CODEX_AGENT_VERSION__", repr(self._agent_version)
+        )
 
     def build_run_command(
         self,

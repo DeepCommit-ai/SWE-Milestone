@@ -9,8 +9,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/Hydrapse/EvoClaw.git
-cd EvoClaw
+git clone https://github.com/DeepCommit-ai/SWE-Milestone.git
+cd SWE-Milestone
 uv sync
 ```
 
@@ -20,13 +20,20 @@ Workspace data (metadata, SRS documents, test classifications) is hosted on Hugg
 
 ```bash
 git lfs install
-git clone https://huggingface.co/datasets/hyd2apse/EvoClaw-data
+git clone https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data
+cd SWE-Milestone-data && git checkout v1.0   # pin the benchmark data version
 ```
+
+The data repo carries the same `vX.Y` version tags as the Docker images
+(see [versioning.md](versioning.md)). Trials verify at launch that the data
+checkout matches the pinned version (`SWE_MILESTONE_IMAGE_TAG`, default
+`v1.0`) and record the verdict in `trial_metadata.json`; align a stale
+checkout with `./scripts/pull_data.sh` (aligns to the pinned version; `--report-only` to inspect).
 
 The dataset contains one directory per repository:
 
 ```
-EvoClaw-data/
+SWE-Milestone-data/
 ├── navidrome_navidrome_v0.57.0_v0.58.0/
 ├── apache_dubbo_dubbo-3.3.3_dubbo-3.3.6/
 ├── BurntSushi_ripgrep_14.1.1_15.0.0/
@@ -55,63 +62,62 @@ The "Milestones" column in the main README counts graded milestones only. Some r
 
 ## Docker Images
 
-Pre-built Docker images are hosted on DockerHub under the `hyd2apse` organization. There are two types of images per repository:
+Pre-built Docker images are hosted on DockerHub under the `hyd2apse` namespace. There are two types of images per repository:
 
-- **Base image** -- the agent runs inside this container (passed via `--image`)
+- **Base image** (`base` / `base-offline`) -- the agent runs inside this container (passed via `--image`)
 - **Milestone images** -- used by the evaluator to run tests for each milestone
 
-### Quick Setup (Recommended)
+Naming is mechanical on both sides (single authority:
+`harness/e2e/image_version.py`; manifest: `manifests/digests-<version>.tsv`,
+which both enumerates the version's images and freezes their content digests):
 
-A helper script automates pulling and retagging:
+```
+hub:    <org>/swe-milestone__<repo_full>__<milestone>:<version>
+local:  swe-milestone/<repo_full>__<milestone>:<version>
+```
+
+Example (org `hyd2apse`, version `v1.0`):
+
+```
+hub:    hyd2apse/swe-milestone__navidrome_navidrome_v0.57.0_v0.58.0__milestone_006:v1.0
+local:  swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__milestone_006:v1.0
+```
+
+`base` and `base-offline` are ordinary milestones (same pattern). The payload
+`<repo_full>__<milestone>` is byte-identical on both sides; `repo_full` and
+`milestone` never contain `__`, so parsing is unambiguous.
+
+### Pulling images
+
+**`docker login` first** -- anonymous DockerHub pulls are rate-limited and a
+full `./scripts/pull_images.sh` run fetches ~115 images.
 
 ```bash
+docker login
+
 # Pull and retag all images for a specific repo
 ./scripts/pull_images.sh --repo navidrome
 
-# Pull and retag all repos
+# Pull and retag everything in the manifest
 ./scripts/pull_images.sh
 
-# Dry run (see what would be pulled)
+# Dry run (print the pull plan, do nothing)
 ./scripts/pull_images.sh --repo navidrome --dry-run
 ```
 
-### Manual Setup
+The script executes the plan emitted by
+`python3 -m harness.e2e.image_version pull-plan` (one `<hub>\t<local>` pair
+per line); retagging hub -> local is a pure pointer operation.
 
-The evaluator expects milestone images named as `{repo_name}/{milestone_id}:latest`. Since DockerHub does not support multi-level repository names, images are published with a flat naming scheme and must be **retagged locally** after pulling.
+### Version pinning
 
-**Image naming mapping:**
+The benchmark data version is pinned via `SWE_MILESTONE_IMAGE_TAG` (default =
+`manifests/BENCHMARK_VERSION`, the single source of truth read by code,
+scripts, and CI). Images for a published
+version are immutable: never re-pushed, never deleted. Pre-v1.0 images remain
+on the hub under the old `hyd2apse/<short>:<milestone>-v0.9` scheme, frozen;
+the current tooling intentionally does not read them (use the old script from
+git history if you ever need them).
 
-| DockerHub name | Local name (after retag) |
-|---|---|
-| `hyd2apse/<repo>:base` | `<repo_full>/base:latest` |
-| `hyd2apse/<repo>:<milestone_id>` | `<repo_full>/<milestone_id>:latest` |
-
-**Repository name mapping:**
-
-| Short name | Full repo name |
-|------------|---------------|
-| `navidrome` | `navidrome_navidrome_v0.57.0_v0.58.0` |
-| `dubbo` | `apache_dubbo_dubbo-3.3.3_dubbo-3.3.6` |
-| `ripgrep` | `burntsushi_ripgrep_14.1.1_15.0.0` |
-| `go-zero` | `zeromicro_go-zero_v1.6.0_v1.9.3` |
-| `nushell` | `nushell_nushell_0.106.0_0.108.0` |
-| `element-web` | `element-hq_element-web_v1.11.95_v1.11.97` |
-| `scikit-learn` | `scikit-learn_scikit-learn_1.5.2_1.6.0` |
-
-**Example: Pull and retag navidrome images manually**
-
-```bash
-REPO=navidrome
-REPO_FULL=navidrome_navidrome_v0.57.0_v0.58.0
-
-# Pull and retag base image
-docker pull hyd2apse/${REPO}:base
-docker tag hyd2apse/${REPO}:base ${REPO_FULL}/base:latest
-
-# Pull and retag all milestone images
-for MID in milestone_001 milestone_002 milestone_003_sub-01 milestone_003_sub-02 \
-           milestone_003_sub-03 milestone_003_sub-04 milestone_004 milestone_006 milestone_007; do
-    docker pull hyd2apse/${REPO}:${MID}
-    docker tag hyd2apse/${REPO}:${MID} ${REPO_FULL}/${MID}:latest
-done
-```
+Full versioning policy (what bumps the benchmark version, immutability rules,
+manifest/digest binding layer): see [docs/versioning.md](versioning.md).

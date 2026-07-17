@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Live smoke test of a repo's quarantine policy against its real base image.
 
-Spins up <repo>/base:latest with the policy's env applied, runs the minimal
+Spins up the repo's production image (image_for_repo: base-offline for
+quarantine repos, else base) with the policy's env applied, runs the minimal
 base init (fakeroot — NOT the agent install), applies lock_network() (which
 itself runs the fail-closed verification: deny-domain probes, answer-fetch
 URL probes, cache forbid-glob audit), then runs positive probes (LLM
@@ -53,7 +54,9 @@ def _probe(cs: "ContainerSetup", url: str, expect_blocked: bool) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", required=True, help="Repo name substring (matched against quarantine_configs/)")
-    ap.add_argument("--image", default=None, help="Override image (default <repo_lowercase>/base:latest)")
+    ap.add_argument("--image", default=None,
+                    help="Override image (default: image_for_repo — "
+                         "swe-milestone/<repo_full>__base[-offline]:<pin>)")
     ap.add_argument("--keep", action="store_true", help="Keep the container for manual inspection")
     args = ap.parse_args()
 
@@ -81,7 +84,7 @@ def main() -> int:
     try:
         # Manual minimal start: docker run with the quarantine env/mounts but
         # WITHOUT the agent init (no claude install needed for a network test).
-        cmd = ["docker", "run", "-d", "--init", "--cap-add=NET_ADMIN",
+        cmd = ["docker", "run", "--pull=never", "-d", "--init", "--cap-add=NET_ADMIN",
                "--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
                "--name", container]
         cmd += cs._framework.get_quarantine_env_vars()
@@ -107,11 +110,11 @@ def main() -> int:
 
         print("Offline switches visible in container env:")
         want = {
-            "EVOCLAW_CARGO_OFFLINE": "CARGO_NET_OFFLINE=true",
-            "EVOCLAW_GO_OFFLINE": "GOPROXY=off",
-            "EVOCLAW_MAVEN_OFFLINE": "MAVEN_ARGS=-o",
-            "EVOCLAW_NPM_OFFLINE": "npm_config_offline=true",
-            "EVOCLAW_PIP_OFFLINE": "PIP_NO_INDEX=1",
+            "SWE_MILESTONE_CARGO_OFFLINE": "CARGO_NET_OFFLINE=true",
+            "SWE_MILESTONE_GO_OFFLINE": "GOPROXY=off",
+            "SWE_MILESTONE_MAVEN_OFFLINE": "MAVEN_ARGS=-o",
+            "SWE_MILESTONE_NPM_OFFLINE": "npm_config_offline=true",
+            "SWE_MILESTONE_PIP_OFFLINE": "PIP_NO_INDEX=1",
         }
         r = subprocess.run(["docker", "exec", container, "env"],
                            capture_output=True, text=True)

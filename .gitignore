@@ -138,6 +138,7 @@ celerybeat.pid
 # Environments
 # .env is the committed PUBLIC template; .env_private holds real host paths.
 .env_private
+.env_private*
 .env.*
 .venv
 .venv/
@@ -252,7 +253,7 @@ package-lock.json
 litellm_config.yaml
 litellm.log
 
-# EvoClaw trial config (user-specific) and auto-generated collect configs
+# SWE-Milestone trial config (user-specific) and auto-generated collect configs
 trial_config.yaml
 # Ignore ad-hoc trial_configs files by default; whitelist curated reference
 # configs below. NOTE: use `trial_configs/*` (not `trial_configs/`) so git
@@ -261,14 +262,18 @@ trial_config.yaml
 trial_configs/*
 !trial_configs/gemini-cli_gemini-3.5-flash.yaml
 !trial_configs/claude-code_glm-5.1.yaml
-!trial_configs/claude-code_deepseek-v4-pro.yaml
+!trial_configs/claude-code_glm-5.2.yaml
+!trial_configs/claude-code_glm-5.2-1m.yaml
 !trial_configs/claude-code_kimi-k2.6.yaml
 !trial_configs/claude-code_opus-4.6.yaml
 !trial_configs/claude-code_opus-4.7-1m.yaml
 !trial_configs/claude-code_opus-4.7.yaml
 !trial_configs/claude-code_opus-4.8.yaml
+!trial_configs/claude-code_opus-4.8-1m.yaml
 !trial_configs/codex_gpt-5.4.yaml
 !trial_configs/codex_gpt-5.5.yaml
+.swe-milestone/
+# Legacy pre-v1.0 local state.
 .evoclaw/
 
 # Ad-hoc analysis notes (not for source control)

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Literal
 
 from harness.utils.rust_test_filter import (
+    RustTestFilterError,
     _read_file_from_container,
     _write_file_to_container,
     find_test_ranges_from_content,
@@ -199,7 +200,21 @@ def mask_inline_tests_in_file(
 
     # Find test ranges using ast-grep based detection
     # only_root_level=True to avoid breaking nested modules/impl blocks
-    test_ranges = find_test_ranges_from_content(content, file_path, only_root_level=True)
+    # Agent-side masking can only remove root items without breaking their
+    # lexical scope.  Nested test helpers are restored authoritatively by the
+    # evaluator's scope-preserving merger; keep the historical masking behavior
+    # here instead of blocking otherwise runnable agents — a detector failure
+    # on one file skips that file, it must not abort the whole setup.
+    try:
+        test_ranges = find_test_ranges_from_content(
+            content,
+            file_path,
+            only_root_level=True,
+            reject_nested=False,
+        )
+    except RustTestFilterError as exc:
+        logger.warning(f"Skipping mask for {file_path}: test detection failed ({exc})")
+        return False
 
     if not test_ranges:
         logger.debug(f"No inline tests found in {file_path}")

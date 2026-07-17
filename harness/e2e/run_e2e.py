@@ -19,6 +19,7 @@ Features:
 - Retry: Allow re-evaluation when tag changes after initial evaluation
 """
 
+from harness.e2e.env_guard import reject_legacy_env
 import argparse
 import fcntl
 import json
@@ -32,18 +33,72 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Optional
 
 import yaml
 
 from harness.e2e.orchestrator import E2EOrchestrator
 from harness.e2e.agent_runner import E2EAgentRunner
+from harness.e2e.agents.claude_code import validate_claude_code_version
 from harness.e2e.log_parser import get_parser
+from harness.e2e.repo_config_binding import (
+    freeze_repo_config,
+    load_trial_repo_config_binding,
+    resolve_repo_config,
+)
+from harness.e2e.runtime_policy_binding import (
+    RUNTIME_POLICY_ENV_KEYS,
+    RUNTIME_POLICY_MODE_PROTECTED,
+    TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING,
+    RuntimePolicyBindingError,
+    freeze_runtime_policy,
+    load_trial_runtime_policy_binding,
+    resolve_runtime_policy,
+    runtime_policy_coverage_errors,
+    verify_expected_runtime_policy,
+)
 from harness.e2e.trial_lock import acquire_trial_lock
 
 logger = logging.getLogger("e2e.runner")
 orchestrator_logger = logging.getLogger("e2e.orchestrator")
+
+
+def _activate_runtime_policy(binding) -> None:
+    """Atomically replace all harness-managed runtime-policy environment."""
+    env = dict(binding.env)
+    unexpected = set(env) - set(RUNTIME_POLICY_ENV_KEYS)
+    if unexpected:
+        raise RuntimePolicyBindingError(
+            f"runtime policy derived unmanaged environment keys: {sorted(unexpected)}"
+        )
+    for key in RUNTIME_POLICY_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.pop("SWE_MILESTONE_UNPROTECTED", None)
+    os.environ.update(env)
+    if binding.mode == "unprotected":
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+
+
+def _resolve_trial_relative_path(
+    trial_root: Path,
+    value: str,
+    *,
+    field_name: str,
+) -> Path:
+    """Resolve a persisted resume path without allowing trial-root escape."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError(f"{field_name} must be a safe relative POSIX path")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"unsafe {field_name}: {value!r}")
+    root = Path(trial_root).resolve()
+    resolved = root.joinpath(*relative.parts).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} escapes trial root: {value!r}") from exc
+    return resolved
 
 
 @dataclass
@@ -62,7 +117,10 @@ class DebounceState:
     milestone_id: str  # Milestone ID (e.g., "M001.1")
 
 
-def load_workspace_metadata(workspace_root: Path) -> dict:
+def load_workspace_metadata(
+    workspace_root: Path,
+    repo_config: Optional[dict] = None,
+) -> dict:
     """Load workspace metadata from metadata.json.
 
     Args:
@@ -97,7 +155,23 @@ def load_workspace_metadata(workspace_root: Path) -> dict:
     # Fallback to config YAML for optional patterns if not in metadata
     # workspace_root: DATA/harness_workspace/navidrome_navidrome_v0.57.0_v0.58.0/baseline_004_v4
     # config_path:    config/navidrome_navidrome_v0.57.0_v0.58.0.yaml
-    if "generated_patterns" not in metadata or "modifiable_test_patterns" not in metadata:
+    if (
+        repo_config is not None
+        and (
+            "generated_patterns" not in metadata
+            or "modifiable_test_patterns" not in metadata
+        )
+    ):
+        if "generated_patterns" not in metadata and "generated_patterns" in repo_config:
+            metadata["generated_patterns"] = repo_config["generated_patterns"]
+        if (
+            "modifiable_test_patterns" not in metadata
+            and "modifiable_test_patterns" in repo_config
+        ):
+            metadata["modifiable_test_patterns"] = repo_config[
+                "modifiable_test_patterns"
+            ]
+    elif "generated_patterns" not in metadata or "modifiable_test_patterns" not in metadata:
         config_name = workspace_root.parent.name  # e.g., navidrome_navidrome_v0.57.0_v0.58.0
         config_path = Path("config") / f"{config_name}.yaml"
         if config_path.exists():
@@ -587,17 +661,34 @@ class E2ETrialRunner:
                         dropped_eval_keys.add(key)
                         continue
 
-                    snapshot_path = self.orchestrator.trial_root / snapshot_rel
+                    try:
+                        snapshot_path = _resolve_trial_relative_path(
+                            self.orchestrator.trial_root,
+                            snapshot_rel,
+                            field_name="resume snapshot_path",
+                        )
+                    except ValueError as exc:
+                        logger.warning("Resume priming: dropping %s: %s", key, exc)
+                        dropped_eval_keys.add(key)
+                        continue
                     if not snapshot_path.exists():
                         logger.warning(f"Resume priming: snapshot missing for {key}: {snapshot_path}")
                         dropped_eval_keys.add(key)
                         continue
 
-                    result_dir = (
-                        self.orchestrator.trial_root / result_rel
-                        if isinstance(result_rel, str) and result_rel
-                        else snapshot_path.parent
-                    )
+                    if isinstance(result_rel, str) and result_rel:
+                        try:
+                            result_dir = _resolve_trial_relative_path(
+                                self.orchestrator.trial_root,
+                                result_rel,
+                                field_name="resume result_dir",
+                            )
+                        except ValueError as exc:
+                            logger.warning("Resume priming: dropping %s: %s", key, exc)
+                            dropped_eval_keys.add(key)
+                            continue
+                    else:
+                        result_dir = snapshot_path.parent
                     result_dir.mkdir(parents=True, exist_ok=True)
 
                     with self._state_lock:
@@ -613,6 +704,34 @@ class E2ETrialRunner:
                         pass_to_pass_threshold=config.pass_to_pass_threshold,
                         none_to_pass_threshold=config.none_to_pass_threshold,
                         agent_attempt=attempt,
+                        build_failure_fail_closed=(
+                            self.orchestrator.build_failure_fail_closed
+                        ),
+                        repo_config_path=(
+                            self.orchestrator.repo_config_binding.path
+                            if self.orchestrator.repo_config_binding is not None
+                            else None
+                        ),
+                        repo_config_sha256=(
+                            self.orchestrator.repo_config_binding.sha256
+                            if self.orchestrator.repo_config_binding is not None
+                            else None
+                        ),
+                        runtime_policy_path=(
+                            self.orchestrator.runtime_policy_binding.path
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
+                        runtime_policy_sha256=(
+                            self.orchestrator.runtime_policy_binding.sha256
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
+                        runtime_policy_mode=(
+                            self.orchestrator.runtime_policy_binding.mode
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
                     )
                     pending_futures[future] = (mid, attempt)
 
@@ -1108,8 +1227,15 @@ class E2ETrialRunner:
             timeout_ms=self.timeout_ms,
             prompt_version=self.prompt_version,
             reasoning_effort=self.reasoning_effort,
-            api_router=self.orchestrator.api_router,
         )
+
+        def invoke_agent(callable_):
+            # A model turn may have deleted its disposable cache or an old
+            # resumed container may predate the immutable Go split. Verify the
+            # exact shared runtime and reset only reproducible COW module state
+            # before every fresh/resume/recover subprocess.
+            self.orchestrator.container_setup.prepare_agent_invocation()
+            return callable_()
 
         # Capture initial state
         prev_state = get_dag_progress_state()
@@ -1160,8 +1286,10 @@ class E2ETrialRunner:
                         logger.info(f"Attempting to resume previous agent session ({attempt_label})...")
                         orchestrator_logger.info(f"🔁 Agent resume {attempt_label}")
                         self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
-                        success = self.agent_runner.send_recover_message(
-                            has_new_tasks=True, timeout_ms=recover_timeout_ms
+                        success = invoke_agent(
+                            lambda: self.agent_runner.send_recover_message(
+                                has_new_tasks=True, timeout_ms=recover_timeout_ms
+                            )
                         )
                         if success:
                             break
@@ -1262,13 +1390,13 @@ class E2ETrialRunner:
                         except Exception as e:
                             logger.warning(f"Failed to invalidate persistent session: {e}")
                         orchestrator_logger.info("🚀 Agent started (fallback new session)")
-                        success = self.agent_runner.run()
+                        success = invoke_agent(self.agent_runner.run)
 
                     resume_session_first = False  # Only attempt once
                 else:
                     logger.info("Running agent (first run)...")
                     orchestrator_logger.info("🚀 Agent started (first run)")
-                    success = self.agent_runner.run()
+                    success = invoke_agent(self.agent_runner.run)
                 first_run = False
                 orchestrator_logger.info("Agent first run completed" + (" ✓" if success else " ✗ (failed)"))
             else:
@@ -1277,8 +1405,10 @@ class E2ETrialRunner:
                 )
                 orchestrator_logger.info(f"🔄 Agent recover message sent (recover #{recover_count})")
                 self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
-                success = self.agent_runner.send_recover_message(
-                    has_new_tasks=has_new_tasks, timeout_ms=recover_timeout_ms
+                success = invoke_agent(
+                    lambda: self.agent_runner.send_recover_message(
+                        has_new_tasks=has_new_tasks, timeout_ms=recover_timeout_ms
+                    )
                 )
                 orchestrator_logger.info(
                     f"Agent recover {recover_count} completed" + (" ✓" if success else " ✗ (failed)")
@@ -1818,28 +1948,87 @@ def _run_resume_mode(args):
 
     # Extract config from original metadata, allow CLI overrides
     metadata = trial_state.original_config
-    # Resume corollary of F2-b: keep a resumed --unprotected baseline OPEN. The
-    # flag isn't a CLI arg the second time, so read it from the persisted metadata
-    # and set the signal BEFORE the orchestrator (and its ContainerSetup) is
-    # constructed — otherwise __init__'s policy recovery would silently re-harden
-    # a trial that ran with the network open before the interruption.
-    from harness.e2e.quarantine import metadata_wants_unprotected
-    if metadata_wants_unprotected(metadata) and not os.environ.get("EVOCLAW_UNPROTECTED"):
-        os.environ["EVOCLAW_UNPROTECTED"] = "1"
-        logger.info("Resume: trial was launched --unprotected; keeping it open (no re-harden)")
+    metadata_schema = metadata.get("trial_metadata_schema_version", 1)
+    runtime_policy_binding = None
+    if (
+        "runtime_policy_binding" in metadata
+        or (
+            isinstance(metadata_schema, int)
+            and not isinstance(metadata_schema, bool)
+            and metadata_schema
+            >= TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING
+        )
+    ):
+        runtime_policy_binding = load_trial_runtime_policy_binding(
+            trial_root,
+            metadata,
+            expected_repo_name=metadata.get("repo_name"),
+        )
+        _activate_runtime_policy(runtime_policy_binding)
+        logger.info(
+            "Resume: restored trial-pinned runtime policy %s (%s)",
+            runtime_policy_binding.sha256,
+            runtime_policy_binding.mode,
+        )
+    else:
+        # Explicit legacy compatibility only.  These results remain labelled
+        # legacy-live and are not promotion-grade.
+        from harness.e2e.quarantine import metadata_wants_unprotected
+
+        if metadata_wants_unprotected(metadata):
+            os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+            logger.info(
+                "Resume: legacy trial was launched --unprotected; keeping it open"
+            )
+        logger.warning(
+            "Resume: legacy trial has no pinned runtime policy; live policy "
+            "recovery is forensic-only and must not be mixed into a promotion"
+        )
     # --model override for resume (e.g., fix a wrong model after fatal error)
     if getattr(args, '_model_explicitly_set', False):
         logger.info(f"Overriding model: {metadata.get('model')} → {args.model}")
         metadata["model"] = args.model
+    requested_agent_version = metadata.get("requested_agent_version")
     workspace_root = Path(metadata["workspace_root"]).resolve()
 
-    # Load workspace metadata (needed for orchestrator)
-    workspace_metadata = load_workspace_metadata(workspace_root)
-    repo_src_dirs = workspace_metadata["repo_src_dirs"]
-    test_dirs = workspace_metadata["test_dirs"]
-    exclude_patterns = workspace_metadata["exclude_patterns"]
-    generated_patterns = workspace_metadata.get("generated_patterns", [])
-    modifiable_test_patterns = workspace_metadata.get("modifiable_test_patterns", [])
+    repo_config_binding = load_trial_repo_config_binding(
+        trial_root,
+        metadata,
+        expected_repo_name=metadata.get("repo_name"),
+    )
+    if repo_config_binding is None:
+        logger.warning(
+            "Resume: legacy trial has no pinned repository config; results are "
+            "forensic/legacy-unbound and must not be mixed into a pinned promotion"
+        )
+
+    # New trials persist the complete snapshot-authority filter.  Resume must
+    # not rebuild it from a live metadata.json, because a dataset edit between
+    # fresh and resume would otherwise change which submitted files exist in
+    # later snapshots.  Legacy trials retain their historical fallback.
+    if repo_config_binding is not None:
+        required_capture_fields = ("repo_src_dirs", "test_dirs", "exclude_patterns")
+        missing_capture_fields = [
+            field for field in required_capture_fields if field not in metadata
+        ]
+        if missing_capture_fields:
+            raise RuntimeError(
+                "Pinned trial metadata is missing snapshot capture field(s): "
+                + ", ".join(missing_capture_fields)
+            )
+        repo_src_dirs = metadata["repo_src_dirs"]
+        test_dirs = metadata["test_dirs"]
+        exclude_patterns = metadata["exclude_patterns"]
+        generated_patterns = metadata.get("generated_patterns", [])
+        modifiable_test_patterns = metadata.get("modifiable_test_patterns", [])
+        logger.info("Resume: using trial-persisted snapshot capture filter")
+    else:
+        workspace_metadata = load_workspace_metadata(workspace_root)
+        repo_src_dirs = workspace_metadata["repo_src_dirs"]
+        test_dirs = workspace_metadata["test_dirs"]
+        exclude_patterns = workspace_metadata["exclude_patterns"]
+        generated_patterns = workspace_metadata.get("generated_patterns", [])
+        modifiable_test_patterns = workspace_metadata.get("modifiable_test_patterns", [])
 
     # Resolve dag_path from original metadata or default
     dag_path_str = metadata.get("dag_path")
@@ -1880,8 +2069,11 @@ def _run_resume_mode(args):
         exclude_patterns=exclude_patterns,
         generated_patterns=generated_patterns,
         modifiable_test_patterns=modifiable_test_patterns,
-        api_router=metadata.get("api_router", metadata.get("drop_params", False)),
         reasoning_effort=metadata.get("reasoning_effort"),
+        agent_version=requested_agent_version,
+        build_failure_fail_closed=metadata.get("build_failure_fail_closed"),
+        repo_config_binding=repo_config_binding,
+        runtime_policy_binding=runtime_policy_binding,
     )
 
     # Prepare agent output directory (reuse existing)
@@ -1909,6 +2101,7 @@ def _run_resume_mode(args):
 
 
 def main():
+    reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
     setup_logging()
     parser = argparse.ArgumentParser(
         description="Run End-to-End Agent Trial (Continuous Task Queue Mode with Recovery)",
@@ -1936,6 +2129,17 @@ Example:
         "policy WITHOUT applying it — scores may be tainted). Normally you launch "
         "via scripts/run_all.py, which applies the policy and runs the gate.",
     )
+    parser.add_argument(
+        "--expected-runtime-policy-sha256",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--expected-runtime-policy-mode",
+        choices=["protected", "absent", "unprotected"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
     # Paths (required for fresh start, optional for resume)
     parser.add_argument(
@@ -1960,6 +2164,12 @@ Example:
         help="Agent framework to use (default: claude-code)",
     )
     parser.add_argument("--model", default="claude-sonnet-4-5-20250929", help="Claude model ID")
+    parser.add_argument(
+        "--agent-version",
+        type=validate_claude_code_version,
+        default=None,
+        help="Claude Code CLI version to install: an exact version (for example 2.1.158), stable, or latest.",
+    )
     parser.add_argument("--prompt-version", default="v2", help="Prompt template version (e.g., v1 or v2)")
     parser.add_argument(
         "--milestones",
@@ -1992,6 +2202,27 @@ Example:
         default=None,
         help="Path to e2e_config.yaml (default: search in workspace-root, then harness/e2e/)",
     )
+    build_failure_policy = parser.add_mutually_exclusive_group()
+    build_failure_policy.add_argument(
+        "--allow-partial-build-reports",
+        dest="build_failure_fail_closed",
+        action="store_false",
+        help=(
+            "On deterministic compilation/build failures, score reports from "
+            "packages/modules that completed. Timeouts and nonzero outer-runner "
+            "exits remain fail-closed."
+        ),
+    )
+    build_failure_policy.add_argument(
+        "--fail-closed-build-reports",
+        dest="build_failure_fail_closed",
+        action="store_true",
+        help=(
+            "Strict opt-in: reject partial reports after deterministic "
+            "compilation/build failures."
+        ),
+    )
+    parser.set_defaults(build_failure_fail_closed=None)
 
     # Trial naming
     parser.add_argument(
@@ -2011,20 +2242,6 @@ Example:
         "--remove-container",
         action="store_true",
         help="Remove container after trial completes (default: keep container running)",
-    )
-
-    parser.add_argument(
-        "--api-router",
-        action="store_true",
-        help="Deploy the vendored claude-code-router-py inside the container to "
-        "translate Anthropic Messages API to OpenAI format. Only applies to "
-        "claude-code agent.",
-    )
-
-    parser.add_argument(
-        "--drop-params",
-        action="store_true",
-        help="Deprecated: use --api-router instead.",
     )
 
     parser.add_argument(
@@ -2048,17 +2265,35 @@ Example:
 
     args = parser.parse_args()
 
+    if (args.expected_runtime_policy_sha256 is None) != (
+        args.expected_runtime_policy_mode is None
+    ):
+        parser.error(
+            "--expected-runtime-policy-sha256 and "
+            "--expected-runtime-policy-mode must be provided together"
+        )
+
     # --unprotected: signal ContainerSetup NOT to recover quarantine from policy
     # (operator explicitly wants an open baseline run) — covers fresh AND resume,
     # both of which construct ContainerSetup (F2-b).
     if getattr(args, "unprotected", False):
-        os.environ["EVOCLAW_UNPROTECTED"] = "1"
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
 
     # Track whether --model was explicitly provided (vs default)
     args._model_explicitly_set = '--model' in sys.argv
 
     # Handle resume mode
     if args.resume_trial:
+        if args.expected_runtime_policy_sha256 is not None:
+            parser.error(
+                "expected runtime-policy identity is fresh-worker-only; resume "
+                "uses the trial-frozen binding"
+            )
+        if args.agent_version:
+            parser.error(
+                "--agent-version cannot change an existing container during --resume-trial; "
+                "the version recorded by the original trial is reused"
+            )
         _run_resume_mode(args)
         return
 
@@ -2075,16 +2310,45 @@ Example:
 
     if missing_args:
         parser.error(f"the following arguments are required for fresh start: {', '.join(missing_args)}")
+    if args.agent_version and args.agent not in ("claude-code", "codex", "gemini-cli"):
+        parser.error(
+            "--agent-version is supported only with --agent claude-code, codex, or gemini-cli"
+        )
 
-    # Fail-closed quarantine guard (#3): scripts/run_all.py applies the per-repo
-    # policy env + runs the coverage gate; a direct run_e2e launch bypasses both.
-    # Refuse to start a repo that HAS a policy but wasn't given the quarantine
-    # env (EVOCLAW_QUARANTINE), unless --unprotected is explicitly set.
-    from harness.e2e.quarantine import quarantine_guard_error
-    _guard = quarantine_guard_error(
+    # Resolve the complete runtime policy once, before any container exists.
+    # This replaces any partial/stale inherited marker environment and gives a
+    # direct run_e2e launch the same policy as scripts/run_all.py.
+    project_root = Path(__file__).resolve().parent.parent.parent
+    resolved_runtime_policy = resolve_runtime_policy(
         args.repo_name,
-        Path(__file__).resolve().parent.parent.parent,
-        quarantine_active=bool(os.environ.get("EVOCLAW_QUARANTINE")),
+        project_root,
+        unprotected=args.unprotected,
+    )
+    verify_expected_runtime_policy(
+        resolved_runtime_policy,
+        expected_sha256=args.expected_runtime_policy_sha256,
+        expected_mode=args.expected_runtime_policy_mode,
+    )
+    if resolved_runtime_policy.mode == RUNTIME_POLICY_MODE_PROTECTED:
+        policy_errors = runtime_policy_coverage_errors(resolved_runtime_policy)
+        if policy_errors:
+            for error in policy_errors:
+                logger.error(error)
+            raise RuntimePolicyBindingError(
+                "runtime policy failed quarantine coverage validation"
+            )
+    _activate_runtime_policy(resolved_runtime_policy)
+
+    from harness.e2e.quarantine import quarantine_guard_error_from_config
+
+    _guard = quarantine_guard_error_from_config(
+        args.repo_name,
+        (
+            resolved_runtime_policy.policy
+            if resolved_runtime_policy.source_path is not None
+            else None
+        ),
+        quarantine_active=bool(os.environ.get("SWE_MILESTONE_QUARANTINE")),
         unprotected=args.unprotected,
     )
     if _guard:
@@ -2093,10 +2357,14 @@ Example:
 
     # Setup Paths
     workspace_root = args.workspace_root.resolve()
+    resolved_repo_config = resolve_repo_config(args.repo_name, workspace_root)
 
     # Load workspace metadata (repo_src_dirs, test_dirs, exclude_patterns)
     # These fields are required and will raise an error if missing
-    workspace_metadata = load_workspace_metadata(workspace_root)
+    workspace_metadata = load_workspace_metadata(
+        workspace_root,
+        repo_config=dict(resolved_repo_config.config),
+    )
     repo_src_dirs = workspace_metadata["repo_src_dirs"]
     test_dirs = workspace_metadata["test_dirs"]
     exclude_patterns = workspace_metadata["exclude_patterns"]
@@ -2120,6 +2388,24 @@ Example:
     # Create e2e_trial directory for all trials
     e2e_trial_dir = workspace_root / "e2e_trial"
     e2e_trial_dir.mkdir(parents=True, exist_ok=True)
+
+    # Benchmark-version gate (docs/versioning.md): verify the data checkout
+    # (workspace_root lives inside the data repo) and the image tag against
+    # the pinned version BEFORE any trial state exists — an explicit-pin
+    # refusal must not leave behind a populated trial dir that blocks the
+    # retry. The verdicts are persisted into trial_metadata below so the
+    # version a score belongs to is recorded, not inferred.
+    from harness.e2e.data_version import (
+        check_data_version,
+        check_image_tag_consistency,
+    )
+
+    version_meta = check_data_version(Path(args.workspace_root), context="run_e2e")
+    image_check_meta = (
+        check_image_tag_consistency(str(args.image), context="run_e2e")
+        if args.image
+        else None
+    )
 
     # Generate next trial name with auto-incrementing suffix
     trial_base_name = args.trial_name if args.trial_name else "agent_run"
@@ -2209,6 +2495,16 @@ Example:
     logger.info(f"Trial artifacts path: {trial_root}")
     trial_root.mkdir(parents=True, exist_ok=True)
 
+    # Freeze the exact repository evaluation config before any milestone is
+    # captured.  Every worker and resume path consumes this byte-identical
+    # copy, so a live data-root YAML edit cannot switch semantics mid-trial.
+    repo_config_binding = freeze_repo_config(trial_root, resolved_repo_config)
+    runtime_policy_binding = freeze_runtime_policy(
+        trial_root,
+        resolved_runtime_policy,
+    )
+    _activate_runtime_policy(runtime_policy_binding)
+
     # Copy config and selected_milestone_ids to trial directory
     import shutil
 
@@ -2280,21 +2576,52 @@ Example:
     _tmp_framework = get_agent_framework(args.agent, **_framework_kwargs)
     effective_reasoning_effort = _tmp_framework.get_effective_reasoning_effort()
 
+    # Resolve once and persist so resume cannot silently change scoring policy
+    # when the workspace/default config changes later.
+    from harness.e2e.config import E2EConfig
+
+    effective_build_failure_fail_closed = args.build_failure_fail_closed
+    if effective_build_failure_fail_closed is None:
+        effective_build_failure_fail_closed = E2EConfig(trial_config_path).build_failure_fail_closed
+
     trial_metadata = {
+        "trial_metadata_schema_version": (
+            TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING
+        ),
         "trial_name": trial_name,
         "repo_name": args.repo_name,
         "milestone_version": args.milestone_version,
+        # Benchmark version this trial claims to run on (vX.Y, the image tag —
+        # docs/versioning.md), plus the verified state of the data checkout
+        # and of the image tag (a :latest fallback shows up here as a
+        # structured mismatch, not just a transient launch warning).
+        "benchmark_version": version_meta["benchmark_version"],
+        "data_version": version_meta["data_version"],
+        "image_tag_check": image_check_meta,
         "image": args.image,
         "model": args.model,
         "agent_name": args.agent,
+        # The requested selector is known before container startup; the actual
+        # numeric version is detected and filled after initialization.
+        "requested_agent_version": args.agent_version,
+        "agent_version": None,
+        # Filled from docker container inspect after launch. A full image ID,
+        # unlike the user-facing tag, cannot be silently retargeted.
+        "agent_image_id": None,
         "prompt_version": args.prompt_version,
         "timeout_seconds": args.timeout,
         "reasoning_effort": effective_reasoning_effort,
+        "build_failure_fail_closed": effective_build_failure_fail_closed,
         # Native claude-code context-compaction window in tokens. Set from the
         # trial config `auto_compact_window` (propagated via the
-        # EVOCLAW_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
+        # SWE_MILESTONE_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
         # display it. None when the config doesn't set it.
-        "auto_compact_window": os.environ.get("EVOCLAW_AUTO_COMPACT_WINDOW"),
+        "auto_compact_window": os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW"),
+        # Native claude-code Tool Search pin ("true"/"false"/"auto"/"auto:N").
+        # Set from the trial config `enable_tool_search` (propagated via the
+        # SWE_MILESTONE_ENABLE_TOOL_SEARCH env var). None = config didn't set it,
+        # claude-code's own endpoint-dependent default applies.
+        "enable_tool_search": os.environ.get("SWE_MILESTONE_ENABLE_TOOL_SEARCH"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,
@@ -2304,10 +2631,11 @@ Example:
         "dag_path": str(dag_path),
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
-        "api_router": args.api_router or args.drop_params,
         # Persist --unprotected so a resumed open baseline stays open (isn't
         # silently re-hardened by ContainerSetup's policy recovery on resume).
         "unprotected": bool(args.unprotected),
+        "repo_config_binding": repo_config_binding.to_metadata(trial_root),
+        "runtime_policy_binding": runtime_policy_binding.to_metadata(trial_root),
     }
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:
@@ -2331,8 +2659,11 @@ Example:
         exclude_patterns=exclude_patterns,  # Exclude patterns for SrcFileFilter
         generated_patterns=generated_patterns,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns=modifiable_test_patterns,  # Test files agent can modify
-        api_router=args.api_router or args.drop_params,
         reasoning_effort=args.reasoning_effort,
+        agent_version=args.agent_version,
+        build_failure_fail_closed=effective_build_failure_fail_closed,
+        repo_config_binding=repo_config_binding,
+        runtime_policy_binding=runtime_policy_binding,
     )
 
     # Prepare agent output directory

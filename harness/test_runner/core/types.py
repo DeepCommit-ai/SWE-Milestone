@@ -434,6 +434,11 @@ class MilestoneTestMode:
                    If not specified, uses the global framework setting.
         requires_docker_socket: Whether this mode needs Docker socket mounted
                                 (for testcontainers/e2e tests that spawn containers)
+        run_timeout_seconds: Overall wall-clock budget for one run of this mode
+                             (None = runner default). E2e modes that spin real
+                             containers per test can legitimately exceed the
+                             default; a too-small budget kills the run mid-way
+                             and truncates the report.
     """
 
     name: str
@@ -442,6 +447,7 @@ class MilestoneTestMode:
     description: str = ""
     framework: Optional[str] = None  # Override global framework for this mode
     requires_docker_socket: bool = False  # For e2e tests using testcontainers
+    run_timeout_seconds: Optional[int] = None  # Overall per-run budget override
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -454,6 +460,8 @@ class MilestoneTestMode:
             result["framework"] = self.framework
         if self.requires_docker_socket:
             result["requires_docker_socket"] = self.requires_docker_socket
+        if self.run_timeout_seconds is not None:
+            result["run_timeout_seconds"] = self.run_timeout_seconds
         return result
 
     @classmethod
@@ -472,6 +480,7 @@ class MilestoneTestMode:
             description=data.get("description", ""),
             framework=data.get("framework"),  # Optional framework override
             requires_docker_socket=data.get("requires_docker_socket", False),
+            run_timeout_seconds=data.get("run_timeout_seconds"),
         )
 
 

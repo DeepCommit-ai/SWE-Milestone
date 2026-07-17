@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -27,22 +28,67 @@ import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-import yaml
-
-from harness.e2e.container_setup import ContainerSetup
-from harness.e2e.image_version import resolve_image
+from harness.e2e.container_setup import ContainerSetup, inspect_docker_image_id
+from harness.e2e.image_version import local_ref, resolve_image
 from harness.e2e.agent_runner import AgentRunner
 from harness.e2e.evaluator import PatchEvaluator, EvaluationResult
+from harness.e2e.repo_config_binding import (
+    RepoConfigBinding,
+    RepoConfigBindingError,
+    freeze_repo_config,
+    resolve_repo_config,
+)
+from harness.e2e.runtime_policy_binding import (
+    RUNTIME_POLICY_ENV_KEYS,
+    RUNTIME_POLICY_MODE_PROTECTED,
+    RUNTIME_POLICY_MODE_UNPROTECTED,
+    RuntimePolicyBinding,
+    RuntimePolicyBindingError,
+    freeze_runtime_policy,
+    image_for_runtime_policy,
+    resolve_runtime_policy,
+    runtime_policy_coverage_errors,
+)
 from harness.e2e.test_masking import mask_tests_by_names
 from harness.e2e.log_parser import get_parser, TrialStats
+from harness.e2e.residue_prune import (
+    capture_filter_config as _capture_filter_config,
+    check_snapshot_integrity,
+    classify_capture_loss,
+    normalize_tar_members,
+    parse_status_porcelain_z,
+)
 from harness.utils.src_filter import SrcFileFilter
-from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths
+from harness.utils.snapshot import (
+    ManifestOverlay,
+    ROOT_BUILD_FILES,
+    expand_atomic_manifest_overlay,
+    find_build_manifests,
+    get_snapshot_paths,
+    make_snapshot_metadata,
+    should_include_snapshot_file,
+)
 
 logger = logging.getLogger("e2e.run_milestone")
 
 PROMPT_DIR = Path(__file__).parent / "prompt"
+
+
+def _activate_runtime_policy(binding: RuntimePolicyBinding) -> None:
+    env = dict(binding.env)
+    unexpected = set(env) - set(RUNTIME_POLICY_ENV_KEYS)
+    if unexpected:
+        raise RuntimePolicyBindingError(
+            f"runtime policy derived unmanaged environment keys: {sorted(unexpected)}"
+        )
+    for key in RUNTIME_POLICY_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.pop("SWE_MILESTONE_UNPROTECTED", None)
+    os.environ.update(env)
+    if binding.mode == "unprotected":
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
 
 
 def get_next_trial_name(base_name: str, result_dir: Path) -> str:
@@ -84,7 +130,10 @@ def get_next_trial_name(base_name: str, result_dir: Path) -> str:
     return f"{base_name}_{max_num + 1:03d}"
 
 
-def load_workspace_metadata(workspace_root: Path) -> dict:
+def load_workspace_metadata(
+    workspace_root: Path,
+    repo_config: Optional[dict] = None,
+) -> dict:
     """Load metadata.json from workspace root.
 
     Args:
@@ -111,24 +160,19 @@ def load_workspace_metadata(workspace_root: Path) -> dict:
     if missing:
         raise KeyError(f"Missing required fields in metadata.json: {missing}")
 
-    # Fallback to config YAML for optional patterns if not in metadata
-    # workspace_root: DATA/harness_workspace/navidrome_navidrome_v0.57.0_v0.58.0/baseline_004_v4
-    # config_path:    config/navidrome_navidrome_v0.57.0_v0.58.0.yaml
+    # Use the already-resolved repository config for optional patterns.  The
+    # caller freezes these exact bytes before any snapshot is captured, so a
+    # live YAML edit cannot change capture authority during a run.
     if "generated_patterns" not in metadata or "modifiable_test_patterns" not in metadata:
-        config_name = workspace_root.parent.name  # e.g., navidrome_navidrome_v0.57.0_v0.58.0
-        config_path = Path("config") / f"{config_name}.yaml"
-        if config_path.exists():
-            logger.info(f"Loading optional patterns from config: {config_path}")
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f)
+        config = repo_config or {}
+        if config:
+            logger.info("Loading optional patterns from frozen repository config")
             if "generated_patterns" not in metadata and "generated_patterns" in config:
                 metadata["generated_patterns"] = config["generated_patterns"]
                 logger.info(f"  loaded generated_patterns from config: {metadata['generated_patterns']}")
             if "modifiable_test_patterns" not in metadata and "modifiable_test_patterns" in config:
                 metadata["modifiable_test_patterns"] = config["modifiable_test_patterns"]
                 logger.info(f"  loaded modifiable_test_patterns from config: {metadata['modifiable_test_patterns']}")
-        else:
-            logger.debug(f"Config file not found: {config_path}, using defaults for optional patterns")
 
     return metadata
 
@@ -163,6 +207,9 @@ class MilestoneRunner:
         reasoning_effort: Optional[str] = None,
         trial_name: Optional[str] = None,
         max_retries: int = 5,
+        unprotected: bool = False,
+        repo_config_binding: Optional[RepoConfigBinding] = None,
+        runtime_policy_binding: Optional[RuntimePolicyBinding] = None,
     ):
         """Initialize MilestoneRunner.
 
@@ -198,12 +245,101 @@ class MilestoneRunner:
         self.reasoning_effort = reasoning_effort
         self.trial_name = trial_name
         self.max_retries = max_retries
+        self.unprotected = unprotected
+        self._snapshot_baseline_commit: Optional[str] = None
+
+        # Mirror PatchEvaluator's repository-name rules, then freeze the
+        # repository config once for this single-milestone trial.  Programmatic
+        # callers cannot accidentally bypass the binding by omitting an
+        # optional CLI argument.
+        if (self.workspace_root / "metadata.json").exists():
+            self.repo_name = self.workspace_root.name
+        else:
+            self.repo_name = self.workspace_root.parent.name
+        binding_root = (
+            self.output_dir.parent
+            if self.output_dir.name == self.milestone_id
+            else self.output_dir
+        )
+        if repo_config_binding is None:
+            resolved_repo_config = resolve_repo_config(
+                self.repo_name,
+                self.workspace_root,
+            )
+            self.repo_config_binding = freeze_repo_config(
+                binding_root,
+                resolved_repo_config,
+            )
+        else:
+            if repo_config_binding.repo_name != self.repo_name:
+                raise RepoConfigBindingError(
+                    "repo config binding repo_name mismatch: "
+                    f"expected {self.repo_name!r}, got {repo_config_binding.repo_name!r}"
+                )
+            self.repo_config_binding = repo_config_binding
+
+        if runtime_policy_binding is None:
+            project_root = Path(__file__).resolve().parents[2]
+            resolved_runtime_policy = resolve_runtime_policy(
+                self.repo_name,
+                project_root,
+                unprotected=self.unprotected,
+            )
+            # Validate the exact in-memory mapping before persisting it.  An
+            # invalid protected policy must not leave a frozen half-created
+            # single-milestone trial that cannot be retried after the live
+            # policy is corrected.
+            if resolved_runtime_policy.mode == RUNTIME_POLICY_MODE_PROTECTED:
+                policy_errors = runtime_policy_coverage_errors(
+                    resolved_runtime_policy
+                )
+                if policy_errors:
+                    raise RuntimePolicyBindingError(
+                        "runtime policy failed quarantine coverage validation: "
+                        + "; ".join(policy_errors)
+                    )
+            self.runtime_policy_binding = freeze_runtime_policy(
+                binding_root,
+                resolved_runtime_policy,
+            )
+        else:
+            if runtime_policy_binding.repo_name != self.repo_name:
+                raise RuntimePolicyBindingError(
+                    "runtime policy binding repo_name mismatch: "
+                    f"expected {self.repo_name!r}, got "
+                    f"{runtime_policy_binding.repo_name!r}"
+                )
+            if (
+                self.unprotected
+                and runtime_policy_binding.mode != RUNTIME_POLICY_MODE_UNPROTECTED
+            ):
+                raise RuntimePolicyBindingError(
+                    "unprotected=True conflicts with the supplied frozen runtime "
+                    f"policy mode {runtime_policy_binding.mode!r}"
+                )
+            self.runtime_policy_binding = runtime_policy_binding
+        if (
+            runtime_policy_binding is not None
+            and self.runtime_policy_binding.mode == RUNTIME_POLICY_MODE_PROTECTED
+        ):
+            policy_errors = runtime_policy_coverage_errors(
+                self.runtime_policy_binding
+            )
+            if policy_errors:
+                raise RuntimePolicyBindingError(
+                    "runtime policy failed quarantine coverage validation: "
+                    + "; ".join(policy_errors)
+                )
+        _activate_runtime_policy(self.runtime_policy_binding)
 
         # Fallback flag for workdir snapshot extraction
         self._use_workdir_fallback = False
 
         # Load metadata - strict validation, no fallback
-        metadata = load_workspace_metadata(workspace_root)
+        metadata = load_workspace_metadata(
+            workspace_root,
+            repo_config=dict(self.repo_config_binding.config),
+        )
         self.repo_src_dirs = metadata["repo_src_dirs"]
         self.test_dirs = metadata["test_dirs"]
         self.exclude_patterns = metadata.get("exclude_patterns", [])
@@ -213,14 +349,21 @@ class MilestoneRunner:
         # Auto-derive image name if not provided
         if image_name:
             self.image_name = image_name
+        elif self.runtime_policy_binding.mode == RUNTIME_POLICY_MODE_PROTECTED:
+            # The exact protected policy that drives coverage and env also
+            # selects the dependency-closure image.  This applies equally to
+            # every agent framework; an explicit --image remains authoritative.
+            self.image_name = image_for_runtime_policy(
+                self.runtime_policy_binding
+            )
         else:
-            # Path structure: .../harness_workspace/repo_name/test_version
-            # Benchmark data version is pinned via EVOCLAW_IMAGE_TAG (default:
-            # v0.9); falls back to :latest with a warning when the default pin
-            # is absent locally (never when the tag was set explicitly).
-            repo_name = self.workspace_root.parent.name.lower()
-            test_version = self.workspace_root.name.lower()
-            self.image_name = resolve_image(f"{repo_name}/{test_version}/{milestone_id.lower()}")
+            # Keep the historical *milestone image* behavior for disabled
+            # policies, but derive its modern image reference from the
+            # authoritative repo id.  Inferring it from workspace parents can
+            # mistake a data-root directory for the repository name.
+            self.image_name = resolve_image(
+                local_ref(self.repo_name, milestone_id.lower())
+            )
 
         # Container name (includes trial_name for uniqueness across trials)
         if self.trial_name:
@@ -235,7 +378,8 @@ class MilestoneRunner:
             workdir="/testbed",
             agent_name=self.agent_name,
             agent_framework_name=self.agent_name,
-            repo_name=self.workspace_root.parent.name,  # authoritative repo id (F2)
+            repo_name=self.repo_name,  # authoritative repo id (F2)
+            runtime_policy_binding=self.runtime_policy_binding,
         )
 
         # Log directory
@@ -392,6 +536,16 @@ class MilestoneRunner:
             else:
                 logger.warning(f"Squash failed: {squash_result.get('error', 'unknown error')}")
 
+            # This is the exact commit handed to the agent, after evaluator test
+            # masking/comment stripping/squashing. Recording it earlier would
+            # misclassify harness preprocessing as an agent manifest change.
+            snapshot_base = self.container_setup.docker_exec_git("rev-parse", "HEAD")
+            if snapshot_base.returncode != 0 or not snapshot_base.stdout.strip():
+                detail = (snapshot_base.stderr or snapshot_base.stdout or "unknown Git error").strip()
+                raise RuntimeError(f"Could not record snapshot baseline commit: {detail}")
+            self._snapshot_baseline_commit = snapshot_base.stdout.strip()
+            logger.info(f"Snapshot manifest BASE: {self._snapshot_baseline_commit}")
+
             # Phase 3: Run agent
             logger.info("")
             logger.info("=" * 60)
@@ -419,6 +573,7 @@ class MilestoneRunner:
                                     f.write(separator)
 
                 try:
+                    self.container_setup.prepare_agent_invocation()
                     success, session_id = self.agent_runner.run(prompt)
 
                     if success:
@@ -480,6 +635,7 @@ class MilestoneRunner:
                 self._use_workdir_fallback = True
 
             # Phase 4: Verify tag exists (only if agent completed)
+            submission_commit: Optional[str] = None
             if success:
                 logger.info("")
                 logger.info("=" * 60)
@@ -488,6 +644,7 @@ class MilestoneRunner:
                 if not self._verify_tag_exists():
                     logger.warning("Tag not found, waiting 60s before sending reminder...")
                     time.sleep(60)
+                    self.container_setup.prepare_agent_invocation()
                     self.agent_runner.resume_session(session_id, self._commit_reminder())
                     if not self._verify_tag_exists():
                         logger.warning(
@@ -499,6 +656,15 @@ class MilestoneRunner:
                         logger.info(f"Tag verified after reminder: agent-impl-{self.milestone_id}")
                 else:
                     logger.info(f"Tag verified: agent-impl-{self.milestone_id}")
+
+                if not self._use_workdir_fallback:
+                    tag_name = f"agent-impl-{self.milestone_id}"
+                    submission_commit = self._get_tag_hash(tag_name)
+                    logger.info(
+                        "Pinned submission %s to immutable commit %s",
+                        tag_name,
+                        submission_commit,
+                    )
             else:
                 logger.info("")
                 logger.info("=" * 60)
@@ -514,7 +680,9 @@ class MilestoneRunner:
                 logger.warning("Using FALLBACK: extracting from working directory (not git tag)")
                 snapshot_path = self._extract_snapshot_from_workdir()
             else:
-                snapshot_path = self._extract_snapshot()
+                snapshot_path = self._extract_snapshot(
+                    expected_tag_hash=submission_commit,
+                )
             logger.info(f"Snapshot saved to: {snapshot_path}")
 
             # Phase 5.5: Extract and parse agent logs
@@ -689,6 +857,19 @@ git tag agent-impl-{self.milestone_id}
         tag_name = f"agent-impl-{self.milestone_id}"
         result = self.container_setup.docker_exec_git("tag", "-l", tag_name)
         return tag_name in result.stdout
+
+    def _get_tag_hash(self, tag_name: str) -> str:
+        """Resolve an annotated or lightweight submission tag to one commit."""
+        result = self.container_setup.docker_exec_git(
+            "rev-parse", f"{tag_name}^{{commit}}"
+        )
+        commit = (result.stdout or "").strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+            detail = (result.stderr or result.stdout or "missing commit").strip()
+            raise RuntimeError(
+                f"Snapshot provenance could not resolve {tag_name} commit: {detail}"
+            )
+        return commit
 
     def _apply_test_masking(self) -> dict:
         """Apply test masking to prevent information leakage.
@@ -974,7 +1155,13 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 capture_output=True,
                 text=True,
             )
-            if result.returncode == 0 and result.stdout.strip():
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                raise RuntimeError(
+                    f"Snapshot source-directory discovery failed for {src_dir} at {tag_name}"
+                    + (f": {detail}" if detail else "")
+                )
+            if result.stdout.strip():
                 existing.append(src_dir)
             else:
                 logger.debug(f"Skipping non-existent directory: {src_dir}")
@@ -1022,7 +1209,11 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         )
 
         if result.returncode != 0:
-            return set()
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot root-manifest discovery failed for {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
 
         # Parse output: each line is a file that exists
         existing = set()
@@ -1031,8 +1222,154 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 existing.add(line)
         return existing
 
-    def _extract_snapshot(self) -> Path:
+    def _infer_legacy_snapshot_baseline(self, tag_name: str) -> str:
+        """Recover a legacy trial's BASE from its earliest reachable tag."""
+        tags_result = self.container_setup.docker_exec_git("tag", "-l", "agent-impl-*")
+        if tags_result.returncode != 0:
+            detail = (tags_result.stderr or tags_result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot manifest discovery could not list agent tags for {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+
+        reachable: list[tuple[int, str]] = []
+        for candidate in (t for t in tags_result.stdout.splitlines() if t.strip()):
+            ancestor = self.container_setup.docker_exec_git(
+                "merge-base", "--is-ancestor", candidate, tag_name
+            )
+            if ancestor.returncode == 1:
+                continue
+            if ancestor.returncode != 0:
+                detail = (ancestor.stderr or ancestor.stdout or "").strip()
+                raise RuntimeError(
+                    f"Snapshot manifest discovery could not compare {candidate} to {tag_name}"
+                    + (f": {detail}" if detail else "")
+                )
+            distance = self.container_setup.docker_exec_git(
+                "rev-list", "--count", f"{candidate}..{tag_name}"
+            )
+            if distance.returncode != 0:
+                detail = (distance.stderr or distance.stdout or "").strip()
+                raise RuntimeError(
+                    f"Snapshot manifest discovery could not measure {candidate}..{tag_name}"
+                    + (f": {detail}" if detail else "")
+                )
+            try:
+                reachable.append((int(distance.stdout.strip()), candidate))
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Snapshot manifest discovery received an invalid rev-list count "
+                    f"for {candidate}..{tag_name}: {distance.stdout!r}"
+                ) from e
+
+        earliest_tag = max(reachable, default=(0, tag_name))[1]
+        base_result = self.container_setup.docker_exec_git("rev-parse", f"{earliest_tag}^")
+        if base_result.returncode != 0:
+            detail = (base_result.stderr or base_result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot manifest discovery could not resolve the pre-agent parent "
+                f"of {earliest_tag} for {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+
+        baseline = base_result.stdout.strip()
+        if not baseline:
+            raise RuntimeError(
+                f"Snapshot manifest discovery resolved an empty pre-agent parent for {tag_name}"
+            )
+        logger.warning(
+            "Legacy single-milestone run has no recorded snapshot BASE; inferred %s from %s^",
+            baseline,
+            earliest_tag,
+        )
+        return baseline
+
+    def _get_build_manifest_overlay_in_git(self, tag_name: str) -> ManifestOverlay:
+        baseline = getattr(self, "_snapshot_baseline_commit", None) or self._infer_legacy_snapshot_baseline(tag_name)
+        ancestor = self.container_setup.docker_exec_git(
+            "merge-base", "--is-ancestor", baseline, tag_name
+        )
+        if ancestor.returncode != 0:
+            detail = (ancestor.stderr or ancestor.stdout or "not an ancestor").strip()
+            raise RuntimeError(
+                f"Snapshot manifest BASE {baseline} is not an ancestor of {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+
+        upsert_result = self.container_setup.docker_exec_git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMT",
+            baseline,
+            tag_name,
+            "--",
+        )
+        if upsert_result.returncode != 0:
+            detail = (upsert_result.stderr or upsert_result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot manifest discovery could not diff {baseline}..{tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+        delete_result = self.container_setup.docker_exec_git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--diff-filter=D",
+            baseline,
+            tag_name,
+            "--",
+        )
+        if delete_result.returncode != 0:
+            detail = (delete_result.stderr or delete_result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot manifest deletion discovery could not diff {baseline}..{tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+        return ManifestOverlay.create(
+            baseline,
+            find_build_manifests(
+                upsert_result.stdout.split("\0"), getattr(self, "src_filter", None)
+            ),
+            find_build_manifests(
+                delete_result.stdout.split("\0"), getattr(self, "src_filter", None)
+            ),
+        )
+
+    def _get_changed_build_manifests_in_git(self, tag_name: str) -> set[str]:
+        """Compatibility wrapper returning only manifest upserts."""
+        return set(self._get_build_manifest_overlay_in_git(tag_name).upserts)
+
+    def _get_existing_build_manifests_in_git(self, tag_name: str) -> set[str]:
+        result = self.container_setup.docker_exec_git(
+            "-c", "core.quotePath=false", "ls-tree", "-r", "-z",
+            "--name-only", tag_name,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot manifest inventory could not list {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+        return find_build_manifests(
+            result.stdout.split("\0"), getattr(self, "src_filter", None)
+        )
+
+    def _extract_snapshot(
+        self,
+        expected_tag_hash: Optional[str] = None,
+    ) -> Path:
         """Extract source snapshot using git archive.
+
+        The submission tag is peeled once and every capture operation uses that
+        immutable commit.  The tag is checked before and after capture so a
+        concurrent retag cannot produce a mixed snapshot.
 
         Returns:
             Path to snapshot tar file
@@ -1041,21 +1378,45 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             RuntimeError: If extraction fails
         """
         tag_name = f"agent-impl-{self.milestone_id}"
+        agent_tag_commit = expected_tag_hash or self._get_tag_hash(tag_name)
+        if not re.fullmatch(r"[0-9a-f]{40,64}", agent_tag_commit):
+            raise RuntimeError(
+                f"Cannot resolve immutable commit for {tag_name}: {agent_tag_commit!r}"
+            )
+        current_tag_commit = self._get_tag_hash(tag_name)
+        if current_tag_commit != agent_tag_commit:
+            raise RuntimeError(
+                f"Submission tag moved before snapshot capture: {tag_name} "
+                f"was {agent_tag_commit}, now {current_tag_commit}"
+            )
+
         # Save to evaluation/ directory
         eval_dir = self.output_dir / "evaluation"
         eval_dir.mkdir(parents=True, exist_ok=True)
         snapshot_path = eval_dir / "source_snapshot.tar"
 
         # Filter repo_src_dirs to only include directories that exist in the repo
-        existing_dirs = self._get_existing_src_dirs(tag_name)
+        existing_dirs = self._get_existing_src_dirs(agent_tag_commit)
         if not existing_dirs:
             raise RuntimeError(f"No source directories found in repository at {tag_name}")
 
         # Include root build files (Cargo.toml, go.mod, etc.) to preserve agent's dependency config
         # Batch check which root files exist (single git ls-tree call)
-        existing_root_files = self._get_existing_root_files_in_git(tag_name, ROOT_BUILD_FILES)
+        existing_root_files = self._get_existing_root_files_in_git(
+            agent_tag_commit, ROOT_BUILD_FILES
+        )
+        manifest_overlay = expand_atomic_manifest_overlay(
+            self._get_build_manifest_overlay_in_git(agent_tag_commit),
+            self._get_existing_build_manifests_in_git(agent_tag_commit),
+            self.repo_src_dirs,
+        )
+        changed_build_manifests = set(manifest_overlay.upserts)
 
-        snapshot_paths = get_snapshot_paths(existing_dirs, existing_root_files=existing_root_files)
+        snapshot_paths = get_snapshot_paths(
+            existing_dirs,
+            existing_root_files=existing_root_files,
+            extra_build_manifests=changed_build_manifests,
+        )
 
         # Build git archive command
         cmd = [
@@ -1071,25 +1432,169 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             "git",
             "archive",
             "--format=tar",
-            tag_name,
+            agent_tag_commit,
         ] + snapshot_paths
 
-        logger.info(f"Extracting from tag: {tag_name}")
+        logger.info(f"Extracting {tag_name} from immutable commit: {agent_tag_commit}")
         logger.info(f"Snapshot paths: {snapshot_paths} (src dirs filtered from {len(self.repo_src_dirs)} configured)")
 
         with open(snapshot_path, "wb") as f:
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
             if result.returncode != 0:
-                raise RuntimeError(f"git archive failed: {result.stderr.decode()}")
+                snapshot_path.unlink(missing_ok=True)
+                raise RuntimeError(f"git archive failed: {result.stderr.decode(errors='replace')}")
 
         # Filter tar to remove test/excluded files
-        filtered_count = self._filter_tar_archive(snapshot_path)
+        filtered_count = self._filter_tar_archive(
+            snapshot_path,
+            extra_build_manifests=changed_build_manifests,
+        )
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} test/excluded files")
 
+        # Pipeline loss is fail-closed. Dirty/out-of-scope work remains a
+        # diagnostic because the worktree may already contain the next task.
+        res = self.container_setup.docker_exec_git(
+            "-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only",
+            agent_tag_commit,
+        )
+        if res.returncode != 0:
+            detail = (res.stderr or res.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot integrity could not list the tree for {tag_name}"
+                + (f": {detail}" if detail else "")
+            )
+        tag_files = {p for p in res.stdout.split("\0") if p}
+        try:
+            with tarfile.open(snapshot_path) as tf:
+                tar_files = normalize_tar_members(tf.getnames())
+        except (tarfile.TarError, OSError) as e:
+            raise RuntimeError(f"Snapshot integrity could not read {snapshot_path}: {e}") from e
+        report = check_snapshot_integrity(
+            tag_files,
+            tar_files,
+            self.src_filter,
+            max_missing=0,
+            max_missing_frac=0.0,
+            extra_build_manifests=changed_build_manifests,
+        )
+        tar_manifests = find_build_manifests(tar_files)
+        if tar_manifests != changed_build_manifests:
+            unexpected = sorted(tar_manifests - changed_build_manifests)
+            missing = sorted(changed_build_manifests - tar_manifests)
+            raise RuntimeError(
+                "Snapshot manifest overlay mismatch "
+                f"(unexpected={unexpected[:10]}, missing={missing[:10]})"
+            )
+        deleted_present = set(manifest_overlay.deletes) & tar_files
+        if deleted_present:
+            raise RuntimeError(
+                f"Snapshot contains manifest tombstone path(s): {sorted(deleted_present)}"
+            )
+
+        uncommitted_in: List[str] = []
+        uncommitted_out: List[str] = []
+        status = self.container_setup.docker_exec_git(
+            "-c", "core.quotePath=false", "status", "--porcelain", "-z"
+        )
+        if status.returncode == 0:
+            dirty = parse_status_porcelain_z(status.stdout)
+            uncommitted_in, uncommitted_out = classify_capture_loss(
+                dirty, self.src_filter, snapshot_paths
+            )
+        else:
+            logger.warning("snapshot capture diagnostics: git status failed for %s", tag_name)
+
+        committed_out: List[str] = []
+        diff_base: Optional[str] = None
+        tags_res = self.container_setup.docker_exec_git(
+            "tag", "-l", "agent-impl-*", "--sort=creatordate"
+        )
+        if tags_res.returncode == 0:
+            tags = [t for t in tags_res.stdout.splitlines() if t.strip()]
+            if tag_name in tags and tags.index(tag_name) > 0:
+                diff_base = tags[tags.index(tag_name) - 1]
+        else:
+            logger.warning("snapshot capture diagnostics: git tag listing failed for %s", tag_name)
+        if diff_base:
+            diff = self.container_setup.docker_exec_git(
+                "-c", "core.quotePath=false", "diff", "--name-only", "-z",
+                "--diff-filter=d", diff_base, agent_tag_commit,
+            )
+            if diff.returncode == 0:
+                changed = [p for p in diff.stdout.split("\0") if p]
+                _, committed_out = classify_capture_loss(
+                    changed, self.src_filter, snapshot_paths
+                )
+            else:
+                logger.warning(
+                    "snapshot capture diagnostics: git diff failed for %s..%s",
+                    diff_base,
+                    tag_name,
+                )
+
+        image_id = inspect_docker_image_id(self.container_name, container=True)
+        current_tag_commit = self._get_tag_hash(tag_name)
+        if current_tag_commit != agent_tag_commit:
+            raise RuntimeError(
+                f"Submission tag moved during snapshot capture: {tag_name} "
+                f"was {agent_tag_commit}, now {current_tag_commit}"
+            )
+
+        sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
+        sidecar.write_text(
+            json.dumps(
+                make_snapshot_metadata(
+                    tag=tag_name,
+                    snapshot_file=snapshot_path,
+                    manifest_overlay=manifest_overlay,
+                    extra={
+                        "tag": tag_name,
+                        "ok": report.ok,
+                        "expected_count": report.expected_count,
+                        "missing_count": report.missing_count,
+                        "missing_sample": report.missing_sample,
+                        "capture_filter": _capture_filter_config(self.src_filter),
+                        "uncommitted_lost_count": len(uncommitted_in),
+                        "uncommitted_lost_sample": uncommitted_in[:20],
+                        "uncommitted_outside_count": len(uncommitted_out),
+                        "uncommitted_outside_sample": uncommitted_out[:20],
+                        "committed_outside_count": len(committed_out),
+                        "committed_outside_sample": committed_out[:20],
+                        "outside_diff_base": diff_base,
+                        "agent_base_image_id": image_id,
+                        "agent_tag_commit": agent_tag_commit,
+                        **self._repo_config_sidecar_fields(),
+                    },
+                ),
+                indent=2,
+            )
+        )
+        if uncommitted_in or uncommitted_out:
+            logger.warning(
+                f"⚠️  snapshot capture: {len(uncommitted_in) + len(uncommitted_out)} uncommitted "
+                f"path(s) at capture of {tag_name} — not in the snapshot "
+                f"(in-scope: {uncommitted_in[:3]}, out-of-scope: {uncommitted_out[:3]})"
+            )
+        if committed_out:
+            logger.warning(
+                f"⚠️  snapshot capture: {len(committed_out)} path(s) committed since {diff_base} "
+                f"lie outside the capture scope and will never reach the snapshot: {committed_out[:3]}"
+            )
+        if not report.ok:
+            raise RuntimeError(
+                f"Snapshot capture integrity failed for {tag_name}: "
+                f"{report.missing_count}/{report.expected_count} expected files are missing "
+                f"(sample: {report.missing_sample[:5]})"
+            )
+
         return snapshot_path
 
-    def _filter_tar_archive(self, tar_path: Path) -> int:
+    def _filter_tar_archive(
+        self,
+        tar_path: Path,
+        extra_build_manifests: Optional[set[str]] = None,
+    ) -> int:
         """Filter tar archive to remove test files (but keep generated code).
 
         Uses should_include_in_snapshot() which includes:
@@ -1102,9 +1607,8 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         Returns:
             Number of files filtered out
         """
-        # Skip filtering if no patterns defined
-        if not self.src_filter.test_dirs and not self.src_filter.exclude_patterns:
-            return 0
+        # This pass also strips unchanged build manifests, so it is mandatory
+        # even with no test/exclude patterns.
 
         filtered_count = 0
         temp_path = tar_path.with_suffix(".filtered.tar")
@@ -1112,17 +1616,28 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         with tarfile.open(tar_path, "r") as src:
             with tarfile.open(temp_path, "w") as dst:
                 for member in src.getmembers():
-                    # Always include directories
-                    if not member.isfile():
+                    # Keep directory entries as-is.
+                    if member.isdir():
                         dst.addfile(member)
                         continue
 
-                    # Check if file should be included in snapshot
-                    # This includes src files AND generated code files
-                    if self.src_filter.should_include_in_snapshot(member.name):
-                        fileobj = src.extractfile(member)
-                        if fileobj:
+                    # Apply the same path authority policy to every archive
+                    # member. Preserve symlink/hardlink metadata for included
+                    # paths instead of silently deleting submitted tree entries.
+                    if should_include_snapshot_file(
+                        member.name,
+                        self.src_filter,
+                        extra_build_manifests=extra_build_manifests,
+                    ):
+                        if member.isfile():
+                            fileobj = src.extractfile(member)
+                            if fileobj is None:
+                                raise tarfile.TarError(
+                                    f"cannot read regular tar member {member.name!r}"
+                                )
                             dst.addfile(member, fileobj)
+                        else:
+                            dst.addfile(member)
                     else:
                         filtered_count += 1
                         logger.debug(f"Filtered: {member.name}")
@@ -1130,6 +1645,22 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         # Replace original with filtered
         temp_path.replace(tar_path)
         return filtered_count
+
+    def _repo_config_sidecar_fields(self) -> dict:
+        """Return the pinned config identity for snapshot metadata.
+
+        Normal runners always have a binding.  The empty compatibility branch
+        is retained only for lightweight legacy/unit-test objects constructed
+        without ``__init__``.
+        """
+        result = {}
+        repo_binding = getattr(self, "repo_config_binding", None)
+        if repo_binding is not None:
+            result["repo_config_binding"] = repo_binding.identity.to_dict()
+        runtime_binding = getattr(self, "runtime_policy_binding", None)
+        if runtime_binding is not None:
+            result["runtime_policy_binding"] = runtime_binding.identity.to_dict()
+        return result
 
     def _get_existing_workdir_dirs(self) -> list[str]:
         """Get list of source directories that actually exist in the container workdir.
@@ -1159,6 +1690,12 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             )
             if result.returncode == 0:
                 existing.append(src_dir)
+            elif result.returncode != 1:
+                detail = result.stderr.decode(errors="replace").strip()
+                raise RuntimeError(
+                    f"Snapshot workdir-directory discovery failed for {dir_path}"
+                    + (f": {detail}" if detail else "")
+                )
         return existing
 
     def _get_existing_root_files_in_workdir(self, files: list[str]) -> set[str]:
@@ -1174,7 +1711,7 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             return set()
 
         # Check each file and echo if it exists (semicolon-separated commands)
-        check_script = "; ".join(f'[ -f "{f}" ] && echo "{f}"' for f in files)
+        check_script = "; ".join(f'[ -f "{f}" ] && echo "{f}"' for f in files) + "; exit 0"
         result = subprocess.run(
             [
                 "docker",
@@ -1193,12 +1730,98 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Snapshot workdir root-manifest discovery failed"
+                + (f": {detail}" if detail else "")
+            )
 
         existing = set()
         for line in result.stdout.strip().split("\n"):
             if line:
                 existing.add(line)
         return existing
+
+    def _get_build_manifest_overlay_in_workdir(self) -> ManifestOverlay:
+        """Find tracked/untracked manifest delta for untagged fallback."""
+        base = self._snapshot_baseline_commit
+        if not base:
+            raise RuntimeError(
+                "Snapshot workdir manifest discovery has no recorded pre-agent BASE"
+            )
+
+        changed = self.container_setup.docker_exec_git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMT",
+            base,
+            "--",
+        )
+        if changed.returncode != 0:
+            detail = (changed.stderr or changed.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot workdir manifest discovery could not diff {base}..worktree"
+                + (f": {detail}" if detail else "")
+            )
+        upsert_paths = changed.stdout.split("\0")
+        deleted = self.container_setup.docker_exec_git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--diff-filter=D",
+            base,
+            "--",
+        )
+        if deleted.returncode != 0:
+            detail = (deleted.stderr or deleted.stdout or "").strip()
+            raise RuntimeError(
+                f"Snapshot workdir manifest deletion discovery could not diff {base}..worktree"
+                + (f": {detail}" if detail else "")
+            )
+        untracked = self.container_setup.docker_exec_git(
+            "ls-files", "--others", "--exclude-standard", "-z"
+        )
+        if untracked.returncode != 0:
+            detail = (untracked.stderr or untracked.stdout or "").strip()
+            raise RuntimeError(
+                "Snapshot workdir manifest discovery could not list untracked files"
+                + (f": {detail}" if detail else "")
+            )
+        upsert_paths.extend(untracked.stdout.split("\0"))
+        return ManifestOverlay.create(
+            base,
+            find_build_manifests(upsert_paths, getattr(self, "src_filter", None)),
+            find_build_manifests(
+                deleted.stdout.split("\0"), getattr(self, "src_filter", None)
+            ),
+        )
+
+    def _get_changed_build_manifests_in_workdir(self) -> set[str]:
+        """Compatibility wrapper returning only manifest upserts."""
+        return set(self._get_build_manifest_overlay_in_workdir().upserts)
+
+    def _get_existing_build_manifests_in_workdir(self) -> set[str]:
+        result = self.container_setup.docker_exec_git(
+            "-c", "core.quotePath=false", "ls-files", "--cached", "--others",
+            "--exclude-standard", "-z",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Snapshot workdir manifest inventory could not list files"
+                + (f": {detail}" if detail else "")
+            )
+        return find_build_manifests(
+            result.stdout.split("\0"), getattr(self, "src_filter", None)
+        )
 
     def _extract_snapshot_from_workdir(self) -> Path:
         """Extract source snapshot directly from container working directory.
@@ -1223,17 +1846,25 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
         # Include root build files (Cargo.toml, go.mod, etc.) to preserve agent's dependency config
         # Batch check which root files exist (single docker exec call)
         existing_root_files = self._get_existing_root_files_in_workdir(ROOT_BUILD_FILES)
+        manifest_overlay = expand_atomic_manifest_overlay(
+            self._get_build_manifest_overlay_in_workdir(),
+            self._get_existing_build_manifests_in_workdir(),
+            self.repo_src_dirs,
+        )
+        changed_build_manifests = set(manifest_overlay.upserts)
 
-        snapshot_paths = get_snapshot_paths(existing_dirs, existing_root_files=existing_root_files)
+        snapshot_paths = get_snapshot_paths(
+            existing_dirs,
+            existing_root_files=existing_root_files,
+            extra_build_manifests=changed_build_manifests,
+        )
 
         logger.info("Extracting from working directory (fallback mode)")
         logger.info(f"Snapshot paths: {snapshot_paths}")
 
-        # Use tar to directly archive src directories + root build files from the working directory
-        # --ignore-failed-read: silently skip files that don't exist (e.g., Cargo.toml in non-Rust projects)
-        paths_arg = " ".join(snapshot_paths)
-        tar_cmd = f"tar -cf - --ignore-failed-read {paths_arg} 2>/dev/null"
-
+        # Archive only paths that discovery proved exist. Do not use
+        # --ignore-failed-read: a path disappearing during capture must fail
+        # closed instead of yielding a partial tar.
         cmd = [
             "docker",
             "exec",
@@ -1244,10 +1875,11 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             "-w",
             "/testbed",
             self.container_name,
-            "sh",
-            "-c",
-            tar_cmd,
-        ]
+            "tar",
+            "-cf",
+            "-",
+            "--",
+        ] + snapshot_paths
 
         with open(snapshot_path, "wb") as f:
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
@@ -1255,9 +1887,62 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 raise RuntimeError(f"tar archive failed: {result.stderr.decode()}")
 
         # Reuse existing filter logic to remove test/excluded files
-        filtered_count = self._filter_tar_archive(snapshot_path)
+        filtered_count = self._filter_tar_archive(
+            snapshot_path,
+            extra_build_manifests=changed_build_manifests,
+        )
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} test/excluded files")
+
+        try:
+            with tarfile.open(snapshot_path) as archive:
+                tar_files = normalize_tar_members(archive.getnames())
+        except (tarfile.TarError, OSError) as exc:
+            raise RuntimeError(f"Snapshot integrity could not read {snapshot_path}: {exc}") from exc
+        tar_manifests = find_build_manifests(tar_files)
+        if tar_manifests != changed_build_manifests:
+            raise RuntimeError(
+                "Snapshot workdir manifest overlay mismatch "
+                f"(tar={sorted(tar_manifests)}, expected={sorted(changed_build_manifests)})"
+            )
+        deleted_present = set(manifest_overlay.deletes) & tar_files
+        if deleted_present:
+            raise RuntimeError(
+                f"Snapshot contains manifest tombstone path(s): {sorted(deleted_present)}"
+            )
+
+        image_id = inspect_docker_image_id(self.container_name, container=True)
+        commit_result = self.container_setup.docker_exec_git(
+            "rev-parse", "HEAD^{commit}"
+        )
+        agent_tag_commit = (commit_result.stdout or "").strip()
+        if commit_result.returncode != 0 or not re.fullmatch(
+            r"[0-9a-f]{40,64}", agent_tag_commit
+        ):
+            detail = (commit_result.stderr or commit_result.stdout or "missing commit").strip()
+            raise RuntimeError(
+                f"Snapshot provenance could not resolve workdir HEAD commit: {detail}"
+            )
+
+        sidecar = snapshot_path.parent / (snapshot_path.stem + ".integrity.json")
+        sidecar.write_text(
+            json.dumps(
+                make_snapshot_metadata(
+                    tag=f"agent-workdir-{self.milestone_id}",
+                    snapshot_file=snapshot_path,
+                    manifest_overlay=manifest_overlay,
+                    extra={
+                        "ok": True,
+                        "capture_filter": _capture_filter_config(self.src_filter),
+                        "capture_mode": "workdir-fallback",
+                        "agent_base_image_id": image_id,
+                        "agent_tag_commit": agent_tag_commit,
+                        **self._repo_config_sidecar_fields(),
+                    },
+                ),
+                indent=2,
+            )
+        )
 
         return snapshot_path
 
@@ -1288,6 +1973,11 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             patch_file=snapshot_path,
             baseline_classification=baseline_json,
             output_dir=eval_dir,
+            repo_config_path=self.repo_config_binding.path,
+            repo_config_sha256=self.repo_config_binding.sha256,
+            runtime_policy_path=self.runtime_policy_binding.path,
+            runtime_policy_sha256=self.runtime_policy_binding.sha256,
+            runtime_policy_mode=self.runtime_policy_binding.mode,
         )
 
         error_message = None
@@ -1320,6 +2010,11 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 pass_to_pass_required=0,
                 none_to_pass_required=0,
                 none_to_pass_achieved=0,
+                repo_config_binding_mode="trial-pinned",
+                repo_config_sha256=self.repo_config_binding.sha256,
+                runtime_policy_binding_mode="trial-pinned",
+                runtime_policy_sha256=self.runtime_policy_binding.sha256,
+                runtime_policy_mode=self.runtime_policy_binding.mode,
             )
 
         # Save result (even if evaluation failed)
@@ -1495,7 +2190,16 @@ Output Structure:
     )
     parser.add_argument(
         "--image",
-        help="Docker image (default: {repo}/{version}/{mid}:$EVOCLAW_IMAGE_TAG, tag default v0.9)",
+        help=(
+            "Docker image (explicit value wins; otherwise protected policies "
+            "use the repo base-offline closure image, absent/unprotected runs "
+            "keep the historical milestone image)"
+        ),
+    )
+    parser.add_argument(
+        "--unprotected",
+        action="store_true",
+        help="Disable a discovered runtime policy and keep the historical milestone image.",
     )
     parser.add_argument(
         "--model",
@@ -1622,6 +2326,7 @@ Output Structure:
         reasoning_effort=args.reasoning_effort,
         trial_name=trial_name,
         max_retries=args.max_retries,
+        unprotected=args.unprotected,
     )
 
     try:

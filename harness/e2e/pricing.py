@@ -114,6 +114,9 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # ── Moonshot Kimi ─────────────────────────────────────────────────────
     "kimi-k2.5": {"input": 0.6, "output": 3.0, "cache_read": 0.1},
     "kimi-k2.6": {"input": 0.95, "output": 4.0, "cache_read": 0.16},
+    # Official platform.kimi.ai list price (2026-07): uniform across the full
+    # 1M context, no long-context surcharge.
+    "kimi-k3": {"input": 3.0, "output": 15.0, "cache_read": 0.3},
     # ── DeepSeek ──────────────────────────────────────────────────────────
     "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache_read": 0.003625, "cache_write": 0.435},
     # ── MiniMax ───────────────────────────────────────────────────────────
@@ -208,6 +211,7 @@ _MATCH_ORDER = [
     ("glm-4.5-air", "glm-4.5-air"),  # must come before "glm-4"
     ("glm-4.7", "glm-4.7"),
     # Kimi
+    ("kimi-k3", "kimi-k3"),
     ("kimi-k2.6", "kimi-k2.6"),  # must come before "kimi-k2"
     ("kimi-k2", "kimi-k2.5"),    # "kimi-k2" or "kimi-k2.5-xxxxx"
     # DeepSeek

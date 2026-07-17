@@ -1,36 +1,16 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_opus-4.8
 agent: claude-code
-
-# ─── Claude on Google Vertex AI ──────────────────────────────────────────
-# Claude Code's native Vertex mode (CLAUDE_CODE_USE_VERTEX): it talks to
-# Vertex's Anthropic endpoint directly using ADC — no API key, no proxy.
-# Auth is ADC, configured once on the host:
-#   gcloud auth application-default login
-# Launch the normal way:
-#   python scripts/run_all.py --config trial_configs/claude-code_opus-4.8.yaml
-# See docs/vertex-ai.md (credentials) and docs/adding-a-model.md (the process).
 model: claude-opus-4-8
-vertex_ai: true
-vertex_location: global          # Opus 4.8 answers on `global` today. The US
-                                 # regional endpoints (us-east5, ...) exist but
-                                 # ship with ~0 per-minute-token quota until you
-                                 # file a Vertex quota-increase request; flip to
-                                 # e.g. us-east5 once that quota lands.
 
-# Route ALL of Claude Code's class-based model slots (haiku/sonnet/opus/
-# subagent) to the same Vertex model, so background/subagent calls don't fall
-# back to a Claude model the project hasn't enabled on Vertex. run_all.py sets
-# this automatically for vertex_ai; pinned here for clarity.
-default_haiku_model: claude-opus-4-8
-
-# reasoning_effort: max — VERIFIED working on claude-code 2.1.158 (2026-05-30).
-# Effort is now sent server-side via `output_config.effort` (not the old
-# budget_tokens path that bug #48051 collapsed to medium). Measured on Vertex
-# Opus 4.8: each level transmits faithfully (max ≠ medium) and the server honors
-# it — `max` produced ~2.6x the thinking of `low`, ~2x `medium`. The container
-# installs the latest claude, so this holds. (If you ever pin an older claude
-# where #48051 bites, leave this unset to fall back to Opus's built-in xhigh.)
+default_agent_model: claude-opus-4-8
 reasoning_effort: max
-
 timeout: 18000
+auto_compact_window: 200000
+
+# Uncomment to run on Vertex AI instead of the Anthropic API (auth = ADC: `gcloud auth application-default login`).
+# vertex_ai: true
+# vertex_location: global
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

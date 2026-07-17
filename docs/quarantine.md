@@ -1,6 +1,6 @@
 # Quarantine — anti-cheat network isolation
 
-EvoClaw drops an agent into a repo at version **A** and asks it to implement the
+SWE-Milestone drops an agent into a repo at version **A** and asks it to implement the
 changes that turn it into version **B** (the milestones). The benchmark is only
 valid if the agent *writes* those changes. If it can instead **fetch version B's
 own source** (the "answer") and copy it, the score is meaningless.
@@ -109,19 +109,21 @@ Declared per-ecosystem in the policy, injected as container env by
 | policy switch | container effect |
 |---|---|
 | `cargo_offline: true` | `CARGO_NET_OFFLINE=true` |
-| `go_offline: true` | `GOPROXY=off` (also written into `/etc/environment` + `.bashrc` by `lock_network` — shell profiles override a bare `docker -e`) |
+| `go_offline: true` | local-only `GOPROXY`, `GONOPROXY=none`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, pinned `GOFLAGS`/`GOENV`, a root-owned `BASH_ENV` contract, and per-invocation COW module/build/bin/env state |
 | `maven_offline: true` | `MAVEN_ARGS=-o` (+ `-Dmaven.repo.local=<maven_repo_local>`) |
 | `npm_offline: true` | `npm_config_offline=true` |
 | (pip — derived from `ecosystem: [pip]`, no key) | `PIP_NO_INDEX=1`, `PIP_FIND_LINKS=/wheelhouse` |
 
-This layer does double duty: it is an **independent anti-cheat line** (for go it
-is the *primary* one — `GOPROXY=off` makes `go get <self>@<target>` fail inside
-the toolchain itself, needed because proxy.golang.org can't be IP-blocked, see
-§9), and it **keeps legitimate builds working** — an online-configured manager
+This layer does double duty: it is an **independent anti-cheat line** (for Go,
+the only configured proxy is the image-baked, read-only dependency closure;
+`cache_forbid_globs` rejects any copy of the repo-under-test, so
+`go get <self>@<target>` cannot resolve), and it **keeps legitimate builds
+working** — an online-configured manager
 would hang against the DROP rules; an offline one uses the image's baked closure
-directly. `GOPROXY` is set to `off` under *any* quarantine (the mirror domains
-are hosts-poisoned anyway), and stays at the sanctioned proxy in non-quarantine
-containers (`goproxy_value` in `harness/e2e/quarantine.py`).
+directly. A Go quarantine uses the local file proxy; other quarantine ecosystems
+set `GOPROXY=off` because the public mirror domains are hosts-poisoned. An
+unprotected container keeps the sanctioned public proxy (`goproxy_value` in
+`harness/e2e/quarantine.py`).
 
 Additionally, `lock_network` removes the agent user's sudoers entry, so the
 agent cannot flush iptables or edit `/etc/hosts`.
@@ -154,7 +156,7 @@ refuses the launch rather than warning:
   env from the on-disk policy when the process env lacks it (direct
   `run_e2e --resume-trial`, manual `run_milestone`). Protection follows the
   **disk fact** (does this repo have a policy file), not a losable env var. The
-  only exception: `EVOCLAW_UNPROTECTED`, persisted in trial metadata so resuming
+  only exception: `SWE_MILESTONE_UNPROTECTED`, persisted in trial metadata so resuming
   an intentionally-open baseline doesn't silently re-harden it.
 
 The gate checks *what you declared*; the in-container probes check *whether it
@@ -170,7 +172,7 @@ quarantine_configs/<repo>.yaml          policy: repo-intrinsic, auto-on
         │
         ▼
 harness/e2e/quarantine.py               the only policy interpreter (pure functions)
-        │   load_quarantine_env()   → EVOCLAW_* env vars
+        │   load_quarantine_env()   → SWE_MILESTONE_* env vars
         │   quarantine_coverage_errors() → launch gate
         │   image_for_repo()        → base-offline vs base (§8)
         ▼
@@ -197,11 +199,11 @@ the agent's container                   registries unreachable, managers offline
 | `scripts/verify_quarantine.py` | standalone live smoke test |
 | `scripts/pull_images.sh` | distributes images across machines |
 
-The env vars carrying policy into the container: `EVOCLAW_QUARANTINE`,
-`EVOCLAW_DENY_DOMAINS`, `EVOCLAW_DENY_CIDRS`, `EVOCLAW_FIREWALL_EXEMPT`,
-`EVOCLAW_{PIP,CARGO,GO,MAVEN,NPM}_OFFLINE`, `EVOCLAW_MAVEN_REPO_LOCAL`,
-`EVOCLAW_CACHE_FORBID_GLOBS`, `EVOCLAW_VERIFY_FETCH_URLS`, plus
-`EVOCLAW_UNPROTECTED` for the escape hatch.
+The env vars carrying policy into the container: `SWE_MILESTONE_QUARANTINE`,
+`SWE_MILESTONE_DENY_DOMAINS`, `SWE_MILESTONE_DENY_CIDRS`, `SWE_MILESTONE_FIREWALL_EXEMPT`,
+`SWE_MILESTONE_{PIP,CARGO,GO,MAVEN,NPM}_OFFLINE`, `SWE_MILESTONE_MAVEN_REPO_LOCAL`,
+`SWE_MILESTONE_CACHE_FORBID_GLOBS`, `SWE_MILESTONE_VERIFY_FETCH_URLS`, plus
+`SWE_MILESTONE_UNPROTECTED` for the escape hatch.
 
 ## 5. Day-to-day usage
 
@@ -303,7 +305,7 @@ python scripts/build_offline_closure.py --repo <repo_full_name>          # local
 python scripts/build_offline_closure.py --repo <repo_full_name> --push   # + DockerHub
 ```
 
-One command builds `<repo>/base-offline:staging` and runs **four fail-closed
+One command builds `swe-milestone/<repo_full>__base-offline:staging` and runs **four fail-closed
 gates**; `:latest` is tagged only if all pass, so the existence of a
 `base-offline` image is itself the proof it was validated:
 
@@ -324,12 +326,12 @@ gates**; `:latest` is tagged only if all pass, so the existence of a
    the staging image.
 
 How the closure is assembled: a networked multi-stage `docker build` starting
-`FROM <repo>/base:latest` unions every milestone's declared dependencies into
+`FROM swe-milestone/<repo_full>__base:<pin>` unions every milestone's declared dependencies into
 the shared cache (cargo `vendor` / go `go mod download all` / maven
 `dependency:go-offline` + test-scope resolve / yarn per-lockfile installs / pip
 freeze-union → `pip download` into an in-image `/wheelhouse`), then a final
-stage copies only the warmed cache forward. `base:latest` is never modified —
-`base-offline` is a strict layer on top (§8). Escape hatches for odd repos live
+stage copies only the warmed cache forward. The plain `__base` image is never
+modified — `__base-offline` is a strict layer on top (§8). Escape hatches for odd repos live
 in the `closure:` block (`cargo_mechanism: raw-cache`, `go_mechanism`,
 `global_npm_tools`, `extra_vendor_crates`). Never run `mvn install` during a
 build — it would bake the repo's own artifact into `.m2`; the builder's flow
@@ -339,13 +341,17 @@ Prerequisite: the repo's milestone images are present (`scripts/pull_images.sh`)
 
 ### Step 3 — promote the tag (easy to forget!)
 
-The builder only tags **`:latest`**, but the harness pins **`v0.9`** (§8). A
-rebuilt closure is **not live** until promoted:
+The builder only tags **`:staging`/`:latest`** (floating build tags), but the
+harness pins the benchmark data version (§8). A rebuilt closure is **not
+live** until promoted to the pinned tag — release promotion is handled
+uniformly by `retag-plan` (see the release runbook in `docs/versioning.md`); for a single
+repo on one machine:
 
 ```bash
-# this machine
-docker tag <repo_full>/base-offline:latest <repo_full>/base-offline:v0.9
-# other machines: push (Step 2 --push, or docker push), then pull_images.sh there
+# this machine (example: version v1.0)
+docker tag swe-milestone/<repo_full>__base-offline:latest \
+           swe-milestone/<repo_full>__base-offline:v1.0
+# other machines: ./scripts/push_images.sh --repo <short>, then pull_images.sh there
 ```
 
 ### Step 4 — verify, then run
@@ -357,30 +363,40 @@ python scripts/run_all.py --config trial_config.yaml
 
 ## 8. Images and version pinning
 
-**Two images per repo.** `<repo>/base` is the original eval image (its cache
-covers only the A-version closure). `<repo>/base-offline` is built `FROM` it —
-same `/testbed`, same environment, plus the A→B union dependency cache (and a
+**Two images per repo.** `swe-milestone/<repo_full>__base` is the original
+eval image (its cache covers only the A-version closure).
+`swe-milestone/<repo_full>__base-offline` is built `FROM` it — same
+`/testbed`, same environment, plus the A→B union dependency cache (and a
 newer toolchain where B needs one). `image_for_repo()` selects at launch:
 policy file present → `base-offline`; no policy (or `--unprotected` baselines
 still launching a policy-less repo) → `base`. All 7 repos, **including
 scikit-learn**, use `base-offline` (the pip wheelhouse is baked in at
 `/wheelhouse`, not host-mounted).
 
-**Tag semantics.** `v0.9` is the benchmark **data-version pin** (env
-`EVOCLAW_IMAGE_TAG`, default `v0.9`); `:latest` is "most recent local build".
-`resolve_image()` (`harness/e2e/image_version.py`):
+**Tag semantics.** The tag is the benchmark **data-version pin** (env
+`SWE_MILESTONE_IMAGE_TAG`, default `v1.0` — defined once in
+`harness/e2e/image_version.py`); `:latest` is "most recent local build".
+`resolve_image()`:
 
-1. `<image>:v0.9` exists locally → use it.
+1. `<image>:<pin>` exists locally → use it.
 2. Pin came from the default and only `:latest` exists → use it **with a loud
    warning** (content unverified).
-3. `EVOCLAW_IMAGE_TAG` set explicitly → never fall back; fail fast.
+3. `SWE_MILESTONE_IMAGE_TAG` set explicitly → never fall back; fail fast.
 
-**Distribution.** `scripts/pull_images.sh` pulls, per repo: the base image, the
-base-offline image (tagged locally as *both* `:latest` and `:v0.9`; a repo
-missing on the Hub is a warning, with a pointer to the builder), and all
-milestone images. Hub naming: `hyd2apse/<short>:base-offline-v0.9` etc. Note
-that pulling **re-points local tags at the Hub version** — that's what
-"aligning a machine" means, so make sure the Hub holds what you want first.
+Containers additionally launch with `--pull=never`: a missing local image is
+a loud failure, never a silent registry fetch mid-eval.
+
+**Distribution.** `scripts/pull_images.sh` executes the plan emitted by
+`python3 -m harness.e2e.image_version pull-plan` from the digest manifest
+`manifests/digests-<version>.tsv`: every image (base, base-offline, all
+milestones — base-offline is not special) is pulled **by content digest**
+(`<org>/swe-milestone__<repo_full>__<milestone>@sha256:…`, immune to Hub tag
+replacement) and retagged to the local
+`swe-milestone/<repo_full>__<milestone>:<version>`. A failed pull is a
+per-image WARN; the script continues, prints the full failure list, and exits
+non-zero. Note that pulling **re-points local tags at the Hub version** —
+that's what "aligning a machine" means, so make sure the Hub holds what you
+want first.
 
 **The rule that follows:** after any closure rebuild, promote (`retag`/`push`)
 per Step 3, or the harness will keep launching the previous generation.
@@ -394,12 +410,13 @@ per Step 3, or the harness will keep launching the previous generation.
   `firewall_exempt_domains` (enforced by the code-level constant
   `FIREWALL_EXEMPTABLE_DOMAINS` — a *fact*, not a self-declaration; the gate
   rejects anything else and `verify` honors only the intersection). Their
-  defense is downgraded: `/etc/hosts` poisoning + `GOPROXY=off`. That stops the
+  defense is downgraded: `/etc/hosts` poisoning + a local-only `GOPROXY`. That stops the
   toolchain and ordinary curl, **not** a deliberate `curl --resolve` with a
-  known Google IP. The definitive fix for this whole shared-CDN class is a
-  future **SNI-filtering egress proxy** (terminate all egress at a proxy that
-  filters by hostname, so IP sharing stops mattering); until then this residual
-  is accepted and documented.
+  known Google IP. The definitive fix for this whole shared-CDN class is an
+  SNI-filtering proxy that filters by hostname so IP sharing stops mattering;
+  §10 implements exactly that for the *inverse* case (a wanted LLM endpoint
+  sharing a denied CDN). Extending it to also front the denied Go domains would
+  retire this residual; until then it is accepted and documented.
 - **Training data.** These are public repos; version B may be in the model's
   weights. Quarantine prevents *fetching*, not *remembering* — inherent to any
   public-repo benchmark.
@@ -414,6 +431,39 @@ per Step 3, or the harness will keep launching the previous generation.
   outside the closure, the install fails loudly (`No matching distribution` /
   `not found in vendored sources` / GOPROXY-off errors in the trace) — extend
   the closure, rebuild, promote. Detectable, never a silent leak.
+
+## 10. SNI-pinned tunnel — reaching an LLM endpoint through a denied CDN
+
+Some LLM endpoints sit behind the **same CDN a repo's registry rides**. The
+starkest case: `api.kimi.com` and `api.moonshot.ai` are Cloudflare-fronted, and
+element-web denies Cloudflare `104.16.0.0/12` to block npm. IP-denying the
+range blocks npm *and* the model. Domain whitelisting can't help — the firewall
+filters at the IP layer, where a Cloudflare edge is reachable via SNI for **any**
+Cloudflare site (a `curl --resolve registry.npmjs.org:443:<kimi-edge-ip>` fetches
+npm; confirmed). So the endpoint and the registry are genuinely indistinguishable
+at the IP layer.
+
+The fix (`harness/e2e/sni_tunnel.py`, wired in `container_setup._ensure_sni_sidecar`):
+
+- A **sidecar container** on the same Docker bridge runs an SNI-pinned forwarder.
+  It reads each connection's TLS ClientHello, and relays **only** when the SNI is
+  the pinned endpoint — any other SNI (e.g. a spoofed `registry.npmjs.org`) is
+  dropped. It never decrypts, so TLS stays end-to-end and the cert validates.
+- The agent container maps the endpoint to the sidecar in `/etc/hosts` and
+  `ACCEPT`s only the sidecar IP; Cloudflare's real range stays `DROP`'d, so the
+  registry remains unreachable. (Sidecar, not a host process: this class of host
+  blocks container→host traffic; sidecar, not in the agent container: the agent
+  controls that one.)
+- **Activation is a code-level fact, never a self-declaration.** A tunnel is set
+  up only when the trial's `UNIFIED_BASE_URL` host is in the hardcoded
+  `SNI_TUNNELABLE_DOMAINS` allowlist (LLM endpoints only — a registry can never
+  appear there) **and** resolves into a `deny_cidr`. Dormant for every repo/model
+  that doesn't need it.
+- **Verified at lockdown.** `verify_network_lockdown` asserts both directions:
+  the endpoint completes a TLS handshake through the sidecar, and a
+  `registry.npmjs.org` SNI straight to the sidecar is refused. The three detours
+  all fail: direct-to-Cloudflare (IP `DROP`), tunnel-with-registry-SNI (forwarder
+  drop), tunnel-with-endpoint-SNI-but-registry-Host (Cloudflare answers `403`).
 
 ## History
 

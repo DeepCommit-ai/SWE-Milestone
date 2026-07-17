@@ -287,185 +287,16 @@ def load_e2e_trial_submission_counts(workspace_root: Path, trial: str) -> tuple[
         return 0, 0
 
 
-def _load_e2e_stats(workspace_root: Path, trial: str) -> Optional[Dict]:
-    """Load stats from agent_stats.json, falling back to live agent_stdout.txt.
-
-    agent_stats.json is written once at trial cleanup.  While a trial is still
-    running it does not exist, so we fall back to parsing agent_stdout.txt
-    (which receives one JSON line per completed session) for live cost/turns.
-    """
-    trial_dir = workspace_root / "e2e_trial" / trial
-    stats_path = trial_dir / "agent_stats.json"
-
-    if stats_path.exists():
-        try:
-            with open(stats_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-
-    # Fallback: parse agent_stdout.txt for live stats
-    stdout_path = trial_dir / "log" / "agent_stdout.txt"
-    if not stdout_path.exists():
-        return None
-    try:
-        total_cost = 0.0
-        total_turns = 0
-        model_usage: Dict[str, Dict] = {}
-        with open(stdout_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "total_cost_usd" not in data and "num_turns" not in data:
-                    continue
-                total_cost += data.get("total_cost_usd", 0)
-                total_turns += data.get("num_turns", 0)
-                for model, usage in data.get("modelUsage", {}).items():
-                    if not isinstance(usage, dict):
-                        continue
-                    if model not in model_usage:
-                        model_usage[model] = {}
-                    for key, val in usage.items():
-                        if isinstance(val, (int, float)):
-                            model_usage[model][key] = model_usage[model].get(key, 0) + val
-        if total_turns == 0 and not model_usage:
-            return None
-        return {
-            "summary": {"total_cost_usd": total_cost, "total_turns": total_turns},
-            "modelUsage": model_usage,
-            "_live": True,  # marker: parsed from stdout, not agent_stats
-        }
-    except Exception:
-        return None
-
-
-def load_e2e_trial_cost(workspace_root: Path, trial: str) -> Optional[float]:
-    """Load total cost from agent_stats.json or live agent_stdout.txt.
-
-    For claude-code trials: recalculates from modelUsage with canonical
-    pricing (corrects Claude Code CLI's wrong rates for non-Claude models).
-
-    Returns total cost in USD or None if not available.
-    """
-    stats = _load_e2e_stats(workspace_root, trial)
-    if stats is None:
-        return None
-    try:
-        if "claude-code" in trial:
-            cost = recalculate_cost_from_model_usage(stats.get("modelUsage", {}))
-            if cost is not None:
-                return cost
-        return stats.get("summary", {}).get("total_cost_usd")
-    except Exception:
-        return None
-
-
-def load_e2e_trial_turns(workspace_root: Path, trial: str) -> Optional[int]:
-    """Load total turns from agent_stats.json or live agent_stdout.txt."""
-    stats = _load_e2e_stats(workspace_root, trial)
-    if stats is None:
-        return None
-    try:
-        turns = stats.get("summary", {}).get("total_turns")
-        if turns and turns > 0:
-            return turns
-
-        # Older Claude Code agent_stats were written with empty milestone_stats
-        # when git tag timestamps failed to parse. The parser still captured
-        # de-duplicated usage_units, one per LLM API call, so use them as a
-        # display fallback for total turns.
-        usage_units = stats.get("usage_units")
-        if isinstance(usage_units, list) and usage_units:
-            return len(usage_units)
-
-        return turns
-    except Exception:
-        return None
-
-
-def load_e2e_trial_output_tokens(workspace_root: Path, trial: str) -> Optional[int]:
-    """Load total output tokens from agent_stats.json or live agent_stdout.txt.
-
-    Sums outputTokens + thoughtsTokens (Gemini) + reasoningOutputTokens (Codex)
-    + reasoningTokens (OpenHands) across all models in modelUsage.
-    """
-    stats = _load_e2e_stats(workspace_root, trial)
-    if stats is None:
-        return None
-    try:
-        model_usage = stats.get("modelUsage", {})
-        if not model_usage:
-            return None
-        total = 0
-        for m in model_usage.values():
-            if not isinstance(m, dict):
-                continue
-            total += (
-                m.get("outputTokens", 0)
-                + m.get("thoughtsTokens", 0)
-                + m.get("reasoningOutputTokens", 0)
-                + m.get("reasoningTokens", 0)
-            )
-        return total if total > 0 else None
-    except Exception:
-        return None
-
-
-def load_e2e_trial_duration(workspace_root: Path, trial: str) -> Optional[int]:
-    """Load e2e trial duration from agent_stats.json.
-
-    Uses the sum of all session durations (duration_ms) which represents
-    actual agent working time, excluding gaps between sessions (e.g. resume delays).
-    Falls back to orchestrator.log wall-clock time if agent_stats.json is unavailable.
-    Returns duration in milliseconds or None if not available.
-    """
-    # Primary: read from agent_stats.json
-    stats_path = workspace_root / "e2e_trial" / trial / "agent_stats.json"
-    if stats_path.exists():
-        try:
-            with open(stats_path) as f:
-                stats = json.load(f)
-            duration_ms = stats.get("summary", {}).get("duration_ms")
-            if duration_ms and duration_ms > 0:
-                return duration_ms
-        except Exception:
-            pass
-
-    # Fallback: parse orchestrator.log wall-clock time
-    import re
-    from datetime import datetime
-
-    log_path = workspace_root / "e2e_trial" / trial / "orchestrator.log"
-    if not log_path.exists():
-        return None
-
-    try:
-        with open(log_path) as f:
-            content = f.read()
-
-        time_format = "%Y-%m-%d %H:%M:%S,%f"
-
-        start_pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}).*Agent started \(first run\)"
-        start_match = re.search(start_pattern, content)
-
-        end_pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}).*E2E Trial (?:COMPLETED|INCOMPLETE)"
-        end_matches = re.findall(end_pattern, content)
-
-        if not start_match or not end_matches:
-            return None
-
-        start_time = datetime.strptime(start_match.group(1), time_format)
-        end_time = datetime.strptime(end_matches[-1], time_format)
-
-        duration_ms = int((end_time - start_time).total_seconds() * 1000)
-        return duration_ms if duration_ms > 0 else None
-    except Exception:
-        return None
+# Trial-level effort caliber (cost / turns / output-tokens / duration) is defined
+# once in trial_metrics.py so the monitor here and downstream analysis stay in
+# lockstep — same functions, not hand-matched reimplementations.
+from harness.e2e.trial_metrics import (  # noqa: E402
+    _load_e2e_stats,
+    load_e2e_trial_cost,
+    load_e2e_trial_turns,
+    load_e2e_trial_output_tokens,
+    load_e2e_trial_duration,
+)
 
 
 def load_evaluation_result(result_path: Path, prefer_filtered: bool = True) -> Tuple[Optional[Dict], Optional[str]]:
@@ -499,6 +330,82 @@ def load_evaluation_result(result_path: Path, prefer_filtered: bool = True) -> T
         return None, None
 
 
+_BUILD_FAILURE_EVIDENCE = (
+    re.compile(r"\bCompilation failed\b", re.IGNORECASE),
+    re.compile(r"\bCOMPILATION ERROR\b"),
+    re.compile(r"\berror\[E\d+\]:"),
+    re.compile(r"^error: could not compile\b", re.MULTILINE),
+    re.compile(r"\[(?:build|setup) failed\]", re.IGNORECASE),
+    re.compile(r"\bcannot find symbol\b", re.IGNORECASE),
+)
+
+
+def is_zero_test_build_failure(result: Dict) -> bool:
+    """Whether a zero-test result contains deterministic build-failure evidence.
+
+    A submitted tree that cannot compile is a valid graded outcome: it receives
+    score 0 and remains in the denominator.  This is deliberately distinct from
+    an evaluator/runner failure, whose score is unknown and must be retried.
+    """
+    if not result or (result.get("test_summary") or {}).get("total", 0) != 0:
+        return False
+    if result.get("infrastructure_failure"):
+        return False
+    if result.get("scored_failure_reason") == "build-failure-with-zero-tests":
+        return True
+
+    patch_status = result.get("patch_status") or {}
+    if patch_status.get("compilation_success") is False:
+        return True
+
+    evidence = [
+        result.get("start_compile_error", ""),
+        result.get("end_compile_error", ""),
+        result.get("error_message", ""),
+    ]
+    build_policy = result.get("build_failure_policy") or {}
+    evidence.extend(build_policy.get("diagnostics") or [])
+    go_closure = ((result.get("evaluation_environment") or {}).get("go_module_closure") or {})
+    evidence.extend(
+        [
+            go_closure.get("production_compile_error", ""),
+            go_closure.get("test_graph_contract_error", ""),
+        ]
+    )
+    text = "\n".join(str(item) for item in evidence if item)
+    return any(pattern.search(text) for pattern in _BUILD_FAILURE_EVIDENCE)
+
+
+def is_infra_invalid(result: Dict) -> bool:
+    """Return whether a result is evaluation-invalid and requires retry.
+
+    The label is diagnostic only.  Aggregate scoring still retains the graded
+    milestone as a zero, so an infrastructure failure can never improve a
+    trial by disappearing from its denominator.  Zero-test build failures are
+    separately classified as ordinary scored failures.
+    """
+    if not result:
+        return False
+    if is_zero_test_build_failure(result):
+        return False
+    if result.get("infra_invalid") is True or result.get("eval_status") == "infra-invalid":
+        return True
+    # A planned-but-not-started milestone is not an evaluation attempt yet.
+    if result.get("eval_status") == "not_run":
+        return False
+    ts = result.get("test_summary", {})
+    if ts.get("total", 0) != 0:
+        return False
+    return any(
+        (ts.get(key, 0) or 0) > 0
+        for key in (
+            "fail_to_pass_required",
+            "none_to_pass_required",
+            "pass_to_pass_required",
+        )
+    )
+
+
 def check_compilation_failure(result: Dict) -> bool:
     """Check if the result indicates a compilation failure."""
     if not result:
@@ -527,6 +434,12 @@ def is_resolved(result: Dict) -> bool:
     """Check if a result is resolved/passed, handling both mstone and e2e formats."""
     if not result:
         return False
+    if is_infra_invalid(result):
+        return False
+    # A zero-test/compilation-failure result can be mislabeled by legacy
+    # filtered files.  Never let that stale label count as resolved.
+    if check_compilation_failure(result):
+        return False
     # mstone format uses "resolved"
     if "resolved" in result:
         return result.get("resolved", False)
@@ -543,6 +456,9 @@ def score_result(result: Dict) -> Tuple[int, int, int, int]:
     """
     if not result:
         return (-1, -1, -1, -1)
+
+    if is_infra_invalid(result):
+        return (-3, -3, -3, -3)
 
     # Check for compilation failure
     if check_compilation_failure(result):
@@ -597,6 +513,9 @@ def get_status(result: Dict) -> str:
     if result.get("eval_status") == "not_run":
         return "⏳ Not run"
 
+    if is_infra_invalid(result):
+        return "🚫 Infra-invalid"
+
     # Check for synthetic results (agent timeout/killed, no evaluation produced)
     if result.get("_synthetic"):
         failure_reason = result.get("_failure_reason", "unknown")
@@ -627,6 +546,9 @@ def get_failure_note(result: Dict, milestone_id: str = "") -> str:
     # Check for e2e not_run status first
     if result.get("eval_status") == "not_run":
         return "Not run"
+
+    if is_infra_invalid(result):
+        return result.get("infra_invalid_reason") or "Zero tests with required tests"
 
     # Check for synthetic results
     if result.get("_synthetic"):
@@ -856,9 +778,12 @@ def find_milestones_e2e(workspace_root: Path, trials: List[str]) -> List[str]:
         # Also check for milestone directories with evaluation_result.json
         if eval_dir.exists():
             for item in eval_dir.iterdir():
-                if item.is_dir() and item.name.startswith("M"):
-                    if (item / "evaluation_result.json").exists():
-                        milestones.add(_strip_retry_suffix(item.name))
+                # Milestone IDs are repository-defined and are not guaranteed to
+                # start with "M" (for example, ``maintenance_ui_ux``).  The
+                # result file is the authoritative marker here, matching the
+                # discovery rule used by ``is_milestone_dir``/``load_e2e_results``.
+                if item.is_dir() and (item / "evaluation_result.json").exists():
+                    milestones.add(_strip_retry_suffix(item.name))
 
     return sorted(milestones, key=sort_milestone_key)
 
@@ -894,14 +819,24 @@ def load_e2e_results(
     # Merge retry keys into base milestone IDs, keeping only the latest attempt.
     # e.g. if both "M001" (attempt 0) and "M001-retry1" (attempt 1) exist,
     # keep only the retry1 result under key "M001".
+    summary_attempts: Dict[str, int] = {}
+    summary_keys: Dict[str, str] = {}
     for raw_key, raw_val in raw_results.items():
         base_id = _strip_retry_suffix(raw_key)
         attempt = raw_val.get("attempt", _get_retry_attempt(raw_key))
-        if base_id not in results or attempt > results[base_id].get("attempt", 0):
-            results[base_id] = raw_val
+        try:
+            attempt = int(attempt)
+        except (TypeError, ValueError):
+            attempt = _get_retry_attempt(raw_key)
+        if base_id not in results or attempt > summary_attempts[base_id]:
+            results[base_id] = dict(raw_val)
+            summary_attempts[base_id] = attempt
+            summary_keys[base_id] = raw_key
 
-    # Then, check ALL evaluation_result files to supplement or correct results
-    # The evaluation_result.json 'resolved' field is the authoritative source
+    # Then, check all evaluation_result files.  Select one deterministic/latest
+    # attempt per base milestone before merging; iterating directories directly
+    # can otherwise let an older retry overwrite a newer one.
+    evaluation_candidates: Dict[str, List[Tuple[str, int, Dict, Optional[str]]]] = {}
     if eval_dir.exists():
         for item in eval_dir.iterdir():
             if is_milestone_dir(item):
@@ -913,27 +848,62 @@ def load_e2e_results(
                 eval_result, result_type = load_evaluation_result(result_file, prefer_filtered)
 
                 if eval_result:
-                    resolved = eval_result.get("resolved", False)
-                    correct_status = "passed" if resolved else "failed"
+                    evaluation_candidates.setdefault(base_id, []).append(
+                        (dir_name, _get_retry_attempt(dir_name), eval_result, result_type)
+                    )
 
-                    if base_id not in results:
-                        # Add new result from evaluation_result.json
-                        results[base_id] = {
-                            "eval_status": correct_status,
-                            "test_summary": eval_result.get("test_summary", {}),
-                            "_from_eval_result": True,
-                        }
-                        if result_type:
-                            result_type_counts[result_type] += 1
-                    else:
-                        # Correct eval_status if it doesn't match resolved field
-                        if results[base_id].get("eval_status") != correct_status:
-                            results[base_id]["eval_status"] = correct_status
-                            results[base_id]["_corrected"] = True
-                        # Replace test_summary with filtered data when available
-                        if result_type == "filtered":
-                            results[base_id]["test_summary"] = eval_result.get("test_summary", {})
-                            result_type_counts["filtered"] += 1
+    for base_id, candidates in evaluation_candidates.items():
+        # Prefer the exact summary key when it exists.  This handles summaries
+        # that store an explicit attempt number under an unsuffixed directory.
+        preferred_key = summary_keys.get(base_id)
+        matching = [candidate for candidate in candidates if candidate[0] == preferred_key]
+        candidate = matching[0] if matching else max(candidates, key=lambda value: value[1])
+        _dir_name, attempt, eval_result, result_type = candidate
+
+        # Never replace a known newer summary attempt with an older result file.
+        if base_id in summary_attempts and not matching and attempt < summary_attempts[base_id]:
+            continue
+
+        resolved = is_resolved(eval_result)
+        infra_invalid = is_infra_invalid(eval_result)
+        correct_status = "infra-invalid" if infra_invalid else ("passed" if resolved else "failed")
+
+        had_summary = base_id in results
+        merged = dict(results.get(base_id, {}))
+        # The per-attempt evaluation JSON is authoritative for every scoring
+        # field.  Keeping only summary.test_summary allowed stale tests_status,
+        # resolved, and failure metadata to leak into otherwise fresh replays.
+        merged.update(eval_result)
+        merged["eval_status"] = correct_status
+        merged["infra_invalid"] = infra_invalid
+        if infra_invalid:
+            merged["infra_invalid_reason"] = (
+                eval_result.get("infra_invalid_reason")
+                or "zero-tests-with-required-tests"
+            )
+        else:
+            merged["infra_invalid_reason"] = ""
+        merged["_from_eval_result"] = True
+        if had_summary:
+            merged["_corrected"] = True
+        results[base_id] = merged
+        if result_type:
+            result_type_counts[result_type] += 1
+
+    # Defend summary-only and legacy records too: consumers should never count
+    # an empty evaluation as passed, even before its source JSON is repaired.
+    for result in results.values():
+        if is_zero_test_build_failure(result):
+            result["infra_invalid"] = False
+            result["infra_invalid_reason"] = ""
+            result["scored_failure_reason"] = "build-failure-with-zero-tests"
+            result["eval_status"] = "failed"
+        elif is_infra_invalid(result):
+            result["infra_invalid"] = True
+            result.setdefault("infra_invalid_reason", "zero-tests-with-required-tests")
+            result["eval_status"] = "infra-invalid"
+        elif check_compilation_failure(result):
+            result["eval_status"] = "failed"
 
     return results, result_type_counts
 
@@ -1214,11 +1184,19 @@ def compute_repo_summary(
     sum_score_reliable = 0.0
     sum_precision = 0.0
     sum_recall = 0.0
+    infra_invalid_count = 0
+    scoreable_count = 0
 
     for milestone, data in results.items():
         result = data["result"]
         if milestone not in non_graded:
             graded_count += 1
+            infra_invalid = is_infra_invalid(result)
+            if infra_invalid:
+                infra_invalid_count += 1
+            # "evaluated" means an evaluator attempt produced a result.  Keep
+            # infra-invalid as a separate diagnostic instead of treating that
+            # completed attempt as if it had never been evaluated.
             if result.get("eval_status") != "not_run":
                 evaluated_count += 1
             if is_resolved(result):
@@ -1229,6 +1207,7 @@ def compute_repo_summary(
             prec, rec = calculate_precision_recall(result)
             if s1000 is not None:
                 sum_score_1000 += s1000
+                scoreable_count += 1
             if sfull is not None:
                 sum_score_full += sfull
             if srel is not None:
@@ -1267,6 +1246,8 @@ def compute_repo_summary(
     return {
         "error": False,
         "graded": graded_count,
+        "scoreable": scoreable_count,
+        "infra_invalid": infra_invalid_count,
         "evaluated": evaluated_count,
         "resolved": resolved_count,
         "resolve_pct": resolved_count * 100 / graded_count if graded_count > 0 else 0.0,
@@ -1301,8 +1282,9 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = "",
     done_strs = {}
     for s in summaries:
         if not s.get("error"):
-            resolve_strs[s["repo"]] = f"{s['resolve_pct']:.2f}% ({s['resolved']}/{s['graded']})"
-            done_strs[s["repo"]] = f"{s['evaluated']}/{s['graded']}"
+            denominator = s["graded"]
+            resolve_strs[s["repo"]] = f"{s['resolve_pct']:.2f}% ({s['resolved']}/{denominator})"
+            done_strs[s["repo"]] = f"{s['evaluated']}/{denominator}"
         else:
             resolve_strs[s["repo"]] = "-"
             done_strs[s["repo"]] = "-"
@@ -1773,10 +1755,13 @@ def print_detail_table(
     n_evaluated = 0
     n_resolved = 0
     total_score = 0.0
+    n_infra_invalid = 0
     for m in sorted_milestones:
         if m in non_graded:
             continue
         r = results[m]["result"]
+        if is_infra_invalid(r):
+            n_infra_invalid += 1
         if r.get("eval_status") != "not_run":
             n_evaluated += 1
         if is_resolved(r):
@@ -1785,8 +1770,11 @@ def print_detail_table(
         if s is not None:
             total_score += s
 
+    # Every graded milestone stays in the denominator.  An infra-invalid result
+    # is shown separately for diagnosis but contributes zero to this total.
     avg_score_str = f"{total_score / n_graded * 100:.1f}%" if n_graded > 0 else "--"
-    print(f"\n\U0001f4cb {repo_name} ({n_evaluated}/{n_graded} evaluated, score: {avg_score_str})")
+    invalid_suffix = f", {n_infra_invalid} infra-invalid" if n_infra_invalid else ""
+    print(f"\n\U0001f4cb {repo_name} ({n_evaluated}/{n_graded} evaluated{invalid_suffix}, score: {avg_score_str})")
     print()
 
     # Column widths
@@ -1847,6 +1835,8 @@ def print_detail_table(
                 score_str = f"{s * 100:.1f}%" if s is not None else "--"
                 if is_resolved(result):
                     status = "\033[32m✅ resolved\033[0m"
+                elif is_infra_invalid(result):
+                    status = "\033[33m🚫 infra-invalid\033[0m"
                 elif check_compilation_failure(result):
                     status = "\033[31m💥 compile\033[0m"
                 else:
@@ -1913,10 +1903,14 @@ def calculate_score(result: Dict) -> Optional[float]:
     Uses ratio-based P2P penalty instead of absolute numbers, which is fairer for
     projects with large test suites.
 
-    Returns None if the result is invalid, 0.0 if compilation failure.
+    Returns None only when no result exists.  Infrastructure-invalid and build
+    failures both score 0.0 and remain in the graded denominator.
     """
     if not result:
         return None
+
+    if is_infra_invalid(result):
+        return 0.0
 
     if check_compilation_failure(result):
         return 0.0
@@ -1958,10 +1952,14 @@ def calculate_score_v2(result: Dict) -> Optional[float]:
     - Caps P2P penalty denominator at 1000 to avoid over-penalizing large test suites
     - P2P_missed = P2P_required - P2P_achieved
 
-    Returns None if the result is invalid, 0.0 if compilation failure.
+    Returns None only when no result exists.  Infrastructure-invalid and build
+    failures both score 0.0 and remain in the graded denominator.
     """
     if not result:
         return None
+
+    if is_infra_invalid(result):
+        return 0.0
 
     if check_compilation_failure(result):
         return 0.0
@@ -2009,10 +2007,14 @@ def calculate_score_reliable(result: Dict) -> Optional[float]:
           Precision = (N_fixed + 1) / (N_fixed + N_broken + 1)
       - If Precision == Recall == 0: score = 0
 
-    Returns None if result is invalid, 0.0 if compilation failure.
+    Returns None only when no result exists.  Infrastructure-invalid and build
+    failures both score 0.0 and remain in the graded denominator.
     """
     if not result:
         return None
+
+    if is_infra_invalid(result):
+        return 0.0
 
     if check_compilation_failure(result):
         return 0.0
@@ -2047,10 +2049,14 @@ def calculate_score_reliable(result: Dict) -> Optional[float]:
 def calculate_precision_recall(result: Dict) -> Tuple[Optional[float], Optional[float]]:
     """Calculate precision and recall components of score_reliable.
 
-    Returns (precision, recall) tuple, or (None, None) if result is invalid.
+    Returns (precision, recall), with infrastructure-invalid/build failures as
+    (0, 0).  Only an absent result returns (None, None).
     """
     if not result:
         return None, None
+
+    if is_infra_invalid(result):
+        return 0.0, 0.0
 
     if check_compilation_failure(result):
         return 0.0, 0.0
@@ -2135,6 +2141,7 @@ def print_comparison_table(
     sum_score_v2 = 0.0
     sum_score_reliable = 0.0
     score_count = 0  # Count of milestones with valid scores
+    infra_invalid_count = 0
     agent_framework = None
     model = None
 
@@ -2158,6 +2165,8 @@ def print_comparison_table(
         # Only count graded milestones for pass rate and score
         if milestone not in non_graded_milestones:
             graded_count += 1
+            if is_infra_invalid(result):
+                infra_invalid_count += 1
             if is_resolved(result):
                 resolved_count += 1
             # Sum scores for graded milestones only
@@ -2207,7 +2216,8 @@ def print_comparison_table(
 
     # Print summary at top (pass rate based on graded milestones only)
     non_graded_count = len(sorted_milestones) - graded_count
-    pass_rate = resolved_count * 100 / graded_count if graded_count > 0 else 0.0
+    resolve_denominator = graded_count
+    pass_rate = resolved_count * 100 / resolve_denominator if resolve_denominator > 0 else 0.0
 
     # Use total_duration/total_turns if provided (e2e), otherwise use summed values (mstone)
     display_duration = total_duration if total_duration is not None else sum_duration
@@ -2218,14 +2228,22 @@ def print_comparison_table(
         f" | Duration: {format_duration(display_duration)}" if display_duration and display_duration > 0 else ""
     )
     turns_suffix = f" | Turns: {display_turns}" if display_turns and display_turns > 0 else ""
+    # Divide by the complete graded set, never by successful evaluator output.
+    # None/infra-invalid/build-failure therefore cannot shrink the denominator.
     avg_score = sum_score / graded_count if graded_count > 0 else 0.0
     avg_score_v2 = sum_score_v2 / graded_count if graded_count > 0 else 0.0
     avg_score_reliable = sum_score_reliable / graded_count if graded_count > 0 else 0.0
 
+    invalid_suffix = (
+        f"; {infra_invalid_count} infra-invalid counted as 0"
+        if infra_invalid_count
+        else ""
+    )
+
     if non_graded_count > 0:
-        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}, excl. {non_graded_count} non-graded) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
+        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{resolve_denominator}, excl. {non_graded_count} non-graded{invalid_suffix}) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
     else:
-        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
+        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{resolve_denominator}{invalid_suffix}) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
 
     # Print summary with prominent border
     summary_width = display_width(summary_text) + 4
@@ -2740,11 +2758,14 @@ def main():
         sum_score_full = 0.0
         sum_score_reliable = 0.0
         score_count = 0
+        infra_invalid_count = 0
 
         for milestone, data in results.items():
             result = data["result"]
             if milestone not in non_graded_milestones:
                 graded_count += 1
+                if is_infra_invalid(result):
+                    infra_invalid_count += 1
                 if is_resolved(result):
                     resolved_count += 1
                 s1000 = calculate_score_v2(result)
@@ -2765,12 +2786,15 @@ def main():
             load_e2e_trial_submission_counts(args.workspace_root, trial) if args.trial_type == "e2e" else (0, 0)
         )
 
+        resolve_denominator = graded_count
         return {
             "trial": trial,
             "error": False,
             "graded": graded_count,
+            "scoreable": score_count,
+            "infra_invalid": infra_invalid_count,
             "resolved": resolved_count,
-            "resolve_pct": resolved_count * 100 / graded_count if graded_count > 0 else 0.0,
+            "resolve_pct": resolved_count * 100 / resolve_denominator if resolve_denominator > 0 else 0.0,
             "score_1000": sum_score_1000 / graded_count * 100 if graded_count > 0 else 0.0,
             "score_full": sum_score_full / graded_count * 100 if graded_count > 0 else 0.0,
             "score_reliable": sum_score_reliable / graded_count * 100 if graded_count > 0 else 0.0,

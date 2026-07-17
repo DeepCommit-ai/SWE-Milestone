@@ -1,8 +1,11 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_glm-5.1
 agent: claude-code
 model: glm-5.1
 timeout: 18000
-default_haiku_model: glm-5.1
+default_agent_model: glm-5.1
+auto_compact_window: 200000
 
 
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

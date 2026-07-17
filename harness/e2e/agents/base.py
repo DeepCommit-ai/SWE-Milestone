@@ -1,9 +1,31 @@
 """Abstract base class for agent frameworks."""
 
 import os
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Type
+
+from harness.e2e.quarantine import GO_OFFLINE_FILE_PROXY, GO_OFFLINE_SHELL_ENV
+
+_AGENT_CLI_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def validate_agent_cli_version(value: Optional[str], *, agent_label: str) -> Optional[str]:
+    """Validate a trial-config ``agent_version`` selector for npm-installed CLIs.
+
+    Accepts an exact semantic version (a reproducibility pin) or ``latest``
+    (explicitly re-resolve the newest release at container setup time).
+    """
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "latest" or _AGENT_CLI_VERSION_RE.fullmatch(value):
+        return value
+    raise ValueError(
+        f"{agent_label} agent_version must be a semantic version such as "
+        "'1.2.3', or 'latest'"
+    )
 
 
 class AgentFramework(ABC):
@@ -96,6 +118,50 @@ class AgentFramework(ABC):
         """
         return []
 
+    @staticmethod
+    def _validate_docker_env_args(args: List[str], *, source: str) -> List[str]:
+        """Validate the ``-e KEY=value`` representation used by Docker."""
+        if len(args) % 2:
+            raise ValueError(f"{source} returned an odd number of Docker env arguments")
+        values: List[str] = []
+        for index in range(0, len(args), 2):
+            flag, value = args[index:index + 2]
+            if flag != "-e" or not isinstance(value, str):
+                raise ValueError(
+                    f"{source} returned malformed Docker env arguments at index {index}"
+                )
+            key = value.split("=", 1)[0]
+            if not key:
+                raise ValueError(f"{source} returned an empty Docker environment key")
+            values.append(value)
+        return values
+
+    def get_effective_container_env_vars(self) -> List[str]:
+        """Return framework env with the shared quarantine contract authoritative.
+
+        Existing adapters historically appended ``get_quarantine_env_vars``
+        themselves.  Core launch paths call this method instead: active shared
+        keys are removed from the adapter result and appended exactly once.
+        Consequently a future adapter cannot accidentally omit or override the
+        hermetic Go/Maven/etc. environment merely by forgetting that convention.
+        """
+        framework_values = self._validate_docker_env_args(
+            self.get_container_env_vars(),
+            source=f"{self.FRAMEWORK_NAME}.get_container_env_vars",
+        )
+        quarantine_values = self._validate_docker_env_args(
+            self.get_quarantine_env_vars(),
+            source="get_quarantine_env_vars",
+        )
+        managed = {value.split("=", 1)[0] for value in quarantine_values}
+        effective = [
+            value
+            for value in framework_values
+            if value.split("=", 1)[0] not in managed
+        ]
+        effective.extend(quarantine_values)
+        return [item for value in effective for item in ("-e", value)]
+
     def get_quarantine_mounts(self) -> List[str]:
         """Quarantine: return extra Docker volume mounts for offline operation.
 
@@ -111,29 +177,48 @@ class AgentFramework(ABC):
     def get_quarantine_env_vars(self) -> List[str]:
         """Quarantine: force the repo's package manager(s) offline.
 
-        Belt to the EVOCLAW_DENY_* firewall suspenders, shared across agents.
+        Belt to the SWE_MILESTONE_DENY_* firewall suspenders, shared across agents.
         pip reads the in-image /wheelhouse (baked by the closure builder) when
-        EVOCLAW_PIP_OFFLINE is set; cargo/go/maven/npm run offline against
-        their own image-baked caches. GOPROXY=off is additionally written into
-        /etc/environment + .bashrc by container_setup.lock_network (shell
-        profiles would override a bare docker -e). See docs/quarantine.md.
+        SWE_MILESTONE_PIP_OFFLINE is set; cargo/go/maven/npm run offline against
+        their own image-baked caches. The local-only Go contract is also sealed
+        in a root-owned BASH_ENV and written into the container profiles, since
+        login shells can override a bare docker ``-e``. See docs/quarantine.md.
         """
         env: List[str] = []
-        if os.environ.get("EVOCLAW_PIP_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_PIP_OFFLINE"):
             env += ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
-        if os.environ.get("EVOCLAW_CARGO_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_CARGO_OFFLINE"):
             env += ["-e", "CARGO_NET_OFFLINE=true"]
-        if os.environ.get("EVOCLAW_GO_OFFLINE"):
-            env += ["-e", "GOPROXY=off"]
-        if os.environ.get("EVOCLAW_MAVEN_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+            expected_go = os.environ.get("SWE_MILESTONE_GO_TOOLCHAIN", "").removeprefix("go")
+            go_path = (
+                "/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            )
+            env += [
+                "-e", f"GOPROXY={GO_OFFLINE_FILE_PROXY}",
+                "-e", "GONOPROXY=none",
+                "-e", "GOSUMDB=off",
+                "-e", "GOTOOLCHAIN=local",
+                "-e", "GOFLAGS=-buildvcs=false",
+                "-e", "GOENV=/home/fakeroot/.cache/evoclaw-goenv/env",
+                "-e", f"BASH_ENV={GO_OFFLINE_SHELL_ENV}",
+                "-e", "GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache",
+                "-e", "GOCACHE=/home/fakeroot/.cache/go-build",
+                "-e", "GOBIN=/home/fakeroot/go/bin",
+                "-e", f"PATH={go_path}",
+            ]
+            if expected_go:
+                env += ["-e", f"GOLANG_VERSION={expected_go}"]
+        if os.environ.get("SWE_MILESTONE_MAVEN_OFFLINE"):
             margs = "-o"
-            repo_local = os.environ.get("EVOCLAW_MAVEN_REPO_LOCAL")
+            repo_local = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL")
             if repo_local:
                 # The image's populated cache lives under root's home; the
                 # agent runs as fakeroot, whose own ~/.m2 starts empty.
                 margs += f" -Dmaven.repo.local={repo_local}"
             env += ["-e", f"MAVEN_ARGS={margs}"]
-        if os.environ.get("EVOCLAW_NPM_OFFLINE"):
+        if os.environ.get("SWE_MILESTONE_NPM_OFFLINE"):
             env += ["-e", "npm_config_offline=true"]
         return env
 
@@ -146,6 +231,28 @@ class AgentFramework(ABC):
         Override in subclasses that support reasoning effort.
         """
         return None
+
+    def get_requested_version(self) -> Optional[str]:
+        """Return the requested agent CLI version, if this framework supports pinning."""
+        return None
+
+    def get_version_command(self) -> Optional[List[str]]:
+        """Return the in-container command used to report the agent CLI version."""
+        return None
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        """Extract a normalized version from the agent CLI's version output."""
+        value = output.strip()
+        return value or None
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        """Return whether an observed version satisfies the requested version.
+
+        Frameworks with version channels or other non-exact selectors should
+        override this method. The default only accepts an exact match.
+        """
+        requested = self.get_requested_version()
+        return requested is None or actual_version == requested
 
     def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
         """Extract the latest session ID directly from agent files inside the container.

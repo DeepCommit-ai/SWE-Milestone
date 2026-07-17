@@ -39,6 +39,17 @@ verify_fetch_urls:
 closure:
   cache_paths:
     - /root/.m2/repository
+  # Build plugins can choose implementation artifacts from a module POM at
+  # execution time; dependency:go-offline on the root reactor is not a complete
+  # proof. Warm and then offline-probe both authorities. In particular, the BOM
+  # selects Palantir Java Format 2.38.0, which the old root-only `-N` probe missed.
+  maven_plugin_probes:
+    - pom: pom.xml
+      goal: spotless:check
+      timeout_seconds: 180
+    - pom: dubbo-dependencies-bom/pom.xml
+      goal: spotless:check
+      timeout_seconds: 180
   # Offline closure gate: compile the milestone B-source against the unioned `.m2`
   # with no network. The lint plugins (spotless/checkstyle/rat) are NOT part of the
   # dependency closure — a mid-migration milestone checkpoint legitimately carries

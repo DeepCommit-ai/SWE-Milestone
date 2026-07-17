@@ -4,7 +4,6 @@ Test code region detection for Rust files.
 Uses ast-grep for accurate parsing to detect:
 - #[cfg(test)] blocks (mod, fn, impl, struct, enum, trait, const, static, type, use)
 - #[cfg(test)] mod tests; (declarative/external modules)
-- #[cfg_attr(test, ...)] items
 - #![cfg(test)] file-level test-only modules
 - #[test], #[bench] and other test framework attributes
 - Doc tests (code blocks in /// or //! comments)
@@ -15,8 +14,69 @@ import re
 import sys
 import json
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+class RustTestDetectionError(RuntimeError):
+    """Raised when Rust test/source separation cannot be proven safely."""
+
+
+def _run_ast_grep_json(
+    command: List[str],
+    *,
+    purpose: str,
+    strict: bool = False,
+) -> List[Dict[str, Any]]:
+    """Run ast-grep and decode its JSON array.
+
+    Empty successful output means "no matches".  Tool failures, timeouts, and
+    malformed output are different: evaluation callers use ``strict=True`` so
+    those conditions cannot silently turn into "there are no tests".
+    """
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if strict:
+            raise RustTestDetectionError(f"{purpose}: ast-grep failed: {exc}") from exc
+        return []
+
+    # ``ast-grep run --json`` uses exit 1 plus the valid JSON array ``[]`` for
+    # a normal no-match result.  Do not confuse that with a tool failure.
+    if (
+        result.returncode == 1
+        and result.stdout.strip() == "[]"
+        and not result.stderr.strip()
+    ):
+        return []
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no diagnostic").strip()
+        if strict:
+            raise RustTestDetectionError(
+                f"{purpose}: ast-grep exited {result.returncode}: {detail}"
+            )
+        return []
+    if not result.stdout.strip():
+        return []
+    try:
+        matches = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise RustTestDetectionError(
+                f"{purpose}: ast-grep returned malformed JSON: {exc}"
+            ) from exc
+        return []
+    if not isinstance(matches, list) or not all(isinstance(match, dict) for match in matches):
+        if strict:
+            raise RustTestDetectionError(f"{purpose}: ast-grep JSON is not an object array")
+        return []
+    return matches
 
 
 # ============================================================
@@ -49,7 +109,11 @@ def _find_module_end_with_brace_counting(lines: List[str], start_idx: int) -> Op
 
 
 def _get_item_ranges_from_ast_grep(
-    file_path: str, pattern: str, filter_fn: Optional[callable] = None
+    file_path: str,
+    pattern: str,
+    filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    *,
+    strict: bool = False,
 ) -> List[Tuple[int, int, str]]:
     """Use ast-grep to get precise item ranges.
 
@@ -64,36 +128,86 @@ def _get_item_ranges_from_ast_grep(
     Returns:
         List of (start_line, end_line, matched_text) tuples (1-indexed)
     """
-    try:
-        result = subprocess.run(
-            ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-
-        matches = json.loads(result.stdout)
-        ranges = []
-
-        for match in matches:
-            if filter_fn and not filter_fn(match):
-                continue
-
-            start_line = match["range"]["start"]["line"] + 1  # 0-indexed to 1-indexed
+    matches = _run_ast_grep_json(
+        ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
+        purpose=f"match Rust pattern {pattern!r} in {file_path}",
+        strict=strict,
+    )
+    ranges = []
+    for match in matches:
+        if filter_fn and not filter_fn(match):
+            continue
+        try:
+            start_line = match["range"]["start"]["line"] + 1
             end_line = match["range"]["end"]["line"] + 1
-            text = match.get("text", "")
+        except (KeyError, TypeError) as exc:
+            if strict:
+                raise RustTestDetectionError(
+                    f"match Rust pattern {pattern!r}: missing range metadata"
+                ) from exc
+            continue
+        ranges.append((start_line, end_line, match.get("text", "")))
+    return ranges
 
-            ranges.append((start_line, end_line, text))
-
-        return ranges
-
-    except Exception:
-        return []
 
 
-def _get_block_items_with_precise_ranges(file_path: str) -> Dict[str, List[Tuple[int, int]]]:
+def _get_kind_ranges_by_kind(
+    file_path: str,
+    kinds: List[str],
+    *,
+    strict: bool = False,
+) -> Dict[str, List[Tuple[int, int, str]]]:
+    """Find several node kinds with one ast-grep parse/scan."""
+    unique_kinds = list(dict.fromkeys(kinds))
+    rule_ids = {f"evoclaw-kind-{index}": kind for index, kind in enumerate(unique_kinds)}
+    rules = []
+    for rule_id, kind in rule_ids.items():
+        rules.append(
+            f"""id: {rule_id}
+language: rust
+rule:
+  kind: {kind}
+""".rstrip()
+        )
+    matches = _run_ast_grep_json(
+        [
+            "ast-grep",
+            "scan",
+            "--inline-rules",
+            "\n---\n".join(rules),
+            "--json",
+            file_path,
+        ],
+        purpose=f"find Rust node kinds {unique_kinds!r} in {file_path}",
+        strict=strict,
+    )
+    ranges_by_kind: Dict[str, List[Tuple[int, int, str]]] = {
+        kind: [] for kind in unique_kinds
+    }
+    for match in matches:
+        kind = rule_ids.get(match.get("ruleId", ""))
+        if kind is None:
+            if strict:
+                raise RustTestDetectionError(
+                    f"find Rust node kinds: unexpected rule id {match.get('ruleId')!r}"
+                )
+            continue
+        try:
+            start_line = match["range"]["start"]["line"] + 1
+            end_line = match["range"]["end"]["line"] + 1
+        except (KeyError, TypeError) as exc:
+            if strict:
+                raise RustTestDetectionError(
+                    f"find Rust {kind} nodes: missing range metadata"
+                ) from exc
+            continue
+        ranges_by_kind[kind].append((start_line, end_line, match.get("text", "")))
+    return ranges_by_kind
+
+
+def _get_block_items_with_precise_ranges(
+    file_path: str, *, strict: bool = False
+) -> Dict[str, List[Tuple[int, int]]]:
     """Get precise ranges for block items (mod, impl, fn, trait, struct, enum).
 
     Uses ast-grep for accurate parsing that handles strings/comments correctly.
@@ -108,43 +222,79 @@ def _get_block_items_with_precise_ranges(file_path: str) -> Dict[str, List[Tuple
         "trait": [],
         "struct": [],
         "enum": [],
+        "use": [],
+        "const": [],
+        "static": [],
+        "type": [],
+        "macro_definition": [],
+        "macro_invocation": [],
+        "extern_crate": [],
+        "union": [],
+        "foreign_mod": [],
+        "field_initializer": [],
+        "field_declaration": [],
+        "enum_variant": [],
+        "match_arm": [],
+        "let_declaration": [],
+        "expression_statement": [],
+        "block": [],
     }
 
-    # Pattern for each item type
-    # Note: fn pattern uses $$$RET to match optional return type (e.g., "-> Type")
-    patterns = {
-        "mod": "mod $NAME { $$$ }",
-        "impl": "impl $TYPE { $$$ }",
-        "fn": "fn $NAME($$$) $$$RET { $$$ }",
-        "trait": "trait $NAME { $$$ }",
-        "struct": "struct $NAME { $$$ }",
-        "enum": "enum $NAME { $$$ }",
+    # Node kinds cover modifiers that pattern snippets easily miss.  In
+    # particular, ``fn $NAME(...)`` does not match ``async fn`` and the old
+    # fuzzy lookup could then consume the next production function.
+    kinds = {
+        "mod": "mod_item",
+        "impl": "impl_item",
+        "fn": "function_item",
+        "trait": "trait_item",
+        "struct": "struct_item",
+        "enum": "enum_item",
+        "use": "use_declaration",
+        "const": "const_item",
+        "static": "static_item",
+        "type": "type_item",
+        "macro_definition": "macro_definition",
+        "macro_invocation": "macro_invocation",
+        "extern_crate": "extern_crate_declaration",
+        "union": "union_item",
+        "foreign_mod": "foreign_mod_item",
+        "field_initializer": "field_initializer",
+        "field_declaration": "field_declaration",
+        "enum_variant": "enum_variant",
+        "match_arm": "match_arm",
+        "let_declaration": "let_declaration",
+        "expression_statement": "expression_statement",
+        "block": "block",
     }
 
-    for item_type, pattern in patterns.items():
-        ranges = _get_item_ranges_from_ast_grep(file_path, pattern)
-        items[item_type] = [(start, end) for start, end, _ in ranges]
+    ranges_by_kind = _get_kind_ranges_by_kind(
+        file_path, list(kinds.values()), strict=strict
+    )
+    for item_type, kind in kinds.items():
+        items[item_type] = [
+            (start, end) for start, end, _ in ranges_by_kind[kind]
+        ]
 
     return items
 
 
 def _find_item_end_from_ranges(
-    item_line: int, item_ranges: List[Tuple[int, int]], tolerance: int = 20
+    item_line: int, item_ranges: List[Tuple[int, int]]
 ) -> Optional[int]:
     """Find the end line for an item given its start line using pre-computed ranges.
 
     Args:
         item_line: The line number where the item starts (1-indexed)
         item_ranges: List of (start_line, end_line) tuples from ast-grep
-        tolerance: How many lines ahead to search for the item
-
     Returns:
         The end line number, or None if not found
     """
     for start, end in item_ranges:
-        # Allow the item to start at item_line or a few lines after
-        # (to account for attributes)
-        if item_line <= start <= item_line + tolerance:
+        # ``item_line`` is already the actual item line after attributes were
+        # skipped.  A fuzzy forward search can select an unrelated production
+        # item when ast-grep did not recognize the intended declaration.
+        if start == item_line:
             return end
     return None
 
@@ -183,6 +333,47 @@ def _find_block_end(
     return None
 
 
+def _find_statement_end(
+    item_line: int,
+    item_type: str,
+    item_ranges: Dict[str, List[Tuple[int, int]]],
+    lines: List[str],
+    *,
+    fallback: bool,
+) -> Optional[int]:
+    """Find an exact semicolon item boundary, with an opt-in legacy fallback."""
+    end_line = _find_item_end_from_ranges(item_line + 1, item_ranges.get(item_type, []))
+    if end_line is not None:
+        return end_line
+    if fallback:
+        return _find_single_statement_end(lines, item_line)
+    return None
+
+
+def _find_attributed_nested_node_end(
+    attr_line: int,
+    item_line: int,
+    item_ranges: Dict[str, List[Tuple[int, int]]],
+) -> Optional[int]:
+    """Find cfg-attributed fields/variants/statements by exact AST start."""
+    candidates = []
+    for item_type in (
+        "field_initializer",
+        "field_declaration",
+        "enum_variant",
+        "match_arm",
+        "let_declaration",
+        "expression_statement",
+        "block",
+    ):
+        for start, end in item_ranges[item_type]:
+            # Some Rust nodes include their outer attribute in the node range
+            # (field_initializer), while top-level items begin after it.
+            if start in (attr_line + 1, item_line + 1):
+                candidates.append((end - start, end))
+    return min(candidates)[1] if candidates else None
+
+
 # ============================================================
 # Helper functions for parsing Rust syntax
 # ============================================================
@@ -199,6 +390,84 @@ def _strip_visibility(line: str) -> str:
     return re.sub(vis_pattern, "", stripped)
 
 
+def _scan_attribute_end(
+    lines: List[str], start_line: int, start_column: int
+) -> Optional[Tuple[int, int]]:
+    """Find the matching outer ``]`` for one Rust attribute.
+
+    Attribute arguments may contain nested square brackets, for example
+    ``#[case(&["a", "b"])]``.  Looking for the first ``]`` mistakes the array
+    terminator for the attribute terminator and makes the following function
+    appear malformed.  Scan the bracket nesting while ignoring quoted strings
+    and block/line comments.  The returned column is immediately after the
+    closing bracket.
+    """
+    line = lines[start_line]
+    attr_start = line.find("#[", start_column)
+    inner_start = line.find("#![", start_column)
+    candidates = [value for value in (attr_start, inner_start) if value >= 0]
+    if not candidates:
+        return None
+    marker = min(candidates)
+    bracket = line.find("[", marker)
+    depth = 0
+    quote: Optional[str] = None
+    escaped = False
+    in_block_comment = False
+
+    for line_index in range(start_line, len(lines)):
+        current = lines[line_index]
+        column = bracket if line_index == start_line else 0
+        while column < len(current):
+            char = current[column]
+            following = current[column + 1] if column + 1 < len(current) else ""
+
+            if in_block_comment:
+                if char == "*" and following == "/":
+                    in_block_comment = False
+                    column += 2
+                else:
+                    column += 1
+                continue
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                column += 1
+                continue
+            if char == "/" and following == "/":
+                break
+            if char == "/" and following == "*":
+                in_block_comment = True
+                column += 2
+                continue
+            if char == '"':
+                quote = char
+                column += 1
+                continue
+            # Treat a compact character literal as quoted, without confusing a
+            # Rust lifetime such as ``'a`` for an unterminated string.
+            if char == "'":
+                char_end = column + 2
+                if following == "\\":
+                    char_end += 1
+                if char_end < len(current) and current[char_end] == "'":
+                    quote = char
+                    column += 1
+                    continue
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    return line_index, column + 1
+            column += 1
+    return None
+
+
 def _strip_leading_attrs_from_line(line: str) -> Tuple[str, bool]:
     """Strip leading attributes from a single line.
 
@@ -211,10 +480,10 @@ def _strip_leading_attrs_from_line(line: str) -> Tuple[str, bool]:
         while i < n and line[i].isspace():
             i += 1
         if line.startswith("#[", i) or line.startswith("#![", i):
-            close = line.find("]", i + 2)
-            if close == -1:
+            end = _scan_attribute_end([line], 0, i)
+            if end is None:
                 return "", False
-            i = close + 1
+            _, i = end
             continue
         break
     return line[i:].lstrip(), True
@@ -228,39 +497,50 @@ def _strip_leading_attrs(line: str) -> str:
     return remainder
 
 
-def _skip_to_item(lines: List[str], start_idx: int, max_lines: int = 20) -> int:
+def _skip_to_item(lines: List[str], start_idx: int) -> int:
     """Skip empty lines and attribute lines to find the actual item.
 
     Returns the index of the first non-attribute, non-empty line.
     """
     j = start_idx
-    in_attr_block = False
-    while j < len(lines) and j < start_idx + max_lines:
+    in_comment_block = False
+    while j < len(lines):
         line = lines[j]
         stripped = line.strip()
+        if in_comment_block:
+            if "*/" in line:
+                in_comment_block = False
+            j += 1
+            continue
         if not stripped:
             j += 1
             continue
-        if in_attr_block:
-            if "]" in line:
-                # Attribute block ended; check for inline item after closing bracket
-                remainder, complete = _strip_leading_attrs_from_line(line.split("]", 1)[1])
-                remainder = remainder.lstrip()
-                if complete and remainder and not remainder.startswith(("//", "/*")):
-                    return j
-                in_attr_block = False
-            j += 1
-            continue
         if stripped.startswith("#[") or stripped.startswith("#!["):
-            remainder, complete = _strip_leading_attrs_from_line(line)
+            end = _scan_attribute_end(lines, j, 0)
+            if end is None:
+                return len(lines)
+            end_line, end_column = end
+            remainder, complete = _strip_leading_attrs_from_line(
+                lines[end_line][end_column:]
+            )
             remainder = remainder.lstrip()
             if complete and remainder and not remainder.startswith(("//", "/*")):
-                return j
-            if not complete:
-                in_attr_block = True
+                return end_line
+            j = end_line + 1
+            continue
+        if stripped.startswith("//"):
             j += 1
             continue
-        if stripped.startswith("///") or stripped.startswith("//!"):
+        if stripped.startswith("/*"):
+            close = stripped.find("*/", 2)
+            if close == -1:
+                in_comment_block = True
+                j += 1
+                continue
+            if stripped[close + 2:].strip():
+                # A closed /* ... */ sharing the line with the item it
+                # precedes: this IS the item line, don't skip past it.
+                break
             j += 1
             continue
         # Found the item
@@ -274,13 +554,11 @@ def _is_fn_line(line: str) -> bool:
     if not stripped:
         return False
     stripped = _strip_visibility(stripped)
-    return (
-        stripped.startswith("fn ")
-        or stripped.startswith("async fn ")
-        or stripped.startswith("const fn ")
-        or stripped.startswith("unsafe fn ")
-        or stripped.startswith("extern fn ")
-        or stripped.startswith("async unsafe fn ")
+    return bool(
+        re.match(
+            r'^(?:(?:async|const|unsafe|default)\s+|extern(?:\s+"[^"]*")?\s+)*fn\s+',
+            stripped,
+        )
     )
 
 
@@ -299,7 +577,9 @@ def _find_first_attr_line(lines: List[str], attr_line: int) -> int:
     """Find the first attribute line by looking backwards.
 
     When we find #[test], there may be other attributes above it like
-    #[ignore], #[should_panic], etc. This function finds the first one.
+    #[ignore], #[should_panic], etc.  Outer doc comments are attributes in
+    Rust too, so keep them attached to the test item.  Inner docs (``//!`` and
+    ``/*!``) document the enclosing scope and must not be consumed.
 
     Returns 0-indexed line number.
     """
@@ -315,6 +595,29 @@ def _find_first_attr_line(lines: List[str], attr_line: int) -> int:
             # Another attribute - include it
             first = k
             k -= 1
+        elif stripped.startswith("///"):
+            first = k
+            k -= 1
+        elif stripped.endswith("*/"):
+            # Walk one outer block-doc comment backwards as a unit. Only
+            # lines inside THIS block may be crossed: stop at the line that
+            # opens it, and bail on another block's terminator — scanning
+            # past the opener would swallow unrelated production code into
+            # the test range.
+            block_end = k
+            if "/*" not in lines[k]:
+                k -= 1
+                while k >= 0 and "/*" not in lines[k]:
+                    if "*/" in lines[k]:
+                        k = -1
+                        break
+                    k -= 1
+            if k >= 0 and "/**" in lines[k] and "/*!" not in lines[k]:
+                first = k
+                k -= 1
+            else:
+                k = block_end
+                break
         else:
             # Non-attribute, non-empty line - stop
             break
@@ -455,32 +758,63 @@ def _parse_cfg_meta(tokens: List[Tuple[str, str]], pos: int) -> Tuple[Optional[T
     return ("word", name), pos
 
 
-def _cfg_meta_contains_test(node: Tuple, negated: bool = False) -> bool:
-    """Return True if cfg meta contains a positive test word."""
+def _cfg_meta_possible_values(node: Tuple, *, test_value: bool) -> frozenset[bool]:
+    """Return conservative possible values of a cfg expression.
+
+    Non-``test`` predicates are unknown because the detector does not know the
+    target platform/features.  Keeping both possible values lets us answer the
+    question that matters safely: can this item exist when ``cfg(test)`` is
+    false?
+    """
     if not node:
-        return False
+        return frozenset({False, True})
     if node[0] == "word":
-        return node[1] == "test" and not negated
+        if node[1] == "test":
+            return frozenset({test_value})
+        return frozenset({False, True})
     if node[0] == "name_value":
-        return False
+        return frozenset({False, True})
     if node[0] == "list":
         name = node[1]
         args = node[2]
         if name == "not":
-            return _cfg_meta_contains_test(args[0], not negated) if args else False
-        if name in ("any", "all"):
-            return any(_cfg_meta_contains_test(arg, negated) for arg in args)
-        return False
-    return False
+            if len(args) != 1:
+                return frozenset({False, True})
+            return frozenset(
+                not value
+                for value in _cfg_meta_possible_values(args[0], test_value=test_value)
+            )
+        child_values = [
+            _cfg_meta_possible_values(arg, test_value=test_value) for arg in args
+        ]
+        if name == "all":
+            can_be_true = all(True in values for values in child_values)
+            can_be_false = any(False in values for values in child_values)
+            return frozenset(
+                value for value, possible in ((True, can_be_true), (False, can_be_false)) if possible
+            )
+        if name == "any":
+            can_be_true = any(True in values for values in child_values)
+            can_be_false = all(False in values for values in child_values)
+            return frozenset(
+                value for value, possible in ((True, can_be_true), (False, can_be_false)) if possible
+            )
+        return frozenset({False, True})
+    return frozenset({False, True})
 
 
 def _cfg_expr_has_test(expr: str) -> bool:
-    """Check if a cfg expression includes positive 'test'."""
+    """Return whether a cfg condition can only be true during tests.
+
+    Merely containing the word ``test`` is insufficient.  For example,
+    ``any(windows, test)`` also enables production Windows code and therefore
+    must never be removed.  In contrast, ``all(unix, test)`` implies test mode.
+    """
     tokens = _tokenize_cfg_expr(expr)
-    node, _ = _parse_cfg_meta(tokens, 0)
-    if node is None:
+    node, pos = _parse_cfg_meta(tokens, 0)
+    if node is None or pos != len(tokens):
         return False
-    return _cfg_meta_contains_test(node, False)
+    return True not in _cfg_meta_possible_values(node, test_value=False)
 
 
 def _extract_cfg_condition(attr_text: str, attr_name: str) -> Optional[str]:
@@ -500,7 +834,7 @@ def _extract_cfg_condition(attr_text: str, attr_name: str) -> Optional[str]:
 
 
 def _is_cfg_test_attr(attr_text: str, attr_name: str) -> bool:
-    """Return True if cfg/cfg_attr attribute condition includes positive test."""
+    """Return True if the attribute condition makes its item test-only."""
     cond = _extract_cfg_condition(attr_text, attr_name)
     if not cond:
         return False
@@ -531,6 +865,11 @@ def _has_item_after_column(line: str, col: int) -> bool:
         or no_vis.startswith("trait ")
         or no_vis.startswith("struct ")
         or no_vis.startswith("enum ")
+        or no_vis.startswith("union ")
+        or no_vis.startswith("macro_rules!")
+        or no_vis.startswith("macro ")
+        or no_vis.startswith("extern ")
+        or bool(re.match(r"^(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*!", no_vis))
         or _is_fn_line(remainder)
     )
 
@@ -590,7 +929,9 @@ def _find_doc_test_ranges(lines: List[str]) -> List[Tuple[int, int, str]]:
 # ============================================================
 
 
-def _find_macro_test_ranges(file_path: str) -> List[Tuple[int, int, str]]:
+def _find_macro_test_ranges(
+    file_path: str, *, strict: bool = False
+) -> List[Tuple[int, int, str]]:
     """Find test-related macro invocations.
 
     Detects:
@@ -615,22 +956,23 @@ def _find_macro_test_ranges(file_path: str) -> List[Tuple[int, int, str]]:
     ]
 
     for pattern in test_macro_patterns:
-        try:
-            result = subprocess.run(
-                ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                matches = json.loads(result.stdout)
-                for match in matches:
-                    start_line = match["range"]["start"]["line"] + 1
-                    end_line = match["range"]["end"]["line"] + 1
-                    macro_name = pattern.split("!")[0]
-                    ranges.append((start_line, end_line, f"{macro_name}! macro"))
-        except Exception:
-            pass
+        matches = _run_ast_grep_json(
+            ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
+            purpose=f"find Rust test macro {pattern!r} in {file_path}",
+            strict=strict,
+        )
+        for match in matches:
+            try:
+                start_line = match["range"]["start"]["line"] + 1
+                end_line = match["range"]["end"]["line"] + 1
+            except (KeyError, TypeError) as exc:
+                if strict:
+                    raise RustTestDetectionError(
+                        f"find Rust test macro {pattern!r}: missing range metadata"
+                    ) from exc
+                continue
+            macro_name = pattern.split("!")[0]
+            ranges.append((start_line, end_line, f"{macro_name}! macro"))
 
     return ranges
 
@@ -640,7 +982,9 @@ def _find_macro_test_ranges(file_path: str) -> List[Tuple[int, int, str]]:
 # ============================================================
 
 
-def _find_declaration_list_ranges(file_path: str) -> List[Tuple[int, int]]:
+def _find_declaration_list_ranges(
+    file_path: str, *, strict: bool = False
+) -> List[Tuple[int, int]]:
     """
     Find all declaration_list ranges in a Rust file using ast-grep.
 
@@ -657,45 +1001,12 @@ def _find_declaration_list_ranges(file_path: str) -> List[Tuple[int, int]]:
     Returns:
         List of (start_line, end_line) tuples (1-indexed, inclusive)
     """
-    import tempfile
-    import os
-
-    try:
-        # Create a YAML rule file for finding declaration_list nodes
-        rule_content = """id: find-declaration-list
-language: rust
-rule:
-  kind: declaration_list
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(rule_content)
-            rule_path = f.name
-
-        try:
-            result = subprocess.run(
-                ["ast-grep", "scan", "-r", rule_path, "--json", file_path],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-
-            ranges = []
-            if result.returncode == 0 and result.stdout.strip():
-                try:
-                    matches = json.loads(result.stdout)
-                    for match in matches:
-                        start_line = match["range"]["start"]["line"] + 1  # Convert to 1-indexed
-                        end_line = match["range"]["end"]["line"] + 1
-                        ranges.append((start_line, end_line))
-                except json.JSONDecodeError:
-                    pass
-
-            return ranges
-        finally:
-            os.unlink(rule_path)
-
-    except Exception:
-        return []
+    return [
+        (start, end)
+        for start, end, _ in _get_kind_ranges_by_kind(
+            file_path, ["declaration_list"], strict=strict
+        )["declaration_list"]
+    ]
 
 
 def _is_inside_any_block(line_number: int, block_ranges: List[Tuple[int, int]]) -> bool:
@@ -747,16 +1058,20 @@ def _merge_overlapping_ranges(ranges: List[Tuple[int, int, str]]) -> List[Tuple[
 
 
 def find_test_code_ranges(
-    file_path: str, include_doc_tests: bool = False, only_root_level: bool = False
+    file_path: str,
+    include_doc_tests: bool = False,
+    only_root_level: bool = False,
+    *,
+    strict: bool = False,
 ) -> List[Tuple[int, int, str]]:
     """
     Find all test code regions in a Rust file using ast-grep.
 
     Detects:
-    - #[cfg(test)] and #[cfg(all/any(test, ...))] blocks
+    - #[cfg(...)] conditions that logically require test mode
     - #[cfg(test)] mod/use/fn/impl/const/static/type statements
     - #[cfg(test)] mod tests; (declarative/external module)
-    - #[cfg_attr(test, ...)] items and #![cfg(test)] file-level modules
+    - #![cfg(test)] file-level modules (cfg_attr never makes an item test-only)
     - #[test], #[bench] functions
     - Async test frameworks: tokio, async_std, actix_rt, smol, etc.
     - Other test frameworks: rstest, quickcheck, test_case, wasm_bindgen_test
@@ -773,6 +1088,8 @@ def find_test_code_ranges(
             Test regions nested inside mod/impl/trait blocks are excluded.
             This prevents extraction of nested tests that would lose context
             when moved to file end (causing E0428, E0061 errors).
+        strict: Raise :class:`RustTestDetectionError` when ast-grep or parsing
+            fails instead of treating the file as if it contained no tests.
 
     Returns list of (start_line, end_line, reason) tuples (1-indexed).
     """
@@ -780,14 +1097,14 @@ def find_test_code_ranges(
         return []
 
     try:
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         ranges = []
 
         # Pre-compute block ranges using ast-grep for precise end detection
         # This avoids the pitfalls of simple brace counting (strings, comments, etc.)
-        block_ranges = _get_block_items_with_precise_ranges(file_path)
+        block_ranges = _get_block_items_with_precise_ranges(file_path, strict=strict)
 
         def _item_start_after_attr(match: Dict) -> int:
             end_line = match["range"]["end"]["line"]
@@ -810,100 +1127,145 @@ def find_test_code_ranges(
         #   - The enum exists in test builds (with EnumIter)
         #   - Removing this would break the build!
         for attr_name in ("cfg",):  # Removed "cfg_attr" - it doesn't make items test-only
-            result = subprocess.run(
-                ["ast-grep", "run", "--pattern", f"#[{attr_name}($$$)]", "--lang", "rust", "--json", file_path],
-                capture_output=True,
-                text=True,
-                timeout=10,
+            matches = _run_ast_grep_json(
+                [
+                    "ast-grep", "run", "--pattern", f"#[{attr_name}($$$)]",
+                    "--lang", "rust", "--json", file_path,
+                ],
+                purpose=f"find #[{attr_name}] attributes in {file_path}",
+                strict=strict,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                matches = json.loads(result.stdout)
-                for match in matches:
-                    matched_text = match.get("text", "")
-                    if not _is_cfg_test_attr(matched_text, attr_name):
-                        continue
-
-                    cfg_line = match["range"]["start"]["line"]  # 0-indexed
-                    j = _item_start_after_attr(match)
-                    if j >= len(lines):
-                        continue
-
-                    next_line = _strip_leading_attrs(lines[j]).strip()
-                    if not next_line:
-                        continue
-                    next_line_no_vis = _strip_visibility(next_line)
-                    start_line = cfg_line + 1  # 1-indexed
-
-                    # Determine item type and find end using precise ast-grep ranges
-                    if next_line_no_vis.startswith("mod "):
-                        # Check for declarative module: mod tests; (semicolon, no braces)
-                        # This means the test code is in a separate file (tests.rs or tests/mod.rs)
-                        if ";" in next_line and "{" not in next_line:
-                            end_line = _find_single_statement_end(lines, j)
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] mod (external)"))
-                        else:
-                            end_line = _find_block_end(j, "mod", block_ranges, lines)
-                            if end_line:
-                                ranges.append((start_line, end_line, f"#[{attr_name}(test)] mod"))
-
-                    elif next_line_no_vis.startswith("use "):
-                        end_line = _find_single_statement_end(lines, j)
-                        ranges.append((start_line, end_line, f"#[{attr_name}(test)] use"))
-
-                    elif _is_fn_line(lines[j]):
-                        end_line = _find_block_end(j, "fn", block_ranges, lines)
-                        if end_line:
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] fn"))
-
-                    elif next_line_no_vis.startswith("impl "):
-                        end_line = _find_block_end(j, "impl", block_ranges, lines)
-                        if end_line:
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] impl"))
-
-                    elif next_line_no_vis.startswith("const "):
-                        end_line = _find_single_statement_end(lines, j)
-                        ranges.append((start_line, end_line, f"#[{attr_name}(test)] const"))
-
-                    elif next_line_no_vis.startswith("static "):
-                        end_line = _find_single_statement_end(lines, j)
-                        ranges.append((start_line, end_line, f"#[{attr_name}(test)] static"))
-
-                    elif next_line_no_vis.startswith("type "):
-                        end_line = _find_single_statement_end(lines, j)
-                        ranges.append((start_line, end_line, f"#[{attr_name}(test)] type"))
-
-                    elif next_line_no_vis.startswith("trait "):
-                        end_line = _find_block_end(j, "trait", block_ranges, lines)
-                        if end_line:
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] trait"))
-
-                    elif next_line_no_vis.startswith("struct "):
-                        # Struct can be single-line or multi-line
-                        if "{" in next_line:
-                            end_line = _find_block_end(j, "struct", block_ranges, lines)
-                        else:
-                            end_line = _find_single_statement_end(lines, j)
-                        if end_line:
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] struct"))
-
-                    elif next_line_no_vis.startswith("enum "):
-                        end_line = _find_block_end(j, "enum", block_ranges, lines)
-                        if end_line:
-                            ranges.append((start_line, end_line, f"#[{attr_name}(test)] enum"))
-
-        # Inner attribute: #![cfg(test)] marks entire file as test-only
-        result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "#![cfg($$$)]", "--lang", "rust", "--json", file_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            matches = json.loads(result.stdout)
             for match in matches:
                 matched_text = match.get("text", "")
-                if _is_cfg_test_attr(matched_text, "cfg"):
-                    ranges.append((1, len(lines), "#![cfg(test)] file"))
+                if not _is_cfg_test_attr(matched_text, attr_name):
+                    continue
+
+                cfg_line = match["range"]["start"]["line"]  # 0-indexed
+                j = _item_start_after_attr(match)
+                if j >= len(lines):
+                    if strict:
+                        raise RustTestDetectionError(
+                            f"test-only cfg attribute at {file_path}:{cfg_line + 1} has no item"
+                        )
+                    continue
+
+                next_line = _strip_leading_attrs(lines[j]).strip()
+                if not next_line:
+                    if strict:
+                        raise RustTestDetectionError(
+                            f"cannot identify item after test-only cfg at {file_path}:{cfg_line + 1}"
+                        )
+                    continue
+                next_line_no_vis = _strip_visibility(next_line)
+                start_line = _find_first_attr_line(lines, cfg_line) + 1
+                end_line = None
+                reason = ""
+
+                # Determine item type and find end using precise ast-grep ranges.
+                if next_line_no_vis.startswith("mod "):
+                    if ";" in next_line and "{" not in next_line:
+                        end_line = _find_item_end_from_ranges(
+                            j + 1, block_ranges["mod"]
+                        )
+                        if end_line is None and not strict:
+                            end_line = _find_single_statement_end(lines, j)
+                        reason = f"#[{attr_name}(test)] mod (external)"
+                    else:
+                        end_line = _find_block_end(
+                            j, "mod", block_ranges, lines, fallback=not strict
+                        )
+                        reason = f"#[{attr_name}(test)] mod"
+                elif next_line_no_vis.startswith("use "):
+                    end_line = _find_statement_end(
+                        j, "use", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] use"
+                elif _is_fn_line(lines[j]):
+                    end_line = _find_block_end(j, "fn", block_ranges, lines, fallback=not strict)
+                    reason = f"#[{attr_name}(test)] fn"
+                elif next_line_no_vis.startswith("impl "):
+                    end_line = _find_block_end(j, "impl", block_ranges, lines, fallback=not strict)
+                    reason = f"#[{attr_name}(test)] impl"
+                elif next_line_no_vis.startswith("const "):
+                    end_line = _find_statement_end(
+                        j, "const", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] const"
+                elif next_line_no_vis.startswith("static "):
+                    end_line = _find_statement_end(
+                        j, "static", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] static"
+                elif next_line_no_vis.startswith("type "):
+                    end_line = _find_statement_end(
+                        j, "type", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] type"
+                elif next_line_no_vis.startswith("trait "):
+                    end_line = _find_block_end(j, "trait", block_ranges, lines, fallback=not strict)
+                    reason = f"#[{attr_name}(test)] trait"
+                elif next_line_no_vis.startswith("struct "):
+                    end_line = (
+                        _find_block_end(j, "struct", block_ranges, lines, fallback=not strict)
+                        if "{" in next_line
+                        else _find_item_end_from_ranges(j + 1, block_ranges["struct"])
+                    )
+                    reason = f"#[{attr_name}(test)] struct"
+                elif next_line_no_vis.startswith("enum "):
+                    end_line = _find_block_end(j, "enum", block_ranges, lines, fallback=not strict)
+                    reason = f"#[{attr_name}(test)] enum"
+                elif next_line_no_vis.startswith("union "):
+                    end_line = _find_block_end(
+                        j, "union", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] union"
+                elif next_line_no_vis.startswith(("macro_rules!", "macro ")):
+                    end_line = _find_block_end(
+                        j, "macro_definition", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] macro definition"
+                elif re.match(
+                    r"^(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*!", next_line_no_vis
+                ):
+                    end_line = _find_block_end(
+                        j, "macro_invocation", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] macro invocation"
+                elif next_line_no_vis.startswith("extern crate "):
+                    end_line = _find_statement_end(
+                        j, "extern_crate", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] extern crate"
+                elif next_line_no_vis.startswith("extern "):
+                    end_line = _find_block_end(
+                        j, "foreign_mod", block_ranges, lines, fallback=not strict
+                    )
+                    reason = f"#[{attr_name}(test)] foreign module"
+
+                if end_line is None:
+                    end_line = _find_attributed_nested_node_end(
+                        cfg_line, j, block_ranges
+                    )
+                    if end_line is not None:
+                        reason = f"#[{attr_name}(test)] nested node"
+
+                if end_line is not None:
+                    ranges.append((start_line, end_line, reason))
+                elif strict:
+                    raise RustTestDetectionError(
+                        f"cannot determine test-only item boundary at {file_path}:{cfg_line + 1}"
+                    )
+
+        # Inner attribute: #![cfg(test)] marks entire file as test-only
+        matches = _run_ast_grep_json(
+            ["ast-grep", "run", "--pattern", "#![cfg($$$)]", "--lang", "rust", "--json", file_path],
+            purpose=f"find inner cfg attributes in {file_path}",
+            strict=strict,
+        )
+        for match in matches:
+            matched_text = match.get("text", "")
+            if _is_cfg_test_attr(matched_text, "cfg"):
+                ranges.append((1, len(lines), "#![cfg(test)] file"))
 
         # ============================================================
         # Pattern Group 2: Test function attributes
@@ -930,130 +1292,138 @@ def find_test_code_ranges(
                 patterns.append(f"#[{attr_name}($$$)]")
 
             for pattern in patterns:
-                result = subprocess.run(
+                matches = _run_ast_grep_json(
                     ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                    purpose=f"find Rust test attribute {pattern!r} in {file_path}",
+                    strict=strict,
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    matches = json.loads(result.stdout)
-                    for match in matches:
-                        attr_line = match["range"]["start"]["line"]  # 0-indexed
+                for match in matches:
+                    attr_line = match["range"]["start"]["line"]  # 0-indexed
+                    j = _item_start_after_attr(match)
+                    if j >= len(lines) or not _is_fn_line(lines[j]):
+                        if strict:
+                            raise RustTestDetectionError(
+                                f"test attribute {pattern!r} at {file_path}:{attr_line + 1} "
+                                "is not attached to a recognizable function"
+                            )
+                        continue
 
-                        # Skip to the function definition
-                        j = _item_start_after_attr(match)
-
-                        if j >= len(lines):
-                            continue
-
-                        # Verify this is a function
-                        if _is_fn_line(lines[j]):
-                            # Find first attribute (there may be #[ignore] etc. above #[test])
-                            first_attr = _find_first_attr_line(lines, attr_line)
-                            start_line = first_attr + 1  # 1-indexed
-                            end_line = _find_block_end(j, "fn", block_ranges, lines)
-                            if end_line:
-                                ranges.append((start_line, end_line, f"#[{attr_name}] fn"))
+                    first_attr = _find_first_attr_line(lines, attr_line)
+                    start_line = first_attr + 1
+                    end_line = _find_block_end(
+                        j, "fn", block_ranges, lines, fallback=not strict
+                    )
+                    if end_line:
+                        ranges.append((start_line, end_line, f"#[{attr_name}] fn"))
+                    elif strict:
+                        raise RustTestDetectionError(
+                            f"cannot determine test function boundary at "
+                            f"{file_path}:{attr_line + 1}"
+                        )
 
         # ============================================================
         # Pattern Group 3: Parameterized test attributes (with arguments)
         # ============================================================
         # #[test_case(...)] - need to match with arguments
-        result = subprocess.run(
+        matches = _run_ast_grep_json(
             ["ast-grep", "run", "--pattern", "#[test_case($$$)]", "--lang", "rust", "--json", file_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            purpose=f"find #[test_case] attributes in {file_path}",
+            strict=strict,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            matches = json.loads(result.stdout)
-            # Group by function (multiple test_case on same fn)
-            processed_fns = set()
-            for match in matches:
-                attr_line = match["range"]["start"]["line"]
-
-                # Skip to function
-                j = _item_start_after_attr(match)
-                if j >= len(lines) or j in processed_fns:
-                    continue
-
-                if _is_fn_line(lines[j]):
-                    processed_fns.add(j)
-                    # Find the first test_case attribute for this function
-                    first_attr = attr_line
-                    k = attr_line - 1
-                    while k >= 0:
-                        stripped = lines[k].strip()
-                        if stripped.startswith("#[test_case") or stripped.startswith("#[case"):
-                            first_attr = k
-                            k -= 1
-                        elif stripped.startswith("#[") or not stripped:
-                            k -= 1
-                        else:
-                            break
-
-                    start_line = first_attr + 1
-                    end_line = _find_block_end(j, "fn", block_ranges, lines)
-                    if end_line:
-                        ranges.append((start_line, end_line, "#[test_case] fn"))
+        # Group by function (multiple test_case on same fn)
+        processed_fns = set()
+        for match in matches:
+            attr_line = match["range"]["start"]["line"]
+            j = _item_start_after_attr(match)
+            if j >= len(lines):
+                if strict:
+                    raise RustTestDetectionError(
+                        f"#[test_case] at {file_path}:{attr_line + 1} has no function"
+                    )
+                continue
+            if j in processed_fns:
+                continue
+            if not _is_fn_line(lines[j]):
+                if strict:
+                    raise RustTestDetectionError(
+                        f"#[test_case] at {file_path}:{attr_line + 1} is not attached "
+                        "to a recognizable function"
+                    )
+                continue
+            processed_fns.add(j)
+            first_attr = _find_first_attr_line(lines, attr_line)
+            start_line = first_attr + 1
+            end_line = _find_block_end(j, "fn", block_ranges, lines, fallback=not strict)
+            if end_line:
+                ranges.append((start_line, end_line, "#[test_case] fn"))
+            elif strict:
+                raise RustTestDetectionError(
+                    f"cannot determine #[test_case] function boundary at "
+                    f"{file_path}:{attr_line + 1}"
+                )
 
         # #[rstest] #[case(...)] combinations
-        result = subprocess.run(
+        matches = _run_ast_grep_json(
             ["ast-grep", "run", "--pattern", "#[case($$$)]", "--lang", "rust", "--json", file_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            purpose=f"find #[case] attributes in {file_path}",
+            strict=strict,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            matches = json.loads(result.stdout)
-            processed_fns = set()
-            for match in matches:
-                attr_line = match["range"]["start"]["line"]
-                j = _item_start_after_attr(match)
-                if j >= len(lines) or j in processed_fns:
-                    continue
-
-                if _is_fn_line(lines[j]):
-                    processed_fns.add(j)
-                    # Find first attribute
-                    first_attr = attr_line
-                    k = attr_line - 1
-                    while k >= 0:
-                        stripped = lines[k].strip()
-                        if stripped.startswith("#["):
-                            first_attr = k
-                            k -= 1
-                        elif not stripped:
-                            k -= 1
-                        else:
-                            break
-
-                    start_line = first_attr + 1
-                    end_line = _find_block_end(j, "fn", block_ranges, lines)
-                    if end_line:
-                        ranges.append((start_line, end_line, "#[rstest/case] fn"))
+        processed_fns = set()
+        for match in matches:
+            attr_line = match["range"]["start"]["line"]
+            j = _item_start_after_attr(match)
+            if j >= len(lines):
+                if strict:
+                    raise RustTestDetectionError(
+                        f"#[case] at {file_path}:{attr_line + 1} has no function"
+                    )
+                continue
+            if j in processed_fns:
+                continue
+            if not _is_fn_line(lines[j]):
+                if strict:
+                    raise RustTestDetectionError(
+                        f"#[case] at {file_path}:{attr_line + 1} is not attached "
+                        "to a recognizable function"
+                    )
+                continue
+            processed_fns.add(j)
+            first_attr = _find_first_attr_line(lines, attr_line)
+            start_line = first_attr + 1
+            end_line = _find_block_end(j, "fn", block_ranges, lines, fallback=not strict)
+            if end_line:
+                ranges.append((start_line, end_line, "#[rstest/case] fn"))
+            elif strict:
+                raise RustTestDetectionError(
+                    f"cannot determine #[case] function boundary at "
+                    f"{file_path}:{attr_line + 1}"
+                )
 
         # #[fixture] for rstest
-        result = subprocess.run(
+        matches = _run_ast_grep_json(
             ["ast-grep", "run", "--pattern", "#[fixture]", "--lang", "rust", "--json", file_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            purpose=f"find #[fixture] attributes in {file_path}",
+            strict=strict,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            matches = json.loads(result.stdout)
-            for match in matches:
-                attr_line = match["range"]["start"]["line"]
-                j = _item_start_after_attr(match)
-                if j >= len(lines):
-                    continue
-
-                if _is_fn_line(lines[j]):
-                    start_line = attr_line + 1
-                    end_line = _find_block_end(j, "fn", block_ranges, lines)
-                    if end_line:
-                        ranges.append((start_line, end_line, "#[fixture] fn"))
+        for match in matches:
+            attr_line = match["range"]["start"]["line"]
+            j = _item_start_after_attr(match)
+            if j >= len(lines) or not _is_fn_line(lines[j]):
+                if strict:
+                    raise RustTestDetectionError(
+                        f"#[fixture] at {file_path}:{attr_line + 1} is not attached "
+                        "to a recognizable function"
+                    )
+                continue
+            start_line = _find_first_attr_line(lines, attr_line) + 1
+            end_line = _find_block_end(j, "fn", block_ranges, lines, fallback=not strict)
+            if end_line:
+                ranges.append((start_line, end_line, "#[fixture] fn"))
+            elif strict:
+                raise RustTestDetectionError(
+                    f"cannot determine #[fixture] function boundary at "
+                    f"{file_path}:{attr_line + 1}"
+                )
 
         # ============================================================
         # Pattern Group 4: Doc tests (code blocks in documentation)
@@ -1068,7 +1438,7 @@ def find_test_code_ranges(
         # ============================================================
         # Pattern Group 5: Test-related macros
         # ============================================================
-        macro_test_ranges = _find_macro_test_ranges(file_path)
+        macro_test_ranges = _find_macro_test_ranges(file_path, strict=strict)
         ranges.extend(macro_test_ranges)
 
         # Merge overlapping ranges
@@ -1076,7 +1446,7 @@ def find_test_code_ranges(
 
         # Filter to only root-level test regions if requested
         if only_root_level:
-            declaration_list_ranges = _find_declaration_list_ranges(file_path)
+            declaration_list_ranges = _find_declaration_list_ranges(file_path, strict=strict)
             ranges = [
                 (start, end, reason)
                 for start, end, reason in ranges
@@ -1085,8 +1455,13 @@ def find_test_code_ranges(
 
         return ranges
 
+    except RustTestDetectionError:
+        raise
     except Exception as e:
-        # Log error for debugging but return empty list
+        if strict:
+            raise RustTestDetectionError(
+                f"find_test_code_ranges failed for {file_path}: {e}"
+            ) from e
         print(f"Warning: find_test_code_ranges failed for {file_path}: {e}", file=sys.stderr)
         return []
 
@@ -1106,7 +1481,12 @@ def find_test_module_ranges(file_path: str, include_doc_tests: bool = False) -> 
 
 
 def find_test_ranges_from_content(
-    content: str, file_path: str, include_doc_tests: bool = False, only_root_level: bool = False
+    content: str,
+    file_path: str,
+    include_doc_tests: bool = False,
+    only_root_level: bool = False,
+    *,
+    strict: bool = False,
 ) -> List[Tuple[int, int]]:
     """Find test code ranges from file content string.
 
@@ -1119,6 +1499,8 @@ def find_test_ranges_from_content(
         include_doc_tests: Whether to include doc tests. Default False.
         only_root_level: If True, only return test regions at file root level.
             Test regions nested inside mod/impl/trait blocks are excluded.
+        strict: Raise when precise detection fails.  When true, the lossy text
+            fallback is intentionally disabled.
     """
     if not file_path.endswith(".rs"):
         return []
@@ -1134,13 +1516,22 @@ def find_test_ranges_from_content(
 
         try:
             ranges = find_test_code_ranges(
-                tmp_path, include_doc_tests=include_doc_tests, only_root_level=only_root_level
+                tmp_path,
+                include_doc_tests=include_doc_tests,
+                only_root_level=only_root_level,
+                strict=strict,
             )
             return [(start, end) for start, end, _ in ranges]
         finally:
             os.unlink(tmp_path)
 
-    except Exception:
+    except RustTestDetectionError:
+        raise
+    except Exception as exc:
+        if strict:
+            raise RustTestDetectionError(
+                f"failed to inspect Rust content for {file_path}: {exc}"
+            ) from exc
         # Fallback to simple text parsing
         pass
 
@@ -1158,8 +1549,8 @@ def find_test_ranges_from_content(
     while i < len(lines):
         raw_line = lines[i]
         stripped = raw_line.strip()
-        if stripped.startswith("#[cfg") or stripped.startswith("#[cfg_attr"):
-            attr_name = "cfg_attr" if stripped.startswith("#[cfg_attr") else "cfg"
+        if stripped.startswith("#[cfg") and not stripped.startswith("#[cfg_attr"):
+            attr_name = "cfg"
             if not _is_cfg_test_attr(raw_line, attr_name):
                 i += 1
                 continue

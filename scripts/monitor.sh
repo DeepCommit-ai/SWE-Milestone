@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Monitor EvoClaw trial progress across all repos.
+# Monitor SWE-Milestone trial progress across all repos.
 #
 # Usage:
 #   ./scripts/monitor.sh <trial_name>                          # monitor a trial
@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONFIG_DIR="$PROJECT_ROOT/.evoclaw"
+CONFIG_DIR="$PROJECT_ROOT/.swe-milestone"
 
 # ─────────────────────────────────────────────
 # Parse arguments
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --full              Full wide table with all columns"
             echo ""
             echo "Filters:"
-            echo "  --data-root PATH    Path to EvoClaw-data (default: from trial_config.yaml)"
+            echo "  --data-root PATH    Path to SWE-Milestone-data (default: from trial_config.yaml)"
             echo "  --repos REPO ...    Only show these repos"
             echo "  -- ...              Extra args passed to collect_results.py"
             exit 0
@@ -63,13 +63,13 @@ done
 # ─────────────────────────────────────────────
 # Resolve data_root (needed before trial auto-detect)
 # ─────────────────────────────────────────────
-EVOCLAW_CONFIG="$PROJECT_ROOT/trial_config.yaml"
+SWE_MILESTONE_CONFIG="$PROJECT_ROOT/trial_config.yaml"
 if [[ -z "$DATA_ROOT" ]]; then
     # Try reading from trial_config.yaml
-    if [[ -f "$EVOCLAW_CONFIG" ]]; then
+    if [[ -f "$SWE_MILESTONE_CONFIG" ]]; then
         DATA_ROOT=$(python3 -c "
 import yaml
-with open('$EVOCLAW_CONFIG') as f:
+with open('$SWE_MILESTONE_CONFIG') as f:
     cfg = yaml.safe_load(f)
 print(cfg.get('data_root', ''))
 " 2>/dev/null)
@@ -103,7 +103,7 @@ if [[ ${#TRIAL_NAMES[@]} -eq 0 ]]; then
     # Auto-detect: find all trial directories across repos
     FOUND_TRIALS=()
     for repo_dir in "$DATA_ROOT"/*/; do
-        # Treat dir as a repo if it has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
+        # Treat dir as a repo if it has metadata.json (SWE-Milestone-data) or trial dirs (SWE-Milestone-log)
         if [[ ! -f "$repo_dir/metadata.json" ]] \
            && [[ ! -d "$repo_dir/e2e_trial" ]] \
            && [[ ! -d "$repo_dir/mstone_trial" ]]; then
@@ -167,7 +167,7 @@ done
 # ─────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 
-# Discover repos: has metadata.json (EvoClaw-data) or trial dirs (EvoClaw-log)
+# Discover repos: has metadata.json (SWE-Milestone-data) or trial dirs (SWE-Milestone-log)
 REPO_ENTRIES=""
 for repo_dir in "$DATA_ROOT"/*/; do
     if [[ ! -f "$repo_dir/metadata.json" ]] \
@@ -256,15 +256,15 @@ fi
 # ─────────────────────────────────────────────
 # Session timeline table
 # ─────────────────────────────────────────────
-export EVOCLAW_DATA_ROOT="$DATA_ROOT"
-export EVOCLAW_TRIAL_NAMES="$(IFS=,; echo "${RESOLVED_TRIALS[*]}")"
+export SWE_MILESTONE_DATA_ROOT="$DATA_ROOT"
+export SWE_MILESTONE_TRIAL_NAMES="$(IFS=,; echo "${RESOLVED_TRIALS[*]}")"
 python3 << 'TIMELINE_EOF'
 import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-data_root = os.environ.get("EVOCLAW_DATA_ROOT", "")
-trial_names_str = os.environ.get("EVOCLAW_TRIAL_NAMES", "")
+data_root = os.environ.get("SWE_MILESTONE_DATA_ROOT", "")
+trial_names_str = os.environ.get("SWE_MILESTONE_TRIAL_NAMES", "")
 if not data_root or not trial_names_str:
     sys.exit(0)
 

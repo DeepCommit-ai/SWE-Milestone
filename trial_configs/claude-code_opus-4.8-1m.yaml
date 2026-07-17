@@ -1,0 +1,10 @@
+data_root: ${SWE_MILESTONE_DATA_ROOT}
+trial_name: claude-code_opus-4.8-1m
+agent: claude-code
+model: claude-opus-4-8
+default_agent_model: claude-opus-4-8
+reasoning_effort: max
+timeout: 18000
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

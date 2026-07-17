@@ -1,4 +1,4 @@
-# EvoClaw Trial Configuration
+# SWE-Milestone Trial Configuration
 # Copy this file to trial_config.yaml and edit.
 #
 # Usage:
@@ -7,10 +7,10 @@
 # Monitor progress:
 #   ./scripts/monitor.sh <trial_name>
 
-# Path to EvoClaw-data (cloned from HuggingFace).
-# Recommended: leave this as ${EVOCLAW_DATA_ROOT} and set the real path ONCE in
+# Path to SWE-Milestone-data (cloned from Hugging Face).
+# Recommended: leave this as ${SWE_MILESTONE_DATA_ROOT} and set the real path ONCE in
 # .env_private (auto-loaded). Or hardcode an absolute path here.
-data_root: ${EVOCLAW_DATA_ROOT}
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 
 # Trial name. Two forms:
 #   "my_experiment"     → run_all.py picks the latest matching _NNN
@@ -21,6 +21,14 @@ trial_name: my_experiment
 
 # Agent framework: claude-code | codex | gemini-cli | openhands
 agent: claude-code
+
+# Optional agent CLI version pin (claude-code, codex, gemini-cli). Use an
+# exact version for reproducible trials; claude-code also accepts the
+# stable/latest release channels (exact pins disable its auto-updates), codex
+# and gemini-cli accept an exact semver or latest. The requested selector and
+# the actual installed version are both recorded in
+# e2e_trial/<trial>/trial_metadata.json.
+# agent_version: 2.1.210
 
 # Model identifier. For Claude Code, use the bare ID (e.g. claude-opus-4-7)
 # or append [1m] for the 1M-context variant (claude-opus-4-7[1m]).
@@ -39,6 +47,31 @@ timeout: 18000
 # 200K, so this is the only useful setting). See docs/adding-a-model.md.
 # auto_compact_window: 200000
 
+# Tool Search pin (claude-code only). Sets claude-code's native
+# ENABLE_TOOL_SEARCH env var in the agent container. Unset = claude-code's
+# own endpoint-dependent default (ON for first-party Anthropic, auto-OFF for
+# Vertex and third-party base URLs). false = all tool schemas load upfront —
+# required by endpoints that don't forward tool_reference blocks (e.g. Kimi),
+# and pins a uniform tool-context composition across endpoints.
+# Values: true | false | auto | auto:N (N = percent of context window).
+# enable_tool_search: false
+
+# Per-trial endpoint (all agents). Overrides the host-level UNIFIED_BASE_URL
+# from .env_private for this trial. base_url supports ${VAR} expansion (same
+# as data_root), so the URL can be a literal or live in .env_private; the API
+# key always stays in .env_private, selected by name with api_key_env (one
+# .env_private holds keys for several endpoints side by side). Without
+# api_key_env the global UNIFIED_API_KEY is used as before.
+# base_url: ${MOONSHOT_BASE_URL}      # or literal: https://api.moonshot.ai/anthropic
+# api_key_env: MOONSHOT_API_KEY
+
+# Build-failure scoring policy. Compatibility mode is the global default: keep
+# diagnostics, but score packages/modules that completed before another package
+# failed to compile. Set true for an explicitly strict fail-closed trial.
+# Runner timeouts and nonzero outer exits always remain fail-closed.
+# evaluation:
+#   build_failure_fail_closed: false
+
 # ─── Optional ───────────────────────────────────────────
 
 # Run specific repos only (default: all repos found in data_root)
@@ -48,14 +81,16 @@ timeout: 18000
 #   - ripgrep
 #   - dubbo
 
-# Override the model for ALL of Claude Code's class-based model slots.
-# Claude Code's hard-coded defaults (e.g., claude-haiku-4-5) go to
-# api.anthropic.com, bypassing your UNIFIED_BASE_URL and billing a
-# separate Anthropic account. Setting this field points all five
-# slots at the same model so every request stays on your proxy.
-# Despite the "haiku" name, this is the right answer for any
-# model call (HAIKU/SONNET/OPUS/SUBAGENT).
-# default_haiku_model: glm-5.1
+# Override the model for ALL of Claude Code's class-based model slots:
+# ANTHROPIC_DEFAULT_HAIKU_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL,
+# ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_FABLE_MODEL,
+# CLAUDE_CODE_SUBAGENT_MODEL, and ANTHROPIC_MODEL are all set to this one
+# value in the agent container. Claude Code's hard-coded defaults (e.g.,
+# claude-haiku-4-5) go to api.anthropic.com, bypassing your UNIFIED_BASE_URL
+# and billing a separate Anthropic account — set this for any third-party
+# model/proxy so every request stays on your endpoint.
+# (Renamed from `default_haiku_model`, which is now a hard error.)
+# default_agent_model: glm-5.1
 
 # ─── Vertex AI (gemini-cli or claude-code) ───────────────
 # Route the agent to Google Vertex AI using its native Vertex support. Vertex
