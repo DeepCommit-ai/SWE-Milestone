@@ -13,6 +13,9 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "ruff>=0.1.0",
+    # Rust test-region detection (harness/prepare_repo + rust_test_filter)
+    # shells out to the ast-grep CLI; the PyPI wheel ships the binary.
+    "ast-grep-cli>=0.26",
 ]
 
 [tool.hatch.build.targets.wheel]
