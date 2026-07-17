@@ -2310,8 +2310,10 @@ Example:
 
     if missing_args:
         parser.error(f"the following arguments are required for fresh start: {', '.join(missing_args)}")
-    if args.agent_version and args.agent != "claude-code":
-        parser.error("--agent-version is currently supported only with --agent claude-code")
+    if args.agent_version and args.agent not in ("claude-code", "codex", "gemini-cli"):
+        parser.error(
+            "--agent-version is supported only with --agent claude-code, codex, or gemini-cli"
+        )
 
     # Resolve the complete runtime policy once, before any container exists.
     # This replaces any partial/stale inherited marker environment and gives a
@@ -2615,6 +2617,11 @@ Example:
         # SWE_MILESTONE_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
         # display it. None when the config doesn't set it.
         "auto_compact_window": os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW"),
+        # Native claude-code Tool Search pin ("true"/"false"/"auto"/"auto:N").
+        # Set from the trial config `enable_tool_search` (propagated via the
+        # SWE_MILESTONE_ENABLE_TOOL_SEARCH env var). None = config didn't set it,
+        # claude-code's own endpoint-dependent default applies.
+        "enable_tool_search": os.environ.get("SWE_MILESTONE_ENABLE_TOOL_SEARCH"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,

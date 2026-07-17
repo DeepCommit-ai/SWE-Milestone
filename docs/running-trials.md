@@ -55,14 +55,16 @@ Two forms for `trial_name`:
 | `my_experiment_002` (fixed `_NNN`) | Used as-is; `--force` / `--new` only affect lifecycle, not the name |
 
 > **Third-party endpoints:** When Claude Code talks to a non-Anthropic endpoint
-> (Z.AI, DeepSeek, all-hands proxy, …), set `default_haiku_model` to your main
-> model name. Claude Code has *five* class-based model slots (HAIKU / SONNET
-> / OPUS / SUBAGENT / global default) that each fall back to a hard-coded
-> Anthropic default (e.g., `claude-haiku-4-5`) when unset — those requests
-> hit `api.anthropic.com` directly, bypassing your `UNIFIED_BASE_URL` and
-> billing a separate Anthropic account. `default_haiku_model` (despite the
-> name) points all five slots at the same model, keeping every request on
-> your proxy.
+> (Z.AI, DeepSeek, all-hands proxy, …), set `default_agent_model` to your main
+> model name. Claude Code has several class-based model slots
+> (`ANTHROPIC_DEFAULT_HAIKU_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` /
+> `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL` /
+> `CLAUDE_CODE_SUBAGENT_MODEL` / `ANTHROPIC_MODEL`) that each fall back to a
+> hard-coded Anthropic default (e.g., `claude-haiku-4-5`) when unset — those
+> requests hit `api.anthropic.com` directly, bypassing your `UNIFIED_BASE_URL`
+> and billing a separate Anthropic account. `default_agent_model` overrides
+> all of these slots with the one value, keeping every request on your proxy.
+> (Renamed from `default_haiku_model`; the old field name is a hard error.)
 
 > **Context compaction (`auto_compact_window`, claude-code only):** by default
 > claude-code runs with **no compaction** — context grows to the endpoint's
@@ -72,12 +74,15 @@ Two forms for `trial_name`:
 > monitor header's `context=` label reflects the effective window. Details:
 > [`adding-a-model.md`](./adding-a-model.md).
 
-> **Claude Code version (`agent_version`, claude-code only):** set an exact
-> version such as `agent_version: 2.1.158` to make the trial install and retain
-> that CLI version, or use the `stable` / `latest` release channel. Exact pins
-> disable Claude Code self-updates. `trial_metadata.json` records both the
-> requested selector (`requested_agent_version`) and the numeric version found
-> in the container (`agent_version`).
+> **Agent CLI version (`agent_version` — claude-code, codex, gemini-cli):**
+> set an exact version such as `agent_version: 2.1.158` to make the trial
+> install and retain that CLI version. claude-code also accepts the `stable` /
+> `latest` release channels (exact pins disable its self-updates); codex and
+> gemini-cli accept an exact semver or `latest` (npm re-resolves the newest
+> release at container setup). A pinned version that cannot be verified inside
+> the container is fatal. `trial_metadata.json` records both the requested
+> selector (`requested_agent_version`) and the numeric version found in the
+> container (`agent_version`).
 
 > **Google Vertex AI (gemini-cli / claude-code):** Vertex doesn't use an API
 > key — it uses ADC. Set `vertex_ai: true` with `agent: gemini-cli` (Gemini

@@ -99,18 +99,22 @@ def _refuse_or_warn(
     detail: str,
     *,
     fatal_remedy: str = "",
-    warn_remedy: str = "",
+    warn_remedy: str = "",  # retained for call-site compatibility; unused
 ) -> None:
-    """Shared enforcement voice: explicit pin refuses, default pin warns loud."""
-    if explicit:
-        sys.exit(
-            f"[{context}] ERROR: {VERSION_ENV}={tag} is an explicit "
-            f"reproducibility pin, but {detail}. {fatal_remedy}".rstrip()
-        )
-    print(
-        f"⚠️  [{context}] WARNING: {detail}; scores may not be comparable "
-        f"to {tag}. {warn_remedy}".rstrip()
+    """Shared enforcement voice: ANY verification failure refuses to launch.
+
+    Score comparability is the benchmark's core contract, so the default
+    version pin is enforced exactly as hard as an explicit one (policy
+    hardened 2026-07-17; previously the default pin only warned). The escape
+    hatches are deliberate and recorded: SWE_MILESTONE_DATA_VERSION_CHECK=off
+    for the data gate, or a digest-pinned image ref for the image gate.
+    """
+    pin = (
+        f"{VERSION_ENV}={tag} is an explicit reproducibility pin"
+        if explicit
+        else f"benchmark version {tag} is pinned by default"
     )
+    sys.exit(f"[{context}] ERROR: {pin}, but {detail}. {fatal_remedy}".rstrip())
 
 
 def _describe(info: Dict, data_path: Path) -> str:
@@ -158,13 +162,9 @@ def check_data_version(data_path: Path, *, context: str) -> Dict:
             explicit,
             f"the benchmark data checkout does not verify: {_describe(info, data_path)}",
             fatal_remedy=(
-                f"Align the data first (scripts/pull_data.sh --checkout, see "
+                f"Align the data first (scripts/pull_data.sh, see "
                 f"docs/versioning.md) or set {DATA_VERSION_CHECK_ENV}=off to "
-                f"run unverified."
-            ),
-            warn_remedy=(
-                f"Align with scripts/pull_data.sh --checkout, or set "
-                f"{VERSION_ENV} explicitly to make this fatal."
+                f"run unverified (recorded as unchecked in trial metadata)."
             ),
         )
     return {
@@ -213,7 +213,10 @@ def check_image_tag_consistency(image: str, *, context: str) -> Dict:
             tag,
             explicit,
             f"image {image!r} is tagged {img_tag!r}, benchmark version is {tag}",
-            fatal_remedy="Refusing to launch.",
+            fatal_remedy=(
+                "Use the benchmark-version tag, or pass a digest-pinned "
+                "image ref (@sha256:…) to override deliberately."
+            ),
         )
     return {
         "image": image,

@@ -34,6 +34,33 @@ def parse_claude_code_version(output: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def validate_tool_search_setting(value) -> Optional[str]:
+    """Validate/normalize the trial-config ``enable_tool_search`` value.
+
+    Returns the string claude-code's native ENABLE_TOOL_SEARCH env var
+    accepts: "true", "false", "auto", or "auto:N" (N = percent of the
+    context window, 0-100). YAML booleans are normalized to "true"/"false".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text in ("true", "false", "auto"):
+        return text
+    if text.startswith("auto:"):
+        try:
+            pct = float(text[5:])
+        except ValueError:
+            pct = None
+        if pct is not None and 0 <= pct <= 100:
+            return text
+    raise ValueError(
+        "enable_tool_search must be true, false, auto, or auto:N "
+        f"(N = 0-100, percent of the context window); got {value!r}"
+    )
+
+
 # Vertex (native CLAUDE_CODE_USE_VERTEX): copy the mounted host ADC into
 # fakeroot's home so Claude Code's google-auth discovers it at the well-known
 # path. A 0600 bind mount owned by the host uid isn't readable by the in-
@@ -81,10 +108,11 @@ class ClaudeCodeFramework(AgentFramework):
     Environment variables:
         UNIFIED_API_KEY: API key (mapped to ANTHROPIC_API_KEY in container)
         UNIFIED_BASE_URL: Base URL (mapped to ANTHROPIC_BASE_URL in container)
-        UNIFIED_DEFAULT_HAIKU_MODEL: Override for all of Claude Code's
-            class-based model slots (haiku / sonnet / opus / subagent /
-            global default). A single yaml field drives all five env vars
-            to the same value — see get_container_env_vars().
+        UNIFIED_DEFAULT_AGENT_MODEL: Override for ALL of Claude Code's
+            class-based model slots (haiku / sonnet / opus / fable /
+            subagent / global default). A single yaml field
+            (`default_agent_model`) drives all these env vars to the same
+            value — see get_container_env_vars().
     """
 
     FRAMEWORK_NAME = "claude-code"
@@ -133,8 +161,10 @@ class ClaudeCodeFramework(AgentFramework):
         # "openrouter/moonshotai/kimi-k2.6") so every env var and --model flag
         # downstream carries the canonical ID the all-hands LiteLLM proxy
         # expects. Passthrough for unknown/native names.
-        raw_haiku = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
-        self._default_haiku_model = resolve_model_alias(raw_haiku) if raw_haiku else None
+        raw_agent_model = os.environ.get("UNIFIED_DEFAULT_AGENT_MODEL")
+        self._default_agent_model = (
+            resolve_model_alias(raw_agent_model) if raw_agent_model else None
+        )
         # Vertex AI mode (run_all.py sets SWE_MILESTONE_VERTEX when vertex_ai: true).
         # Claude Code has built-in Vertex support (CLAUDE_CODE_USE_VERTEX): it
         # talks to Vertex's Anthropic endpoint directly using ADC — no API key,
@@ -149,6 +179,15 @@ class ClaudeCodeFramework(AgentFramework):
         # compacts context at this token budget. Native agent behaviour — does
         # not alter the model ID or request payload sent to the provider.
         self._auto_compact_window = os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW")
+        # Tool Search (deferred tool loading): run_all.py sets
+        # SWE_MILESTONE_ENABLE_TOOL_SEARCH from the trial config
+        # `enable_tool_search`, already validated to "true"/"false"/"auto"/
+        # "auto:N". Passed through as claude-code's native ENABLE_TOOL_SEARCH.
+        # Third-party Anthropic-compatible endpoints that don't forward
+        # tool_reference blocks (e.g. Kimi) require "false"; pinning it also
+        # keeps the tool-schema context composition identical across endpoints
+        # instead of depending on claude-code's endpoint auto-detection.
+        self._enable_tool_search = os.environ.get("SWE_MILESTONE_ENABLE_TOOL_SEARCH")
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
@@ -193,8 +232,8 @@ class ClaudeCodeFramework(AgentFramework):
         Maps unified env vars to Claude-specific env vars:
         - UNIFIED_API_KEY -> ANTHROPIC_API_KEY
         - UNIFIED_BASE_URL -> ANTHROPIC_BASE_URL
-        - UNIFIED_DEFAULT_HAIKU_MODEL -> all five of Claude Code's
-          class-based model slots (see below)
+        - UNIFIED_DEFAULT_AGENT_MODEL -> all of Claude Code's class-based
+          model slots (see below)
 
         Returns:
             List of -e arguments for docker run
@@ -223,9 +262,9 @@ class ClaudeCodeFramework(AgentFramework):
                 env_vars.extend(["-e", f"ANTHROPIC_API_KEY={self._api_key}"])
             if self._base_url:
                 env_vars.extend(["-e", f"ANTHROPIC_BASE_URL={self._base_url}"])
-        if self._default_haiku_model:
+        if self._default_agent_model:
             # Route ALL of Claude Code's class-based model slots to the same
-            # model. Claude Code has five decision points where it picks a
+            # model. Claude Code has several decision points where it picks a
             # model by "class" rather than using --model:
             #   HAIKU  — background tasks (auto-memory, skill listing,
             #            context management)
@@ -233,23 +272,26 @@ class ClaudeCodeFramework(AgentFramework):
             #            "sonnet class"
             #   OPUS   — reasoning-heavy fallback
             #   SUBAGENT — Agent/Task-tool spawns (claude-code specific)
+            #   FABLE  — Fable/Mythos-class slot (added in newer claude-code;
+            #            harmless no-op for older versions)
             #   ANTHROPIC_MODEL — global default when --model is not passed
             #                     (affects nested claude invocations)
             # Leaving any of these unset lets Claude Code fall back to
             # api.anthropic.com with its hard-coded default (e.g.,
             # claude-haiku-4-5), which (a) bypasses the configured
             # UNIFIED_BASE_URL and (b) bills a separate Anthropic account.
-            # Pointing all five at default_haiku_model keeps every request
+            # Pointing all of them at default_agent_model keeps every request
             # on the same endpoint, which is especially critical for
             # third-party proxies (Z.AI, all-hands, OpenRouter).
             for env_name in (
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL",
                 "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
                 "CLAUDE_CODE_SUBAGENT_MODEL",
                 "ANTHROPIC_MODEL",
             ):
-                env_vars.extend(["-e", f"{env_name}={self._default_haiku_model}"])
+                env_vars.extend(["-e", f"{env_name}={self._default_agent_model}"])
         # Belt-and-suspenders: also set CLAUDE_CODE_EFFORT_LEVEL alongside the
         # `--effort` CLI flag. Workaround for github.com/anthropics/claude-code
         # issue #41028 where the CLI flag is parsed but not propagated to the
@@ -266,6 +308,15 @@ class ClaudeCodeFramework(AgentFramework):
         if self._auto_compact_window:
             env_vars.extend([
                 "-e", f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={self._auto_compact_window}",
+            ])
+        # Tool Search pin (native claude-code env var). Set from trial config
+        # `enable_tool_search` via run_all.py's SWE_MILESTONE_ENABLE_TOOL_SEARCH.
+        # Re-validate here so a hand-set env var can't smuggle an arbitrary
+        # string into the container environment.
+        if self._enable_tool_search:
+            env_vars.extend([
+                "-e",
+                f"ENABLE_TOOL_SEARCH={validate_tool_search_setting(self._enable_tool_search)}",
             ])
         # An exact version is a reproducibility pin, so prevent background
         # self-updates between recovery invocations. Do not use

@@ -97,13 +97,14 @@ def _run_evaluation_once(
 
         json.dump(eval_res.to_dict(), f, indent=2)
 
-    # F-2a: an infrastructure failure poisoned the test run. The flagged JSON
-    # is already on disk as evidence; raise so the transient-retry loop in
-    # run_evaluation_task re-runs the evaluation instead of scoring it.
-    if eval_res.infrastructure_failure:
+    # F-2a: an infrastructure failure or an incomplete zero-test universe
+    # poisoned the run.  The flagged JSON is already on disk as evidence;
+    # raise so the transient-retry loop re-runs it instead of accepting an
+    # infra-invalid cell as an ordinary scored zero.
+    if eval_res.infrastructure_failure or eval_res.infra_invalid_reason:
+        reason = eval_res.infrastructure_failure or eval_res.infra_invalid_reason
         raise InfrastructureFailureError(
-            f"{milestone_id}: infrastructure failure during evaluation: "
-            f"{eval_res.infrastructure_failure}"
+            f"{milestone_id}: evaluation result is not safe to score: {reason}"
         )
 
     # Use config thresholds to determine resolution
@@ -694,6 +695,12 @@ class E2EOrchestrator:
         self._record_agent_image_provenance()
         self.container_setup.verify_runtime_environment()
         self._record_agent_version()
+
+        # The agent container's iptables + /etc/hosts persist across stop/start,
+        # but the SNI-tunnel sidecar (a separate --rm container) and the agent's
+        # mapping to its (possibly new) IP do not. Re-ensure it here (idempotent)
+        # so the endpoint resolves through a live sidecar before verify probes it.
+        self.container_setup._ensure_sni_sidecar()
 
         # Verify network lockdown is still active (iptables persists across stop/start)
         try:

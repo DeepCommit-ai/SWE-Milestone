@@ -6,13 +6,15 @@
 # (docs/versioning.md); harness/e2e/data_version.py verifies the checkout at
 # trial launch. This script is the remediation it points at.
 #
-# Default is REPORT-ONLY (fetch tags, show where HEAD stands relative to the
-# version tag). It never rewrites the checkout unless --checkout is given,
-# because the data root may hold live trial state on this machine.
+# Default: fetch tags and ALIGN the checkout to the version tag (detached
+# HEAD). Trial state is safe — a dirty tree refuses the checkout, and live
+# trial data lives in gitignored paths a checkout never touches. Use
+# --report-only to just show where HEAD stands.
 #
 # Usage:
-#   ./scripts/pull_data.sh --data-root /path/to/SWE-Milestone-data
-#   ./scripts/pull_data.sh --version v1.0 --checkout   # detached HEAD at tag
+#   ./scripts/pull_data.sh                              # align to the pinned version
+#   ./scripts/pull_data.sh --report-only                # inspect, change nothing
+#   ./scripts/pull_data.sh --data-root /path --version v1.0
 #   SWE_MILESTONE_DATA_ROOT=... ./scripts/pull_data.sh
 set -uo pipefail
 
@@ -20,17 +22,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 DATA_ROOT="${SWE_MILESTONE_DATA_ROOT:-}"
 VERSION=""
-CHECKOUT=false
+CHECKOUT=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --data-root) DATA_ROOT="$2"; shift 2 ;;
-        --version)   VERSION="$2"; shift 2 ;;
-        --checkout)  CHECKOUT=true; shift ;;
+        --data-root)   DATA_ROOT="$2"; shift 2 ;;
+        --version)     VERSION="$2"; shift 2 ;;
+        --report-only) CHECKOUT=false; shift ;;
+        --checkout)    CHECKOUT=true; shift ;;  # legacy alias of the default
         --help|-h)
-            echo "Usage: $0 [--data-root PATH] [--version vX.Y] [--checkout]"
-            echo "Default data root: \$SWE_MILESTONE_DATA_ROOT. Default version:"
-            echo "SWE_MILESTONE_IMAGE_TAG or the harness default (image_version.py)."
+            echo "Usage: $0 [--data-root PATH] [--version vX.Y] [--report-only]"
+            echo "Default: align the checkout to the version tag. Default data root:"
+            echo "\$SWE_MILESTONE_DATA_ROOT. Default version: SWE_MILESTONE_IMAGE_TAG"
+            echo "or manifests/BENCHMARK_VERSION."
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -74,13 +78,13 @@ echo -e "${YELLOW}HEAD ${HEAD_SHA:0:12} != ${VERSION} (${TAG_SHA:0:12})${NC}"
 if $CHECKOUT; then
     # Refuse to move a dirty tree — trial state must never be clobbered.
     if [[ -n "$(git -C "$DATA_ROOT" status --porcelain)" ]]; then
-        echo -e "${RED}Refusing --checkout: the data tree has local changes.${NC}"
+        echo -e "${RED}Refusing checkout: the data tree has local changes.${NC}"
         git -C "$DATA_ROOT" status --short | head -20
         exit 1
     fi
     git -C "$DATA_ROOT" checkout --detach "refs/tags/${VERSION}" || exit 1
     echo -e "${GREEN}OK${NC} checked out ${VERSION} (detached HEAD)"
 else
-    echo "Re-run with --checkout to move the checkout to ${VERSION}."
+    echo "Report-only mode: re-run without --report-only to align to ${VERSION}."
     exit 1
 fi

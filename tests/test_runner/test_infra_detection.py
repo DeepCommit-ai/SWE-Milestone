@@ -7,7 +7,11 @@ import json
 
 import pytest
 
-from harness.e2e.evaluator import EvaluationResult, InfrastructureFailureError
+from harness.e2e.evaluator import (
+    EvaluationResult,
+    InfrastructureFailureError,
+    _finalize_failed_evaluation_result,
+)
 from harness.e2e.orchestrator import _is_transient_error
 from harness.test_runner.core.test_executor import detect_infrastructure_failure
 
@@ -144,8 +148,14 @@ class TestScoringUntrusted:
         assert _mk_result().scoring_untrusted is False
 
     def test_infrastructure_failure_locks_scoring_untrusted(self):
-        res = _mk_result(infrastructure_failure="Could not find a working container runtime strategy")
+        res = _mk_result(
+            resolved=True,
+            infrastructure_failure="Could not find a working container runtime strategy",
+        )
         assert res.scoring_untrusted is True
+        assert res.resolved is False
+        assert res.to_dict()["infra_invalid"] is True
+        assert res.to_dict()["eval_status"] == "infra-invalid"
 
     def test_residue_prune_fail_closed_still_works(self):
         res = _mk_result(residue_prune_skipped_reason="tar-unreadable")
@@ -181,6 +191,49 @@ class TestScoringUntrusted:
         assert res.scoring_untrusted is True
         assert result["infra_invalid"] is True
         assert result["eval_status"] == "infra-invalid"
+
+    def test_runner_exception_preserves_applied_patch_and_overrides_build_failure(self):
+        from harness.test_runner.core.milestone_attempt import RunnerInfrastructureError
+
+        res = _mk_result(
+            patch_successfully_applied=False,
+            pass_to_pass_required=3,
+            start_compile_error="Compilation failed: cannot find symbol",
+        )
+        assert res.scored_failure_reason == "build-failure-with-zero-tests"
+
+        _finalize_failed_evaluation_result(
+            res,
+            RunnerInfrastructureError("outer test runner returned -1"),
+            {"patch_successfully_applied": True},
+        )
+        result = res.to_dict()
+
+        assert result["patch_successfully_applied"] is True
+        assert result["infrastructure_failure"].startswith(
+            "runner-infrastructure-error:"
+        )
+        assert result["scored_failure_reason"] == ""
+        assert result["infra_invalid"] is True
+        assert result["eval_status"] == "infra-invalid"
+
+    def test_non_runner_exception_keeps_deterministic_build_failure(self):
+        res = _mk_result(
+            patch_successfully_applied=False,
+            pass_to_pass_required=3,
+            start_compile_error="Compilation failed: cannot find symbol",
+        )
+
+        _finalize_failed_evaluation_result(
+            res,
+            RuntimeError("deterministic evaluator setup error"),
+            {"patch_successfully_applied": True},
+        )
+
+        assert res.patch_successfully_applied is True
+        assert res.infrastructure_failure == ""
+        assert res.scored_failure_reason == "build-failure-with-zero-tests"
+        assert res.to_dict()["eval_status"] == "failed"
 
 
 VALID_REPORT = '{"tests": [{"nodeid": "t::a", "outcome": "passed"}], "summary": {"total": 1, "passed": 1, "failed": 0, "error": 0, "skipped": 0}}'

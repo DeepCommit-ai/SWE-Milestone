@@ -1,5 +1,6 @@
 import json
 import io
+import hashlib
 import subprocess
 import tarfile
 from types import SimpleNamespace
@@ -14,12 +15,14 @@ from harness.e2e.run_milestone import MilestoneRunner
 from harness.e2e.evaluator import (
     OFFLINE_CACHE_OVERLAY_SCHEMA_VERSION,
     EvaluationResult,
+    InfrastructureFailureError,
     PatchEvaluator,
     _configured_go_toolchain_version,
     _render_offline_cache_overlay_dockerfile,
     _validated_cache_paths,
     ensure_internal_evaluation_network,
     ensure_offline_evaluation_image,
+    load_bound_fallback_test_graft_policy,
 )
 from harness.e2e.repo_config_binding import RepoConfigIdentity
 from harness.e2e.runtime_policy_binding import RuntimePolicyIdentity
@@ -92,6 +95,9 @@ def _bare_evaluator(snapshot):
     evaluator._go_manifest_inventory = None
     evaluator._eval_meta = {}
     evaluator.repo_config = {}
+    evaluator._fallback_test_graft_policy_override = None
+    evaluator.fallback_test_graft_policy_binding_mode = "absent-legacy"
+    evaluator.fallback_test_graft_policy_sha256 = ""
     evaluator.repo_name = "example_owner_repo_v1_v2"
     evaluator.repo_config_binding_mode = "legacy-unbound"
     evaluator.repo_config_sha256 = ""
@@ -115,7 +121,7 @@ def test_rust_filter_failure_aborts_snapshot_application(tmp_path, monkeypatch):
     evaluator._merge_manifest_upserts = lambda **_kwargs: (True, "")
     evaluator._apply_manifest_deletions = lambda: (True, "")
     evaluator._apply_exact_go_manifest_projection = lambda: (True, "")
-    evaluator._run_post_snapshot_script = lambda: (True, "")
+    evaluator._run_post_snapshot_script = lambda **_kwargs: (True, "")
     evaluator._run_go_module_closure = lambda: (True, "")
     monkeypatch.setattr(
         evaluator_module.subprocess,
@@ -951,6 +957,46 @@ def test_orchestrator_cannot_override_go_resolution_lock(
     assert constructed["repo_config_sha256"] == "f" * 64
 
 
+def test_orchestrator_retries_infra_invalid_zero_test_result(tmp_path, monkeypatch):
+    result = _all_pass_result(
+        total_tests=0,
+        passed_tests=0,
+        pass_to_pass_success_count=0,
+        pass_to_pass_required=1,
+        infra_invalid_reason="zero-tests-with-required-tests",
+    )
+
+    class FakeEvaluator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def evaluate(self):
+            return result
+
+    monkeypatch.setattr(orchestrator_module, "PatchEvaluator", FakeEvaluator)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    with pytest.raises(
+        InfrastructureFailureError,
+        match="evaluation result is not safe to score",
+    ):
+        _run_evaluation_once(
+            milestone_id="M001",
+            snapshot_path=tmp_path / "snapshot.tar",
+            result_dir=output_dir,
+            workspace_root=tmp_path,
+            fail_to_pass_threshold=1.0,
+            pass_to_pass_threshold=1.0,
+            none_to_pass_threshold=1.0,
+            baseline_json=tmp_path / "baseline.json",
+            eval_result_path=output_dir / "evaluation_result.json",
+        )
+
+    saved = json.loads((output_dir / "evaluation_result.json").read_text())
+    assert saved["eval_status"] == "infra-invalid"
+
+
 def test_go_test_import_discovery_is_static_and_marks_external_imports(monkeypatch):
     evaluator = _bare_evaluator("unused.tar")
     stream = "\n".join([
@@ -1635,6 +1681,8 @@ def test_start_fallback_grafts_exact_end_tests_without_manifests(tmp_path, monke
     ok, error = evaluator._graft_ground_truth_tests("end")
 
     assert ok and not error
+    # No scoped-policy diff/audit subprocess is introduced for other repos.
+    assert len(calls) == 2
     assert calls[0][1]["input"] == (
         "/testbed/module/src/test/LegacyTest.java\0"
         "/testbed/module/src/test/NewTest.java\0"
@@ -1648,6 +1696,180 @@ def test_start_fallback_grafts_exact_end_tests_without_manifests(tmp_path, monke
     assert "module/src/test/pom.xml" not in restored
     assert "module/src/main/Main.java" not in restored
     assert evaluator._eval_meta["gt_test_graft_restored_count"] == 3
+    assert evaluator._eval_meta["gt_test_graft_mode"] == "legacy-test-dirs"
+
+
+def test_scoped_fallback_grafts_tests_and_explicit_fixture_only(tmp_path, monkeypatch):
+    evaluator = _bare_evaluator(tmp_path / "source_snapshot.tar")
+    evaluator._prune_filter = SrcFileFilter(
+        src_dirs=["dubbo-demo", "dubbo-test"],
+        test_dirs=["**/src/test/**", "dubbo-test/**", "dubbo-demo/**"],
+    )
+    fixture = "dubbo-demo/example/src/main/proto/message.proto"
+    evaluator.repo_config = {
+        "evaluation_fallback_test_graft": {
+            "mode": "scoped",
+            "authoritative_patterns": ["**/src/test/**", "dubbo-test/**"],
+            "fixture_paths": {"M001": [fixture]},
+            "fail_closed_unlisted_patterns": ["dubbo-demo/**/src/main/**"],
+        }
+    }
+    evaluator._git_ls_tree = lambda tag: (
+        {
+            "dubbo-demo/example/src/main/Demo.java",
+            "dubbo-demo/example/src/test/LegacyTest.java",
+            "dubbo-test/harness/src/main/TestHarness.java",
+        }
+        if tag.endswith("-start")
+        else {
+            "dubbo-demo/example/src/main/Demo.java",
+            fixture,
+            "dubbo-demo/example/src/test/NewTest.java",
+            "dubbo-test/harness/src/main/TestHarness.java",
+        }
+    )
+    evaluator._git_changed_paths = lambda _old, _new: {
+        "dubbo-demo/example/src/test/LegacyTest.java",
+        "dubbo-demo/example/src/test/NewTest.java",
+        fixture,
+    }
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed()
+
+    monkeypatch.setattr("harness.e2e.evaluator.subprocess.run", run)
+    ok, error = evaluator._graft_ground_truth_tests("end")
+
+    assert ok and not error
+    removed = calls[0][1]["input"]
+    assert "/testbed/dubbo-demo/example/src/main/Demo.java\0" not in removed
+    assert f"/testbed/{fixture}\0" in removed
+    assert "/testbed/dubbo-demo/example/src/test/LegacyTest.java\0" in removed
+    assert "/testbed/dubbo-demo/example/src/test/NewTest.java\0" in removed
+    assert "/testbed/dubbo-test/harness/src/main/TestHarness.java\0" in removed
+    restored = calls[1][0]
+    assert fixture in restored
+    assert "dubbo-demo/example/src/test/NewTest.java" in restored
+    assert "dubbo-test/harness/src/main/TestHarness.java" in restored
+    assert "dubbo-demo/example/src/main/Demo.java" not in restored
+    assert evaluator._eval_meta["gt_test_graft_mode"] == "scoped"
+    assert evaluator._eval_meta["gt_test_graft_fixture_paths"] == [fixture]
+    assert evaluator._eval_meta["gt_test_graft_unlisted_changed_paths"] == []
+
+
+def test_scoped_fallback_rejects_unlisted_changed_production_fixture(tmp_path):
+    evaluator = _bare_evaluator(tmp_path / "source_snapshot.tar")
+    evaluator._prune_filter = SrcFileFilter(
+        src_dirs=["dubbo-demo"],
+        test_dirs=["**/src/test/**", "dubbo-demo/**"],
+    )
+    unlisted = "dubbo-demo/example/src/main/proto/message.proto"
+    evaluator.repo_config = {
+        "evaluation_fallback_test_graft": {
+            "mode": "scoped",
+            "authoritative_patterns": ["**/src/test/**"],
+            "fixture_paths": {},
+            "fail_closed_unlisted_patterns": ["dubbo-demo/**/src/main/**"],
+        }
+    }
+    evaluator._git_ls_tree = lambda tag: (
+        {"dubbo-demo/example/src/test/LegacyTest.java"}
+        if tag.endswith("-start")
+        else {
+            "dubbo-demo/example/src/test/NewTest.java",
+            unlisted,
+        }
+    )
+    evaluator._git_changed_paths = lambda _old, _new: {
+        "dubbo-demo/example/src/test/LegacyTest.java",
+        "dubbo-demo/example/src/test/NewTest.java",
+        unlisted,
+    }
+
+    ok, error = evaluator._graft_ground_truth_tests("end")
+
+    assert ok is False
+    assert "outside the explicit authority contract" in error
+    assert unlisted in error
+    assert evaluator._eval_meta["gt_test_graft_unlisted_changed_paths"] == [
+        unlisted
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy, message",
+    [
+        ({"mode": "other"}, "mode must be 'scoped'"),
+        (
+            {
+                "mode": "scoped",
+                "authoritative_patterns": ["../src/test/**"],
+                "fail_closed_unlisted_patterns": ["**/src/main/**"],
+            },
+            "unsafe repository glob",
+        ),
+        (
+            {
+                "mode": "scoped",
+                "authoritative_patterns": ["**/src/test/**"],
+                "fail_closed_unlisted_patterns": ["**/src/main/**"],
+                "fixture_paths": {"M001": ["pom.xml"]},
+            },
+            "cannot own build manifest",
+        ),
+    ],
+)
+def test_scoped_fallback_policy_rejects_invalid_config(tmp_path, policy, message):
+    evaluator = _bare_evaluator(tmp_path / "source_snapshot.tar")
+    evaluator.repo_config = {"evaluation_fallback_test_graft": policy}
+
+    with pytest.raises(ValueError, match=message):
+        evaluator._fallback_test_graft_policy()
+
+
+def test_fallback_graft_policy_is_separately_hash_pinned_and_repo_scoped(tmp_path):
+    path = tmp_path / "fallback_policy.yaml"
+    path.write_text(
+        "schema_version: 1\n"
+        "repo_name: example_owner_repo_v1_v2\n"
+        "policy:\n"
+        "  mode: scoped\n"
+        "  authoritative_patterns:\n"
+        "    - '**/src/test/**'\n"
+        "  fixture_paths: {}\n"
+        "  fail_closed_unlisted_patterns:\n"
+        "    - '**/src/main/**'\n"
+    )
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    policy = load_bound_fallback_test_graft_policy(
+        "example_owner_repo_v1_v2", path, digest
+    )
+
+    assert policy["mode"] == "scoped"
+    with pytest.raises(ValueError, match="digest mismatch"):
+        load_bound_fallback_test_graft_policy(
+            "example_owner_repo_v1_v2", path, "0" * 64
+        )
+    with pytest.raises(ValueError, match="repo mismatch"):
+        load_bound_fallback_test_graft_policy("another_repo", path, digest)
+
+
+def test_explicit_fallback_graft_policy_overrides_absent_repo_policy(tmp_path):
+    evaluator = _bare_evaluator(tmp_path / "source_snapshot.tar")
+    evaluator._fallback_test_graft_policy_override = {
+        "mode": "scoped",
+        "authoritative_patterns": ["**/src/test/**"],
+        "fixture_paths": {},
+        "fail_closed_unlisted_patterns": ["**/src/main/**"],
+    }
+
+    policy = evaluator._fallback_test_graft_policy()
+
+    assert policy["mode"] == "scoped"
+    assert policy["authoritative_patterns"] == ("**/src/test/**",)
 
 
 def test_post_snapshot_script_is_workspace_pinned_hashed_and_fail_closed(tmp_path, monkeypatch):
@@ -1669,8 +1891,23 @@ def test_post_snapshot_script_is_workspace_pinned_hashed_and_fail_closed(tmp_pat
     assert ok and not error
     assert calls[0][:2] == ["docker", "cp"]
     assert calls[1][-2:] == ["bash", "/tmp/evaluation-post-snapshot.sh"]
+    # Evaluation context must reach the script via env, not container-side
+    # inference (reordered datasets pin several milestone tags to one commit).
+    exec_cmd = " ".join(calls[1])
+    assert "SWE_MILESTONE_ID=M001" in exec_cmd
+    assert "SWE_MILESTONE_BASE_TAG=milestone-M001-end" in exec_cmd
+    assert "SWE_MILESTONE_LEGACY_SNAPSHOT=0" in exec_cmd
     assert evaluator._eval_meta["post_snapshot_script_applied"] is True
     assert len(evaluator._eval_meta["post_snapshot_script_sha256"]) == 64
+
+    # START fallback passes its base through; legacy downgrade is visible.
+    evaluator.snapshot_legacy_unverified = True
+    calls.clear()
+    ok, error = evaluator._run_post_snapshot_script(base_suffix="start")
+    assert ok and not error
+    exec_cmd = " ".join(calls[1])
+    assert "SWE_MILESTONE_BASE_TAG=milestone-M001-start" in exec_cmd
+    assert "SWE_MILESTONE_LEGACY_SNAPSHOT=1" in exec_cmd
 
     monkeypatch.setattr(
         "harness.e2e.evaluator.subprocess.run",

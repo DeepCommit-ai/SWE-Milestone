@@ -17,6 +17,11 @@ records "1.0" plus the data-repo commit it was produced from.
    per test id. Promotion of re-eval results into the primary record is a
    separate, explicit, human-approved step — not part of this procedure and
    currently not enabled.
+4. **An output file is not proof of completion.** A replay cell is valid only
+   when the evaluator exits `0` or `1`, `patch_successfully_applied` is true,
+   and neither `infra_invalid` nor `infrastructure_failure` is set. Exit `2`
+   and `eval_status: infra-invalid` retain diagnostic evidence, but must be
+   retried or refined; they are never promotable ordinary zeroes.
 
 ## Where things live
 
@@ -34,6 +39,16 @@ comparison is "same relative path, two roots". Patched images get a distinct
 local tag (recorded in `EXPECTATION.md`); published tags are never
 overwritten.
 
+**Evaluation-time repo hooks** live in the data workspace, wired via the repo
+config key `evaluation_post_snapshot_script` (e.g. dubbo's Maven closure,
+go-zero's go.mod backfill). The evaluator runs the hook after every snapshot
+application (END base and START fallback alike), passes context via env —
+`SWE_MILESTONE_ID`, `SWE_MILESTONE_BASE_TAG`,
+`SWE_MILESTONE_LEGACY_SNAPSHOT` (`1` when running under
+`--allow-legacy-snapshot`) — and echoes the script's stdout into the eval log
+as its audit trail. Hook identity (path + sha256 + applied flag) is persisted
+in `evaluation_result.json`.
+
 ## How to re-evaluate one (arm × milestone)
 
 Offline evaluator CLI against the patched image, feeding the frozen agent
@@ -49,6 +64,13 @@ python -m harness.e2e.evaluator \
 
 (Exact flags per `harness/e2e/evaluator.py --help`; `filter_list` is applied
 automatically when present.)
+
+Batch drivers must apply the validity gate above when deciding whether to
+skip an existing cell and again before reporting the campaign complete. The
+formal orchestrator retries this condition automatically; a direct CLI loop
+must do the same explicitly. After retries are exhausted, leave the evidence
+in the re-evaluation tree and mark the campaign incomplete rather than
+substituting a score.
 
 ## How to compare
 

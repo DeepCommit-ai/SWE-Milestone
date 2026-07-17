@@ -26,6 +26,14 @@ from harness.e2e.quarantine import (
     load_quarantine_env,
     normalize_maven_plugin_probes,
 )
+from harness.e2e import sni_tunnel as sni_tunnel_module
+from harness.e2e.sni_tunnel import tunnel_plan
+
+# Port the SNI-tunnel sidecar listens on. 443 so the agent container can reach
+# it at endpoint:443 (mapped to the sidecar IP in /etc/hosts) with no port
+# rewrite — the sidecar runs as root in its own container, so binding 443 is
+# free. See _ensure_sni_sidecar + harness/e2e/sni_tunnel.py.
+SNI_SIDECAR_PORT = 443
 from harness.e2e.runtime_policy_binding import (
     RUNTIME_POLICY_ENV_KEYS,
     RuntimePolicyBinding,
@@ -350,6 +358,12 @@ class ContainerSetup:
         self.repo_name = repo_name
         self.runtime_policy_binding = runtime_policy_binding
         self.resolved_image_id: Optional[str] = None
+        # SNI-pinned tunnel sidecar (anti-cheat method A). Started when this
+        # repo's quarantine would CIDR-block the trial's LLM endpoint (a
+        # Cloudflare-fronted host it shares with a denied registry). Both stay
+        # None when not needed. See harness/e2e/sni_tunnel.py + docs/quarantine.md.
+        self._sni_tunnel_host: Optional[str] = None
+        self._sni_tunnel_sidecar_ip: Optional[str] = None
 
         if (
             self.runtime_policy_binding is not None
@@ -1711,6 +1725,119 @@ echo "Git history truncated successfully"
                 logger.warning(f"SWE_MILESTONE_DENY_CIDRS pruned {before - len(ips)} resolved IPs in denied ranges")
         return ips
 
+    def _sni_sidecar_name(self) -> str:
+        return f"{self.container_name}-snitun"
+
+    def _sni_sidecar_ip(self) -> Optional[str]:
+        result = subprocess.run(
+            [
+                "docker", "inspect", "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                self._sni_sidecar_name(),
+            ],
+            capture_output=True, text=True,
+        )
+        ip = result.stdout.strip()
+        return ip or None
+
+    def _ensure_sni_sidecar(self) -> Optional[tuple[str, str]]:
+        """Ensure the SNI-tunnel sidecar is up and wired into the agent container.
+
+        Returns (endpoint_host, sidecar_ip) when a tunnel is active, else None.
+        Idempotent and used on both fresh-lock and resume.
+
+        A tunnel is required only when quarantine denies a CIDR the trial's LLM
+        endpoint (UNIFIED_BASE_URL host) resolves into AND that host is in the
+        code-level SNI_TUNNELABLE_DOMAINS allowlist — i.e. the endpoint shares a
+        CDN range with a denied registry and would otherwise be blocked with it.
+
+        The forwarder runs in a SEPARATE container (not on the host: this host
+        blocks container->host traffic, and not in the agent container: the
+        agent controls it). The agent container reaches the sidecar over the
+        Docker bridge (container->container), maps the endpoint to the sidecar
+        in /etc/hosts, and ACCEPTs only the sidecar IP on :443. The sidecar
+        relays ONLY the pinned SNI, so the registry that shares the denied CDN
+        range stays unreachable. See harness/e2e/sni_tunnel.py.
+        """
+        deny_cidrs = [
+            c.strip()
+            for c in os.environ.get("SWE_MILESTONE_DENY_CIDRS", "").split(",")
+            if c.strip()
+        ]
+        host = tunnel_plan(os.environ.get("UNIFIED_BASE_URL", ""), deny_cidrs)
+        if not host:
+            return None
+
+        name = self._sni_sidecar_name()
+        running = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", name],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if running != "true":
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            sni_src = str(Path(sni_tunnel_module.__file__).resolve())
+            # --entrypoint python3 bypasses the image's own ENTRYPOINT (e.g. the
+            # node image's docker-entrypoint.sh) so the tunnel runs directly.
+            launch = subprocess.run(
+                [
+                    "docker", "run", "-d", "--restart", "no", "--user", "0",
+                    "--name", name,
+                    "-v", f"{sni_src}:/sni_tunnel.py:ro",
+                    "--entrypoint", "python3",
+                    self.image_name,
+                    "/sni_tunnel.py",
+                    "--pin", host,
+                    "--listen", f"0.0.0.0:{SNI_SIDECAR_PORT}",
+                    "--upstream", f"{host}:443",
+                ],
+                capture_output=True, text=True,
+            )
+            if launch.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to start SNI tunnel sidecar {name}: {launch.stderr.strip()}"
+                )
+            logger.info(f"  SNI tunnel sidecar {name} started (pinned to {host})")
+
+        sidecar_ip = self._sni_sidecar_ip()
+        if not sidecar_ip:
+            raise RuntimeError(
+                f"SNI tunnel sidecar {name} has no IP — cannot wire the tunnel"
+            )
+
+        # Wire the agent container: map endpoint -> sidecar and ACCEPT the
+        # sidecar IP on the tunnel port. Idempotent (drop any prior mapping /
+        # duplicate ACCEPT first) so resume and re-lock converge cleanly.
+        wire = (
+            f"grep -v ' {host}$' /etc/hosts > /etc/hosts.new || true; "
+            f"printf '%s %s\\n' '{sidecar_ip}' '{host}' >> /etc/hosts.new; "
+            f"cat /etc/hosts.new > /etc/hosts; rm -f /etc/hosts.new; "
+            f"chmod 644 /etc/hosts; "
+            f"iptables -C OUTPUT -d {sidecar_ip} -p tcp --dport {SNI_SIDECAR_PORT} -j ACCEPT 2>/dev/null "
+            f"|| iptables -I OUTPUT 1 -d {sidecar_ip} -p tcp --dport {SNI_SIDECAR_PORT} -j ACCEPT"
+        )
+        wired = subprocess.run(
+            ["docker", "exec", self.container_name, "/bin/sh", "-c", wire],
+            capture_output=True, text=True,
+        )
+        if wired.returncode != 0:
+            raise RuntimeError(
+                f"Failed to wire SNI tunnel into {self.container_name}: {wired.stderr.strip()}"
+            )
+
+        self._sni_tunnel_host = host
+        self._sni_tunnel_sidecar_ip = sidecar_ip
+        logger.info(
+            "  SNI tunnel active: %s -> sidecar %s:%d, pinned to %s (quarantine "
+            "CIDR-blocks its CDN range; registry stays denied)",
+            host, sidecar_ip, SNI_SIDECAR_PORT, host,
+        )
+        return (host, sidecar_ip)
+
+    def stop_sni_tunnel(self) -> None:
+        subprocess.run(
+            ["docker", "rm", "-f", self._sni_sidecar_name()], capture_output=True
+        )
+
     def lock_network(self) -> None:
         """Apply whitelist-based network lockdown inside the container.
 
@@ -1935,6 +2062,12 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         )
         logger.info(f"  {sudo_result.stdout.strip()}")
 
+        # --- Step 6b: SNI-pinned tunnel sidecar (if the LLM endpoint is
+        # CIDR-blocked). Adds the endpoint->sidecar /etc/hosts mapping and the
+        # sidecar-IP ACCEPT to the just-applied lockdown. Same code path is used
+        # on resume, so it must run after the base lockdown is in place.
+        self._ensure_sni_sidecar()
+
         # --- Step 7: Verify lockdown ---
         self.verify_network_lockdown()
 
@@ -1986,6 +2119,80 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
                 f"network probe timed out after 15s for {url} — cannot verify lockdown"
             ) from e
         return _interpret_probe(result.returncode, result.stdout)
+
+    def _tls_handshake_reachable_in_container(
+        self, connect_host: str, port: int, sni: str, user: str = "fakeroot"
+    ) -> bool:
+        """True if a TLS handshake to connect_host:port with `sni` completes.
+
+        Connects (respecting /etc/hosts) and drives a real TLS handshake with
+        the given SNI. Used to assert both directions of the SNI tunnel: the
+        pinned endpoint handshakes (relayed to the real upstream), while a
+        registry SNI does NOT (the forwarder drops it). Certs are not verified —
+        a completed ServerHello is proof the connection was relayed.
+        """
+        probe = (
+            "import sys, socket, ssl\n"
+            "host, port, sni = sys.argv[1], int(sys.argv[2]), sys.argv[3]\n"
+            "ctx = ssl.create_default_context()\n"
+            "ctx.check_hostname = False\n"
+            "ctx.verify_mode = ssl.CERT_NONE\n"
+            "try:\n"
+            "    raw = socket.create_connection((host, port), timeout=8)\n"
+            "    s = ctx.wrap_socket(raw, server_hostname=sni)\n"
+            "    s.close()\n"
+            "    print('REACH')\n"
+            "except Exception:\n"
+            "    print('BLOCK')\n"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "exec", "--user", user,
+                    "-e", f"HOME=/home/{user}" if user != "root" else "HOME=/root",
+                    self.container_name, "python3", "-c", probe,
+                    connect_host, str(port), sni,
+                ],
+                capture_output=True, text=True, timeout=20,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"SNI tunnel probe timed out for {connect_host}:{port} sni={sni}"
+            ) from e
+        return result.stdout.strip().endswith("REACH")
+
+    def _verify_sni_tunnel(self) -> None:
+        """Assert the SNI tunnel relays the pinned endpoint and blocks detours.
+
+        No-op unless a tunnel was started for this container. Two invariants:
+          (a) the pinned endpoint completes a TLS handshake through the tunnel
+              (LLM path works), and
+          (b) a registry SNI to the same gateway is refused (the answer-fetch
+              detour the tunnel could otherwise open stays closed).
+        """
+        host = self._sni_tunnel_host
+        sidecar_ip = self._sni_tunnel_sidecar_ip
+        if not host or not sidecar_ip:
+            return
+        # (a) endpoint handshakes through the sidecar (endpoint -> sidecar via
+        #     /etc/hosts -> relayed to the real upstream).
+        if not self._tls_handshake_reachable_in_container(host, SNI_SIDECAR_PORT, host):
+            raise RuntimeError(
+                f"SNI tunnel verification failed: pinned endpoint {host} did not "
+                f"complete a TLS handshake through the sidecar — LLM path broken"
+            )
+        # (b) a registry SNI straight to the sidecar IP must be refused.
+        if self._tls_handshake_reachable_in_container(
+            sidecar_ip, SNI_SIDECAR_PORT, "registry.npmjs.org"
+        ):
+            raise RuntimeError(
+                f"SNI tunnel verification failed: a registry SNI (registry.npmjs.org) "
+                f"was relayed through sidecar {sidecar_ip} — the answer-fetch detour is OPEN"
+            )
+        logger.info(
+            f"  SNI tunnel verified: {host} handshakes through the sidecar; "
+            f"registry SNI detour blocked"
+        )
 
     def verify_network_lockdown(self) -> bool:
         """Verify that network lockdown is active in the container.
@@ -2149,6 +2356,9 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         if sudo_result.returncode == 0:
             raise RuntimeError("Network lockdown verification failed: fakeroot still has sudo access")
 
+        # SNI tunnel (if active): endpoint relays, registry-SNI detour blocked.
+        self._verify_sni_tunnel()
+
         logger.info("  Lockdown verified: github.com blocked, sudo revoked, OUTPUT policy DROP")
         return True
 
@@ -2220,6 +2430,9 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         Args:
             remove: If True, remove container; otherwise just stop it
         """
+        # Stop the host-side SNI tunnel thread first (harmless if none).
+        self.stop_sni_tunnel()
+
         if not self.container_exists():
             return
 

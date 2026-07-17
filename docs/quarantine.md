@@ -387,11 +387,12 @@ Containers additionally launch with `--pull=never`: a missing local image is
 a loud failure, never a silent registry fetch mid-eval.
 
 **Distribution.** `scripts/pull_images.sh` executes the plan emitted by
-`python3 -m harness.e2e.image_version pull-plan` from the inventory
-`manifests/images-<version>.tsv`: every image (base, base-offline, all
-milestones — base-offline is not special) is pulled from
-`<org>/swe-milestone__<repo_full>__<milestone>:<version>` and retagged to the
-local `swe-milestone/<repo_full>__<milestone>:<version>`. A failed pull is a
+`python3 -m harness.e2e.image_version pull-plan` from the digest manifest
+`manifests/digests-<version>.tsv`: every image (base, base-offline, all
+milestones — base-offline is not special) is pulled **by content digest**
+(`<org>/swe-milestone__<repo_full>__<milestone>@sha256:…`, immune to Hub tag
+replacement) and retagged to the local
+`swe-milestone/<repo_full>__<milestone>:<version>`. A failed pull is a
 per-image WARN; the script continues, prints the full failure list, and exits
 non-zero. Note that pulling **re-points local tags at the Hub version** —
 that's what "aligning a machine" means, so make sure the Hub holds what you
@@ -411,10 +412,11 @@ per Step 3, or the harness will keep launching the previous generation.
   rejects anything else and `verify` honors only the intersection). Their
   defense is downgraded: `/etc/hosts` poisoning + a local-only `GOPROXY`. That stops the
   toolchain and ordinary curl, **not** a deliberate `curl --resolve` with a
-  known Google IP. The definitive fix for this whole shared-CDN class is a
-  future **SNI-filtering egress proxy** (terminate all egress at a proxy that
-  filters by hostname, so IP sharing stops mattering); until then this residual
-  is accepted and documented.
+  known Google IP. The definitive fix for this whole shared-CDN class is an
+  SNI-filtering proxy that filters by hostname so IP sharing stops mattering;
+  §10 implements exactly that for the *inverse* case (a wanted LLM endpoint
+  sharing a denied CDN). Extending it to also front the denied Go domains would
+  retire this residual; until then it is accepted and documented.
 - **Training data.** These are public repos; version B may be in the model's
   weights. Quarantine prevents *fetching*, not *remembering* — inherent to any
   public-repo benchmark.
@@ -429,6 +431,39 @@ per Step 3, or the harness will keep launching the previous generation.
   outside the closure, the install fails loudly (`No matching distribution` /
   `not found in vendored sources` / GOPROXY-off errors in the trace) — extend
   the closure, rebuild, promote. Detectable, never a silent leak.
+
+## 10. SNI-pinned tunnel — reaching an LLM endpoint through a denied CDN
+
+Some LLM endpoints sit behind the **same CDN a repo's registry rides**. The
+starkest case: `api.kimi.com` and `api.moonshot.ai` are Cloudflare-fronted, and
+element-web denies Cloudflare `104.16.0.0/12` to block npm. IP-denying the
+range blocks npm *and* the model. Domain whitelisting can't help — the firewall
+filters at the IP layer, where a Cloudflare edge is reachable via SNI for **any**
+Cloudflare site (a `curl --resolve registry.npmjs.org:443:<kimi-edge-ip>` fetches
+npm; confirmed). So the endpoint and the registry are genuinely indistinguishable
+at the IP layer.
+
+The fix (`harness/e2e/sni_tunnel.py`, wired in `container_setup._ensure_sni_sidecar`):
+
+- A **sidecar container** on the same Docker bridge runs an SNI-pinned forwarder.
+  It reads each connection's TLS ClientHello, and relays **only** when the SNI is
+  the pinned endpoint — any other SNI (e.g. a spoofed `registry.npmjs.org`) is
+  dropped. It never decrypts, so TLS stays end-to-end and the cert validates.
+- The agent container maps the endpoint to the sidecar in `/etc/hosts` and
+  `ACCEPT`s only the sidecar IP; Cloudflare's real range stays `DROP`'d, so the
+  registry remains unreachable. (Sidecar, not a host process: this class of host
+  blocks container→host traffic; sidecar, not in the agent container: the agent
+  controls that one.)
+- **Activation is a code-level fact, never a self-declaration.** A tunnel is set
+  up only when the trial's `UNIFIED_BASE_URL` host is in the hardcoded
+  `SNI_TUNNELABLE_DOMAINS` allowlist (LLM endpoints only — a registry can never
+  appear there) **and** resolves into a `deny_cidr`. Dormant for every repo/model
+  that doesn't need it.
+- **Verified at lockdown.** `verify_network_lockdown` asserts both directions:
+  the endpoint completes a TLS handshake through the sidecar, and a
+  `registry.npmjs.org` SNI straight to the sidecar is refused. The three detours
+  all fail: direct-to-Cloudflare (IP `DROP`), tunnel-with-registry-SNI (forwarder
+  drop), tunnel-with-endpoint-SNI-but-registry-Host (Cloudflare answers `403`).
 
 ## History
 

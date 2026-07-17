@@ -91,3 +91,51 @@ def test_orchestrator_records_actual_agent_version(tmp_path):
         "requested_agent_version": "stable",
         "agent_version": "2.1.158",
     }
+
+
+# ---------------------------------------------------------------------------
+# codex / gemini-cli agent_version support (npm-installed CLIs)
+# ---------------------------------------------------------------------------
+from harness.e2e.agents.base import validate_agent_cli_version
+from harness.e2e.agents.codex import CodexFramework
+from harness.e2e.agents.gemini import GeminiFramework
+
+
+@pytest.mark.parametrize("value", ["0.144.5", "latest", None])
+def test_validate_agent_cli_version_accepts_semver_and_latest(value):
+    assert validate_agent_cli_version(value, agent_label="Codex") == value
+
+
+@pytest.mark.parametrize("value", ["stable", "v1.2", "1.2", "newest"])
+def test_validate_agent_cli_version_rejects_bad_selectors(value):
+    with pytest.raises(ValueError):
+        validate_agent_cli_version(value, agent_label="Codex")
+
+
+@pytest.mark.parametrize(
+    "cls,pkg,placeholder",
+    [
+        (CodexFramework, "@openai/codex", "__CODEX_AGENT_VERSION__"),
+        (GeminiFramework, "@google/gemini-cli", "__GEMINI_AGENT_VERSION__"),
+    ],
+)
+def test_npm_agents_version_interface_and_script_injection(cls, pkg, placeholder):
+    fw = cls(api_key="k", agent_version="1.2.3")
+    assert fw.get_requested_version() == "1.2.3"
+    assert fw.get_version_command()
+    assert fw.parse_version_output(f"{pkg} 1.2.3 (something)") == "1.2.3"
+    assert fw.version_matches_request("1.2.3")
+    assert not fw.version_matches_request("1.2.4")
+
+    script = fw.get_container_init_script("tester")
+    assert placeholder not in script  # placeholder must be substituted
+    assert "requested_version = '1.2.3'" in script
+    assert pkg in script
+
+    # latest always matches whatever the installer resolved
+    fw_latest = cls(api_key="k", agent_version="latest")
+    assert fw_latest.version_matches_request("9.9.9")
+    # unset -> no pin, script carries None
+    fw_none = cls(api_key="k")
+    assert fw_none.get_requested_version() is None
+    assert "requested_version = None" in fw_none.get_container_init_script("tester")

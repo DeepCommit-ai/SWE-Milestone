@@ -78,7 +78,10 @@ from harness.utils.snapshot import (
     snapshot_sha256,
 )
 from harness.utils.test_id_normalizer import TestIdNormalizer
-from harness.test_runner.core.milestone_attempt import run_single_state_tests
+from harness.test_runner.core.milestone_attempt import (
+    RunnerInfrastructureError,
+    run_single_state_tests,
+)
 from harness.test_runner.core.test_executor import (
     detect_infrastructure_failure,
     extract_first_fatal_error,
@@ -97,6 +100,54 @@ GO_EVALUATOR_PATH = (
     "/usr/sbin:/usr/bin:/sbin:/bin"
 )
 INTERNAL_EVALUATION_NETWORK = "evoclaw-eval-internal-v1"
+FALLBACK_TEST_GRAFT_POLICY_SCHEMA_VERSION = 1
+
+
+def _validated_repo_glob_patterns(value: object, *, field: str) -> Tuple[str, ...]:
+    """Return safe repository-relative gitwildmatch patterns.
+
+    These patterns select evaluator-owned files that are later passed to
+    ``git checkout``/``rm`` inside the evaluator container.  Repo config is
+    benchmark-owned, but malformed patterns must still fail closed instead of
+    widening authority to an absolute or parent path.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} must be a non-empty list")
+    patterns: List[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{field} entries must be non-empty strings")
+        pattern = raw.strip()
+        if (
+            "\x00" in pattern
+            or "\\" in pattern
+            or pattern.startswith("/")
+            or any(part == ".." for part in pattern.split("/"))
+        ):
+            raise ValueError(f"unsafe repository glob in {field}: {raw!r}")
+        if pattern in patterns:
+            raise ValueError(f"duplicate repository glob in {field}: {pattern!r}")
+        patterns.append(pattern)
+    return tuple(patterns)
+
+
+def _validated_fixture_paths(value: object, *, field: str) -> FrozenSet[str]:
+    """Return exact, safe, non-manifest evaluator fixture paths."""
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+    normalized: List[str] = []
+    for raw in value:
+        path = normalize_snapshot_path(raw)
+        if is_build_manifest(path):
+            raise ValueError(
+                f"{field} cannot own build manifest {path}; use manifest/closure policy"
+            )
+        if path in normalized:
+            raise ValueError(f"{field} contains duplicate path: {path}")
+        normalized.append(path)
+    return frozenset(normalized)
 
 
 def _validated_overlay_paths(value: object, *, field: str) -> List[str]:
@@ -590,6 +641,70 @@ def load_bound_repo_config(
     return value
 
 
+def load_bound_fallback_test_graft_policy(
+    repo_name: str,
+    policy_path: Path,
+    expected_sha256: str,
+) -> dict:
+    """Load a hash-pinned evaluator-only fallback graft policy.
+
+    This policy is intentionally separate from the trial repo config.  It may
+    change how an evaluator constructs the START fallback tree, but it cannot
+    alter the agent snapshot capture contract that the integrity sidecar binds.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
+        raise ValueError(
+            "fallback test graft policy SHA256 must be 64 lowercase hex characters"
+        )
+    path = Path(policy_path)
+    if path.is_symlink():
+        raise ValueError(
+            f"fallback test graft policy must not be a symlink: {path}"
+        )
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read fallback test graft policy at {path}: {exc}"
+        ) from exc
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected_sha256:
+        raise ValueError(
+            f"fallback test graft policy digest mismatch at {path}: "
+            f"expected {expected_sha256}, got {actual}"
+        )
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"invalid fallback test graft policy YAML at {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"fallback test graft policy at {path} must contain a YAML mapping"
+        )
+    allowed = {"schema_version", "repo_name", "policy"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(
+            f"fallback test graft policy contains unknown keys: {unknown}"
+        )
+    if value.get("schema_version") != FALLBACK_TEST_GRAFT_POLICY_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported fallback test graft policy schema_version: "
+            f"{value.get('schema_version')!r}"
+        )
+    if value.get("repo_name") != repo_name:
+        raise ValueError(
+            "fallback test graft policy repo mismatch: "
+            f"expected {repo_name!r}, got {value.get('repo_name')!r}"
+        )
+    policy = value.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("fallback test graft policy.policy must be an object")
+    return policy
+
+
 def normalize_java_hashcode(nodeid: str) -> str:
     """
     Normalize Java object hashcodes in test nodeids.
@@ -1016,6 +1131,11 @@ class EvaluationResult:
     gt_test_graft_suffix: str = ""
     gt_test_graft_removed_count: int = 0
     gt_test_graft_restored_count: int = 0
+    gt_test_graft_mode: str = "legacy-test-dirs"
+    gt_test_graft_fixture_paths: List[str] = field(default_factory=list)
+    gt_test_graft_unlisted_changed_paths: List[str] = field(default_factory=list)
+    fallback_test_graft_policy_binding_mode: str = "absent-legacy"
+    fallback_test_graft_policy_sha256: str = ""
     offline_cache_overlay_image: str = ""
     offline_cache_milestone_image_id: str = ""
     offline_cache_closure_image_id: str = ""
@@ -1090,7 +1210,7 @@ class EvaluationResult:
                 if self.scored_failure_reason == BUILD_FAILURE_WITH_ZERO_TESTS:
                     self.scored_failure_reason = ""
                 self.infra_invalid_reason = ZERO_TESTS_WITH_REQUIRED_TESTS
-        if self.infra_invalid_reason:
+        if self.infrastructure_failure or self.infra_invalid_reason:
             self.resolved = False
         if self.scored_failure_reason:
             self.resolved = False
@@ -1195,6 +1315,17 @@ class EvaluationResult:
             "gt_test_graft_suffix": self.gt_test_graft_suffix,
             "gt_test_graft_removed_count": self.gt_test_graft_removed_count,
             "gt_test_graft_restored_count": self.gt_test_graft_restored_count,
+            "gt_test_graft_mode": self.gt_test_graft_mode,
+            "gt_test_graft_fixture_paths": self.gt_test_graft_fixture_paths,
+            "gt_test_graft_unlisted_changed_paths": (
+                self.gt_test_graft_unlisted_changed_paths
+            ),
+            "fallback_test_graft_policy_binding_mode": (
+                self.fallback_test_graft_policy_binding_mode
+            ),
+            "fallback_test_graft_policy_sha256": (
+                self.fallback_test_graft_policy_sha256
+            ),
             "offline_cache_overlay_image": self.offline_cache_overlay_image,
             "offline_cache_milestone_image_id": self.offline_cache_milestone_image_id,
             "offline_cache_closure_image_id": self.offline_cache_closure_image_id,
@@ -1234,9 +1365,11 @@ class EvaluationResult:
         }
         result["infrastructure_failure"] = self.infrastructure_failure
         result["scored_failure_reason"] = self.scored_failure_reason
-        result["infra_invalid"] = bool(self.infra_invalid_reason)
+        result["infra_invalid"] = bool(
+            self.infrastructure_failure or self.infra_invalid_reason
+        )
         result["infra_invalid_reason"] = self.infra_invalid_reason
-        if self.infra_invalid_reason:
+        if result["infra_invalid"]:
             result["eval_status"] = "infra-invalid"
         elif self.scored_failure_reason:
             result["eval_status"] = "failed"
@@ -1668,6 +1801,8 @@ class PatchEvaluator:
         build_failure_fail_closed: bool = False,
         repo_config_path: Optional[Path] = None,
         repo_config_sha256: Optional[str] = None,
+        fallback_test_graft_policy_path: Optional[Path] = None,
+        fallback_test_graft_policy_sha256: Optional[str] = None,
         runtime_policy_path: Optional[Path] = None,
         runtime_policy_sha256: Optional[str] = None,
         runtime_policy_mode: Optional[str] = None,
@@ -1727,6 +1862,42 @@ class PatchEvaluator:
                 "Repository config is legacy-unbound; use --repo-config plus "
                 "--repo-config-sha256 for reproducible/promotion-grade evaluation"
             )
+
+        fallback_policy_values = (
+            fallback_test_graft_policy_path,
+            fallback_test_graft_policy_sha256,
+        )
+        if any(value is not None for value in fallback_policy_values) and not all(
+            value is not None for value in fallback_policy_values
+        ):
+            raise ValueError(
+                "fallback_test_graft_policy_path and "
+                "fallback_test_graft_policy_sha256 must be provided together"
+            )
+        self._fallback_test_graft_policy_override: Optional[dict] = None
+        if all(value is not None for value in fallback_policy_values):
+            policy = load_bound_fallback_test_graft_policy(
+                self.repo_name,
+                fallback_test_graft_policy_path,
+                fallback_test_graft_policy_sha256,
+            )
+            repo_policy = self.repo_config.get("evaluation_fallback_test_graft")
+            if repo_policy is not None and repo_policy != policy:
+                raise ValueError(
+                    "explicit fallback test graft policy conflicts with the "
+                    "trial repo config"
+                )
+            self._fallback_test_graft_policy_override = policy
+            self.fallback_test_graft_policy_binding_mode = "evaluator-pinned"
+            self.fallback_test_graft_policy_sha256 = (
+                fallback_test_graft_policy_sha256
+            )
+        elif "evaluation_fallback_test_graft" in self.repo_config:
+            self.fallback_test_graft_policy_binding_mode = "repo-config"
+            self.fallback_test_graft_policy_sha256 = self.repo_config_sha256
+        else:
+            self.fallback_test_graft_policy_binding_mode = "absent-legacy"
+            self.fallback_test_graft_policy_sha256 = ""
         self._project_root = Path(__file__).resolve().parents[2]
         runtime_binding_values = (
             runtime_policy_path,
@@ -1841,6 +2012,11 @@ class PatchEvaluator:
 
         # Fail-loud eval metadata threaded into EvaluationResult (spec phase 1a)
         self._eval_meta: Dict[str, Any] = {
+            # Keep this independent from test completion.  If the outer runner
+            # later times out, the failure result must still say that the
+            # submitted snapshot was applied successfully; otherwise replay
+            # audits incorrectly report a patch-application regression.
+            "patch_successfully_applied": False,
             "base_tag": "",
             "fallback_triggered": False,
             "end_compile_error": "",
@@ -1874,6 +2050,15 @@ class PatchEvaluator:
             "gt_test_graft_suffix": "",
             "gt_test_graft_removed_count": 0,
             "gt_test_graft_restored_count": 0,
+            "gt_test_graft_mode": "legacy-test-dirs",
+            "gt_test_graft_fixture_paths": [],
+            "gt_test_graft_unlisted_changed_paths": [],
+            "fallback_test_graft_policy_binding_mode": (
+                self.fallback_test_graft_policy_binding_mode
+            ),
+            "fallback_test_graft_policy_sha256": (
+                self.fallback_test_graft_policy_sha256
+            ),
             "offline_cache_overlay_image": "",
             "offline_cache_milestone_image_id": "",
             "offline_cache_closure_image_id": "",
@@ -2406,6 +2591,23 @@ if test -x /usr/bin/git.real; then git_bin=/usr/bin/git.real; fi
         cmd = [
             "docker", "exec", self.container_name, "bash", "-c", script,
             "evoclaw-ls-tree", tag_name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        return {p for p in result.stdout.split("\0") if p}
+
+    def _git_changed_paths(self, old_tag: str, new_tag: str) -> Optional[Set[str]]:
+        """Return paths whose Git blob/status differs between two prepared tags."""
+        script = r"""
+git_bin=git
+if test -x /usr/bin/git.real; then git_bin=/usr/bin/git.real; fi
+"$git_bin" -C /testbed -c core.quotePath=false -c safe.directory=/testbed \
+    diff --name-only -z "$1" "$2" --
+"""
+        cmd = [
+            "docker", "exec", self.container_name, "bash", "-c", script,
+            "evoclaw-diff-tree", old_tag, new_tag,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -3334,6 +3536,87 @@ printf 'merged\n'
         print(f"✂️  residue prune: removed {len(prune_set)} residue source file(s) (base={base_tag})")
         return True, ""
 
+    def _fallback_test_graft_policy(self) -> Dict[str, Any]:
+        """Parse the optional repo-scoped fallback test authority policy.
+
+        Absent config deliberately preserves the historical full ``test_dirs``
+        graft for every existing repository.  Repositories may opt into a
+        narrower, fail-closed selector without changing normal END evaluation.
+        """
+        field = "evaluation_fallback_test_graft"
+        configured = getattr(
+            self, "_fallback_test_graft_policy_override", None
+        )
+        if configured is None:
+            configured = self.repo_config.get(field)
+        if configured is None:
+            return {
+                "mode": "legacy-test-dirs",
+                "authoritative_patterns": (),
+                "fixture_paths": frozenset(),
+                "fail_closed_unlisted_patterns": (),
+            }
+        if not isinstance(configured, dict):
+            raise ValueError(f"{field} must be an object")
+        allowed = {
+            "mode",
+            "authoritative_patterns",
+            "fixture_paths",
+            "fail_closed_unlisted_patterns",
+        }
+        unknown = sorted(set(configured) - allowed)
+        if unknown:
+            raise ValueError(f"{field} contains unknown keys: {unknown}")
+        if configured.get("mode") != "scoped":
+            raise ValueError(f"{field}.mode must be 'scoped'")
+
+        authoritative_patterns = _validated_repo_glob_patterns(
+            configured.get("authoritative_patterns"),
+            field=f"{field}.authoritative_patterns",
+        )
+        fail_closed_patterns = _validated_repo_glob_patterns(
+            configured.get("fail_closed_unlisted_patterns"),
+            field=f"{field}.fail_closed_unlisted_patterns",
+        )
+
+        fixture_config = configured.get("fixture_paths", {})
+        if not isinstance(fixture_config, dict):
+            raise ValueError(f"{field}.fixture_paths must be an object")
+        validated_fixtures: Dict[str, FrozenSet[str]] = {}
+        for raw_key, raw_paths in fixture_config.items():
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                raise ValueError(
+                    f"{field}.fixture_paths contains invalid milestone key: "
+                    f"{raw_key!r}"
+                )
+            key = raw_key.strip()
+            if key in validated_fixtures:
+                raise ValueError(
+                    f"{field}.fixture_paths contains duplicate milestone key: {key}"
+                )
+            validated_fixtures[key] = _validated_fixture_paths(
+                raw_paths, field=f"{field}.fixture_paths.{key}"
+            )
+        common = validated_fixtures.get("*", frozenset())
+        milestone = validated_fixtures.get(self.milestone_id, frozenset())
+        overlap = common & milestone
+        if overlap:
+            raise ValueError(
+                f"{field}.fixture_paths duplicates common paths for "
+                f"{self.milestone_id}: {sorted(overlap)}"
+            )
+        return {
+            "mode": "scoped",
+            "authoritative_patterns": authoritative_patterns,
+            "fixture_paths": common | milestone,
+            "fail_closed_unlisted_patterns": fail_closed_patterns,
+        }
+
+    def _matches_repo_patterns(self, path: str, patterns: Tuple[str, ...]) -> bool:
+        if self._prune_filter is None:
+            return False
+        return any(self._prune_filter.match_pattern(path, pattern) for pattern in patterns)
+
     def _graft_ground_truth_tests(self, gt_tag_suffix: str) -> Tuple[bool, str]:
         """Replace the test tree with the exact prepared GT tag's test tree.
 
@@ -3355,11 +3638,37 @@ printf 'merged\n'
         if start_files is None or gt_files is None:
             return False, f"GT test graft cannot list {start_tag} and {gt_tag}"
 
+        try:
+            policy = self._fallback_test_graft_policy()
+        except ValueError as exc:
+            return False, f"fallback test graft config invalid: {exc}"
+        mode = policy["mode"]
+        fixtures: FrozenSet[str] = policy["fixture_paths"]
+        self._eval_meta["gt_test_graft_mode"] = mode
+        self._eval_meta["gt_test_graft_fixture_paths"] = sorted(fixtures)
+        self._eval_meta["gt_test_graft_unlisted_changed_paths"] = []
+
+        missing_fixtures = sorted(fixtures - gt_files)
+        if missing_fixtures:
+            return False, (
+                f"fallback test graft fixture(s) absent from {gt_tag}: "
+                f"{missing_fixtures}"
+            )
+
         def select_tests(paths: Set[str]) -> Set[str]:
             return {
                 path
                 for path in paths
-                if self._prune_filter.is_test_file(path)
+                if (
+                    self._prune_filter.is_test_file(path)
+                    if mode == "legacy-test-dirs"
+                    else (
+                        self._matches_repo_patterns(
+                            path, policy["authoritative_patterns"]
+                        )
+                        or path in fixtures
+                    )
+                )
                 and not self._prune_filter.is_modifiable_test_file(path)
                 and (
                     not is_build_manifest(path)
@@ -3369,6 +3678,31 @@ printf 'merged\n'
 
         start_tests = select_tests(start_files)
         gt_tests = select_tests(gt_files)
+
+        if mode == "scoped":
+            changed_paths = self._git_changed_paths(start_tag, gt_tag)
+            if changed_paths is None:
+                return False, (
+                    f"fallback test graft cannot diff {start_tag} and {gt_tag} "
+                    "for fail-closed authority audit"
+                )
+            selected_paths = start_tests | gt_tests
+            unlisted = sorted(
+                path
+                for path in changed_paths
+                if self._matches_repo_patterns(
+                    path, policy["fail_closed_unlisted_patterns"]
+                )
+                and path not in selected_paths
+            )
+            self._eval_meta["gt_test_graft_unlisted_changed_paths"] = unlisted
+            if unlisted:
+                return False, (
+                    "fallback test graft found changed production-like fixture "
+                    "paths outside the explicit authority contract: "
+                    f"{unlisted}"
+                )
+
         remove_tests = sorted(start_tests | gt_tests)
 
         if remove_tests:
@@ -3407,8 +3741,9 @@ shift
         self._eval_meta["gt_test_graft_removed_count"] = len(remove_tests)
         self._eval_meta["gt_test_graft_restored_count"] = len(ordered_gt_tests)
         print(
-            f"🧪 GT test graft: restored {len(ordered_gt_tests)} {gt_tag_suffix.upper()} "
-            f"test file(s), removed {len(remove_tests)} START/END residue file(s)"
+            f"🧪 GT test graft ({mode}): restored {len(ordered_gt_tests)} "
+            f"{gt_tag_suffix.upper()} test/fixture file(s), removed "
+            f"{len(remove_tests)} START/END residue file(s)"
         )
         return True, ""
 
@@ -4734,12 +5069,18 @@ fi
         )
         return True, ""
 
-    def _run_post_snapshot_script(self) -> Tuple[bool, str]:
+    def _run_post_snapshot_script(self, base_suffix: str = "end") -> Tuple[bool, str]:
         """Run a host-owned, config-pinned evaluation closure script.
 
         The script lives outside the agent snapshot and is copied read-only from
         the benchmark workspace.  Unsafe/missing paths and non-zero exits fail
         closed; its identity is persisted in evaluation_result.json.
+
+        The script receives its evaluation context via environment variables
+        (SWE_MILESTONE_ID, SWE_MILESTONE_BASE_TAG, SWE_MILESTONE_LEGACY_SNAPSHOT)
+        rather than inferring it from the container: reordered datasets can pin
+        several milestone tags to one commit, so `git describe` inside the
+        container is not a reliable witness of the base in play.
         """
         configured = self.repo_config.get("evaluation_post_snapshot_script")
         if configured is None:
@@ -4769,7 +5110,13 @@ fi
         if copied.returncode != 0:
             return False, f"failed to copy evaluation post-snapshot script: {copied.stderr}"
         applied = subprocess.run(
-            ["docker", "exec", self.container_name, "bash", destination],
+            [
+                "docker", "exec",
+                "-e", f"SWE_MILESTONE_ID={self.milestone_id}",
+                "-e", f"SWE_MILESTONE_BASE_TAG=milestone-{self.milestone_id}-{base_suffix}",
+                "-e", f"SWE_MILESTONE_LEGACY_SNAPSHOT={'1' if self.snapshot_legacy_unverified else '0'}",
+                self.container_name, "bash", destination,
+            ],
             capture_output=True,
             text=True,
         )
@@ -4778,6 +5125,10 @@ fi
             return False, f"evaluation post-snapshot script failed (exit {applied.returncode}):\n{output}"
         self._eval_meta["post_snapshot_script_applied"] = True
         print(f"🔧 Applied evaluation closure script {configured} (sha256={digest[:12]}…)")
+        # The script's stdout is its audit trail (e.g. which requires were
+        # backfilled); a silent success would hide those decisions from the log.
+        if applied.stdout.strip():
+            print(applied.stdout.strip())
         return True, ""
 
     def _apply_tar_to_container(
@@ -4879,7 +5230,7 @@ fi
             if not graft_ok:
                 return False, graft_error
 
-        closure_ok, closure_error = self._run_post_snapshot_script()
+        closure_ok, closure_error = self._run_post_snapshot_script(base_suffix=base_suffix)
         if not closure_ok:
             return False, closure_error
 
@@ -5584,6 +5935,19 @@ fi
             gt_test_graft_suffix=self._eval_meta["gt_test_graft_suffix"],
             gt_test_graft_removed_count=self._eval_meta["gt_test_graft_removed_count"],
             gt_test_graft_restored_count=self._eval_meta["gt_test_graft_restored_count"],
+            gt_test_graft_mode=self._eval_meta["gt_test_graft_mode"],
+            gt_test_graft_fixture_paths=self._eval_meta[
+                "gt_test_graft_fixture_paths"
+            ],
+            gt_test_graft_unlisted_changed_paths=self._eval_meta[
+                "gt_test_graft_unlisted_changed_paths"
+            ],
+            fallback_test_graft_policy_binding_mode=self._eval_meta[
+                "fallback_test_graft_policy_binding_mode"
+            ],
+            fallback_test_graft_policy_sha256=self._eval_meta[
+                "fallback_test_graft_policy_sha256"
+            ],
             offline_cache_overlay_image=self._eval_meta["offline_cache_overlay_image"],
             offline_cache_milestone_image_id=self._eval_meta[
                 "offline_cache_milestone_image_id"
@@ -5697,6 +6061,7 @@ fi
             success, error = self.apply_patch(filter_src_only=self.filter_src_only)
             if not success:
                 raise RuntimeError(f"Patch application failed: {error}")
+            self._eval_meta["patch_successfully_applied"] = True
 
             # 4. Run tests once (no retry logic in E2E evaluator)
             print("Running tests...")
@@ -5724,6 +6089,28 @@ fi
                 print(f"📦 Container kept: {self.container_name}")
             else:
                 self.cleanup()
+
+
+def _finalize_failed_evaluation_result(
+    result: EvaluationResult,
+    error: Exception,
+    meta: Dict[str, Any],
+) -> None:
+    """Preserve validity facts when the evaluator exits by exception.
+
+    A ``RunnerInfrastructureError`` means the outer runner did not finish, so
+    reports left on disk are explicitly untrusted.  It must take precedence
+    over earlier deterministic compile diagnostics: those diagnostics may be
+    real, but they do not make a later partial test universe safe to score.
+    """
+    result.patch_successfully_applied = bool(
+        meta.get("patch_successfully_applied", False)
+    )
+    if isinstance(error, RunnerInfrastructureError):
+        result.infrastructure_failure = (
+            "runner-infrastructure-error: " + str(error)
+        )
+    result.classify_zero_test_result()
 
 
 def main():
@@ -5768,6 +6155,18 @@ Example:
     parser.add_argument(
         "--repo-config-sha256",
         help="Expected SHA256 of --repo-config",
+    )
+    parser.add_argument(
+        "--fallback-test-graft-policy",
+        type=Path,
+        help=(
+            "Hash-pinned evaluator-only fallback graft policy; independent "
+            "of the snapshot-bound trial repo config"
+        ),
+    )
+    parser.add_argument(
+        "--fallback-test-graft-policy-sha256",
+        help="Expected SHA256 of --fallback-test-graft-policy",
     )
     parser.add_argument(
         "--runtime-policy",
@@ -5822,6 +6221,13 @@ Example:
         parser.error(f"Missing required arguments: {', '.join('--' + arg.replace('_', '-') for arg in missing)}")
     if (args.repo_config is None) != (args.repo_config_sha256 is None):
         parser.error("--repo-config and --repo-config-sha256 must be provided together")
+    if (args.fallback_test_graft_policy is None) != (
+        args.fallback_test_graft_policy_sha256 is None
+    ):
+        parser.error(
+            "--fallback-test-graft-policy and "
+            "--fallback-test-graft-policy-sha256 must be provided together"
+        )
     runtime_policy_args = (
         args.runtime_policy,
         args.runtime_policy_sha256,
@@ -5856,6 +6262,10 @@ Example:
         allow_legacy_snapshot=args.allow_legacy_snapshot,
         repo_config_path=args.repo_config,
         repo_config_sha256=args.repo_config_sha256,
+        fallback_test_graft_policy_path=args.fallback_test_graft_policy,
+        fallback_test_graft_policy_sha256=(
+            args.fallback_test_graft_policy_sha256
+        ),
         runtime_policy_path=args.runtime_policy,
         runtime_policy_sha256=args.runtime_policy_sha256,
         runtime_policy_mode=args.runtime_policy_mode,
@@ -5949,6 +6359,21 @@ Example:
         result.gt_test_graft_suffix = meta.get("gt_test_graft_suffix", "")
         result.gt_test_graft_removed_count = meta.get("gt_test_graft_removed_count", 0)
         result.gt_test_graft_restored_count = meta.get("gt_test_graft_restored_count", 0)
+        result.gt_test_graft_mode = meta.get(
+            "gt_test_graft_mode", "legacy-test-dirs"
+        )
+        result.gt_test_graft_fixture_paths = meta.get(
+            "gt_test_graft_fixture_paths", []
+        )
+        result.gt_test_graft_unlisted_changed_paths = meta.get(
+            "gt_test_graft_unlisted_changed_paths", []
+        )
+        result.fallback_test_graft_policy_binding_mode = meta.get(
+            "fallback_test_graft_policy_binding_mode", "absent-legacy"
+        )
+        result.fallback_test_graft_policy_sha256 = meta.get(
+            "fallback_test_graft_policy_sha256", ""
+        )
         result.offline_cache_overlay_image = meta.get("offline_cache_overlay_image", "")
         result.offline_cache_milestone_image_id = meta.get(
             "offline_cache_milestone_image_id", ""
@@ -6020,9 +6445,9 @@ Example:
         )
         result.go_module_closure_error = meta.get("go_module_closure_error", "")
         # Fields used to classify zero-test failures are populated after the
-        # dataclass constructor on this exception path, so refresh the verdict
-        # before serializing the raw result.
-        result.classify_zero_test_result()
+        # dataclass constructor on this exception path.  Preserve runner and
+        # patch-application facts before refreshing the verdict.
+        _finalize_failed_evaluation_result(result, e, meta)
         # Save failed result to file
         args.output.parent.mkdir(parents=True, exist_ok=True)
         result_dict = result.to_dict()

@@ -80,23 +80,21 @@ Workspace data is hosted on [HuggingFace](https://huggingface.co/datasets/DeepCo
 git lfs install
 git clone https://huggingface.co/datasets/DeepCommit-ai/SWE-Milestone-data
 
-# Pull all images (login first — anonymous pulls are rate-limited, ~115 images)
+# Point the harness at it — set once in .env_private (gitignored, auto-loaded on every launch)
+cp .env .env_private
+# edit .env_private →  SWE_MILESTONE_DATA_ROOT=$PWD/SWE-Milestone-data
+
+# Align the data checkout to the pinned benchmark version (manifests/BENCHMARK_VERSION)
+./scripts/pull_data.sh
+
+# Pull all images by content digest (login first — anonymous pulls are rate-limited, ~115 images)
 docker login
 ./scripts/pull_images.sh
 ```
 
 > See [docs/setup.md](docs/setup.md) for the full data layout and image naming scheme, and [docs/versioning.md](docs/versioning.md) for the versioning policy.
 
-**3. Host paths (configure once)**
-
-SWE-Milestone reads host-specific paths from `.env_private` (gitignored), auto-loaded by `run_all.py` on every launch — set them **once** and they persist across shells, no re-exporting. Copy the template and edit the one path that matters (where you downloaded the data):
-
-```bash
-cp .env .env_private
-# edit .env_private →  SWE_MILESTONE_DATA_ROOT=/abs/path/to/SWE-Milestone-data
-```
-
-Trial configs then use `data_root: ${SWE_MILESTONE_DATA_ROOT}` — no host path to repeat. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
+Trial configs then use `data_root: ${SWE_MILESTONE_DATA_ROOT}` — no host path to repeat, and the same variable drives `pull_data.sh` and the launch-time version gate. (Anti-cheat *quarantine* is auto-on per repo and needs no extra host paths; see [docs/quarantine.md](docs/quarantine.md).)
 
 ## 🚀 Usage
 
@@ -117,7 +115,12 @@ model: claude-opus-4-7                 # model identifier (use claude-opus-4-7[1
 timeout: 18000                         # optional: max agent runtime per repo (seconds)
 # reasoning_effort: high               # optional: low | medium | high | xhigh | max 
 # repos: [navidrome, ripgrep]          # optional: run only these repos (default: all)
+# agent_version: 2.1.210               # optional: pin the agent CLI version (claude-code | codex | gemini-cli)
 ```
+
+> **Naming convention:** a trial name without a suffix runs the **200K** context regime in Claude Code (pinned via `auto_compact_window: 200000`); only a `-1m` suffix means 1M context (e.g. `claude-code_opus-4.7-1m`, model `claude-opus-4-7[1m]`).
+
+> **New model or Vertex AI?** See [docs/adding-a-model.md](docs/adding-a-model.md); for Vertex (ADC auth, no API key) set `vertex_ai: true` — see [docs/vertex-ai.md](docs/vertex-ai.md).
 
 **2. Run** — evaluate across all repos:
 
@@ -129,6 +132,8 @@ export UNIFIED_BASE_URL=https://...   # optional, for proxy or custom endpoints
 python scripts/run_all.py --config trial_config.yaml
 ```
 
+> **See [docs/running-trials.md](docs/running-trials.md) for the day-to-day operational runbook (launch, monitor, recover from stuck repos)**, and [docs/advanced.md](docs/advanced.md) for single-repo / single-milestone debugging, result collection, `e2e_config.yaml`, and lock internals.
+
 **3. Monitor** — check progress in another terminal:
 
 ```bash
@@ -137,37 +142,47 @@ python scripts/run_all.py --config trial_config.yaml
 ./scripts/monitor.sh my_experiment --full          # full table with all columns
 ```
 
-> **Tip:** `run_all.py` is fire-and-forget — it spawns one detached `run_e2e` per repo and exits immediately (no `nohup` needed). Re-running the same command is the resume operation: each worker holds an `flock` on its trial dir, so the second invocation either takes over only-if-the-first-one-died, or refuses with a clear "owned by PID …" message. Add `--force` to wipe & restart the latest matching `_NNN`, or `--new` to start the next `_NNN` fresh. See [docs/running-trials.md](docs/running-trials.md) for the full behavior matrix.
-
-> See [docs/running-trials.md](docs/running-trials.md) for the day-to-day operational runbook (launch, monitor, recover from stuck repos), and [docs/advanced.md](docs/advanced.md) for single-repo / single-milestone debugging, result collection, `e2e_config.yaml`, and lock internals.
-
-> **Running on Google Vertex AI?** Vertex uses ADC (no API key to paste); set `vertex_ai: true` with `agent: gemini-cli` (Gemini models) or `agent: claude-code` (Claude models) and run `run_all.py` as normal. See [docs/vertex-ai.md](docs/vertex-ai.md) for the credential setup and how it works.
-
-> **Adding a new model to an existing agent?** See [docs/adding-a-model.md](docs/adding-a-model.md) — the config fields, auth routes (API key vs Vertex/ADC), domain whitelist, and pricing, with a worked example.
-
 ## 🔍 Troubleshooting
 
-Below are common issues you may encounter when running evaluations, along with solutions.
+<details>
+<summary><b>Network access blocked inside containers</b></summary>
 
-**1. Network access blocked inside containers**
+Agent containers enforce an iptables outbound whitelist — only API and package-manager domains are allowed (e.g. `api.anthropic.com`, `registry.npmjs.org`, `pypi.org`); code-hosting sites (GitHub, GitLab, …) are blocked to prevent data leakage. Routing through a custom proxy? Add its domain to `WHITELISTED_DOMAINS` in `harness/e2e/container_setup.py`.
 
-Agent containers enforce an iptables-based outbound whitelist — only domains needed for API access and package management are allowed (e.g., `api.anthropic.com`, `registry.npmjs.org`, `pypi.org`). Code hosting sites (GitHub, GitLab, etc.) are explicitly blocked to prevent data leakage. If your setup routes API requests through a custom proxy, make sure the proxy domain is included in `WHITELISTED_DOMAINS` in `harness/e2e/container_setup.py`.
+Plain-HTTP (port 80) blocked by your host? No action needed — the harness rewrites apt sources to HTTPS automatically.
 
-> **Port 80 outbound blocked?** Some hosts/datacenters block plain HTTP. The harness automatically rewrites Debian/Ubuntu apt sources to HTTPS so `apt-get update` reaches mirrors via 443 — no action needed.
+</details>
 
-**2. Agent stops before all milestones are completed**
+<details>
+<summary><b>Agent stopped before all milestones completed — how to resume</b></summary>
 
-Directly re-run the same `run_all.py` command to resume and continues from where the previous worker left off:
+Re-run the same command; it resumes from where the worker left off:
 
 ```bash
 python scripts/run_all.py --config trial_config.yaml
 ```
 
-> **Evaluation protocol**: The reported SWE-Milestone benchmark results follow this protocol: trials are resumed until all milestones are submitted and evaluated. Each resume reuses the same agent session by default to preserve the model's memory of prior work; after three consecutive resumes without new submissions, SWE-Milestone automatically rotates in a fresh session on the next resume so no repo blocks the trial indefinitely. We encourage reproducibility studies to follow the same setting.
+**Evaluation protocol:** reported SWE-Milestone results resume trials until every milestone is submitted and evaluated. Each resume reuses the agent session (preserving the model's memory of prior work); after three consecutive resumes with no new submissions, a fresh session is rotated in automatically. Reproducibility studies should follow the same setting.
 
-> ⚠️ **Not every "no progress" is the agent's fault.** Rate-limit (HTTP 429), quota exhaustion, or auth (HTTP 401/403) errors also cause workers to exit with no submissions. Rotating the agent session won't help — the next request hits the same error. Check the session jsonl for `api_error_status: 429` / `"reached your usage limit"` / `401`; if present, fix the API key (top up or rotate) **before** resuming.
+⚠️ Not every "no progress" is the agent's fault: rate-limit (429), quota, or auth (401/403) errors also stop workers, and session rotation won't fix them. Check the session jsonl for `api_error_status: 429` / `"reached your usage limit"` / `401` and fix the key **before** resuming.
 
-> **Resume requires the container to still exist.** All of the agent's in-progress work — code changes, git history, and Claude's conversation memory — lives inside the container, with no copy on the host. If the container is deleted, the whole trial's working state is lost and only `--force` (restart from scratch) is available. Source snapshots of already-evaluated milestones are preserved on the host under `evaluation/`, so prior scores survive, and the full agent logs are copied to the host directory when the trial finishes.
+**Never delete a running trial's container** — all in-progress work (code, git history, conversation memory) lives inside it; once it's gone only `--force` (restart from scratch) remains. Snapshots of already-evaluated milestones survive on the host under `evaluation/`.
+
+</details>
+
+<details>
+<summary><b>Image or data version mismatch</b></summary>
+
+Containers start with `--pull=never`: a missing local image fails loudly instead of silently fetching. Align your machine with the release (digest-exact, near-free thanks to layer dedup):
+
+```bash
+./scripts/pull_images.sh                          # pulls by content digest from manifests/digests-v1.0.tsv
+python3 scripts/verify_image_digests.py --local   # confirm local bytes match the frozen manifest
+```
+
+The launcher also checks that the data repo is on the matching version tag (default `v1.0`, from `SWE_MILESTONE_IMAGE_TAG`); if it refuses with a version mismatch, update the data checkout: `git -C $SWE_MILESTONE_DATA_ROOT fetch --tags && git -C $SWE_MILESTONE_DATA_ROOT checkout v1.0`.
+
+</details>
 
 ## 🤝 Contributing
 

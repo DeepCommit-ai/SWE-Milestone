@@ -28,7 +28,7 @@ The data repo carries the same `vX.Y` version tags as the Docker images
 (see [versioning.md](versioning.md)). Trials verify at launch that the data
 checkout matches the pinned version (`SWE_MILESTONE_IMAGE_TAG`, default
 `v1.0`) and record the verdict in `trial_metadata.json`; align a stale
-checkout with `./scripts/pull_data.sh --checkout`.
+checkout with `./scripts/pull_data.sh` (aligns to the pinned version; `--report-only` to inspect).
 
 The dataset contains one directory per repository:
 
@@ -68,7 +68,8 @@ Pre-built Docker images are hosted on DockerHub under the `hyd2apse` namespace. 
 - **Milestone images** -- used by the evaluator to run tests for each milestone
 
 Naming is mechanical on both sides (single authority:
-`harness/e2e/image_version.py`; inventory: `manifests/images-<version>.tsv`):
+`harness/e2e/image_version.py`; manifest: `manifests/digests-<version>.tsv`,
+which both enumerates the version's images and freezes their content digests):
 
 ```
 hub:    <org>/swe-milestone__<repo_full>__<milestone>:<version>
@@ -110,8 +111,9 @@ per line); retagging hub -> local is a pure pointer operation.
 
 ### Version pinning
 
-The benchmark data version is pinned via `SWE_MILESTONE_IMAGE_TAG` (default `v1.0`,
-defined once in `harness/e2e/image_version.py`). Images for a published
+The benchmark data version is pinned via `SWE_MILESTONE_IMAGE_TAG` (default =
+`manifests/BENCHMARK_VERSION`, the single source of truth read by code,
+scripts, and CI). Images for a published
 version are immutable: never re-pushed, never deleted. Pre-v1.0 images remain
 on the hub under the old `hyd2apse/<short>:<milestone>-v0.9` scheme, frozen;
 the current tooling intentionally does not read them (use the old script from

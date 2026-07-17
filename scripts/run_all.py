@@ -334,7 +334,20 @@ def main():
     # Optional milestone-prefix: run only the first N (or P%) of each repo's DAG,
     # dependency-closed. CLI --milestones overrides the trial config's 'milestones:'.
     milestones = args.milestones if args.milestones is not None else cfg.get("milestones", None)
-    default_haiku_model = cfg.get("default_haiku_model", None)
+    # `default_agent_model` overrides ALL of Claude Code's class-based model
+    # slots (ANTHROPIC_DEFAULT_HAIKU/SONNET/OPUS/FABLE_MODEL,
+    # CLAUDE_CODE_SUBAGENT_MODEL, ANTHROPIC_MODEL) with one value. Renamed
+    # from `default_haiku_model` 2026-07-16; the old name is a hard error so
+    # a stale config can't silently run without the slot pin.
+    if cfg.get("default_haiku_model") is not None:
+        print(
+            "Error: 'default_haiku_model' was renamed to 'default_agent_model' "
+            "(same semantics: one value overrides ALL of Claude Code's "
+            "class-based model slots). Update the trial config.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    default_agent_model = cfg.get("default_agent_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
     evaluation_cfg = cfg.get("evaluation") or {}
     if not isinstance(evaluation_cfg, dict):
@@ -373,13 +386,13 @@ def main():
         # this same Vertex model so background/subagent calls don't fall back to
         # the hard-coded Anthropic defaults (which may not be enabled on the
         # Vertex project).
-        if not default_haiku_model:
-            default_haiku_model = model
+        if not default_agent_model:
+            default_agent_model = model
 
-    # Propagate default_haiku_model to child processes via env var
-    # (ClaudeCodeFramework reads UNIFIED_DEFAULT_HAIKU_MODEL)
-    if default_haiku_model:
-        os.environ["UNIFIED_DEFAULT_HAIKU_MODEL"] = default_haiku_model
+    # Propagate default_agent_model to child processes via env var
+    # (ClaudeCodeFramework reads UNIFIED_DEFAULT_AGENT_MODEL)
+    if default_agent_model:
+        os.environ["UNIFIED_DEFAULT_AGENT_MODEL"] = default_agent_model
 
     # Auto-compaction window: a single yaml flag (auto_compact_window: 300000)
     # makes claude-code trigger native context compaction at that token budget
@@ -392,6 +405,62 @@ def main():
     auto_compact_window = cfg.get("auto_compact_window", None)
     if auto_compact_window:
         os.environ["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+
+    # Tool Search (claude-code only): `enable_tool_search: false` pins
+    # claude-code's native ENABLE_TOOL_SEARCH env var inside the agent
+    # container (ClaudeCodeFramework reads SWE_MILESTONE_ENABLE_TOOL_SEARCH).
+    # Third-party Anthropic-compatible endpoints that don't forward
+    # tool_reference blocks (e.g. Kimi's) require false; explicit pinning also
+    # removes claude-code's endpoint-dependent auto-detection from the trial.
+    enable_tool_search = cfg.get("enable_tool_search", None)
+    if enable_tool_search is not None:
+        from harness.e2e.agents.claude_code import validate_tool_search_setting
+        try:
+            enable_tool_search = validate_tool_search_setting(enable_tool_search)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if agent != "claude-code":
+            print(
+                "Error: enable_tool_search is currently supported only for agent: claude-code",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["SWE_MILESTONE_ENABLE_TOOL_SEARCH"] = enable_tool_search
+
+    # Per-trial endpoint override: `base_url` in the trial config wins over the
+    # host-level UNIFIED_BASE_URL from .env_private. The URL is not a secret,
+    # so it can live in a committed config; the API key never does — it stays
+    # in .env_private, either as the global UNIFIED_API_KEY or as a named
+    # variable the config selects via `api_key_env` (lets one .env_private
+    # hold keys for several endpoints side by side). Supports ${VAR} expansion
+    # (same as data_root) so the URL itself can also live in .env_private,
+    # e.g. `base_url: ${ZAI_BASE_URL}`.
+    base_url = cfg.get("base_url", None)
+    if base_url:
+        base_url = os.path.expandvars(str(base_url).strip())
+        # expandvars leaves unknown ${VAR} references literally in place —
+        # catch that instead of handing the agent a garbage endpoint.
+        if not base_url or "$" in base_url:
+            print(
+                f"Error: base_url '{cfg.get('base_url')}' references an unset "
+                "variable. Add it to .env_private (KEY=VALUE) or export it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["UNIFIED_BASE_URL"] = base_url
+    api_key_env = cfg.get("api_key_env", None)
+    if api_key_env:
+        api_key_env = str(api_key_env).strip()
+        _key = os.environ.get(api_key_env)
+        if not _key:
+            print(
+                f"Error: api_key_env names '{api_key_env}' but that variable is "
+                "not set. Add it to .env_private (KEY=VALUE) or export it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["UNIFIED_API_KEY"] = _key
 
     # Validate
     if not data_root.exists():

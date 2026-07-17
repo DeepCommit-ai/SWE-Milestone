@@ -1,16 +1,11 @@
-data_root: /data2/gangda/SWE-Milestone-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_kimi-k2.6
 agent: claude-code
-# Kimi's coding endpoint speaks native Anthropic /v1/messages.
-# The endpoint exposes ONE model id `kimi-for-coding`, but accepts "kimi-k2.6"
-# (and probably any alias) as input and maps to kimi-for-coding internally
-# (verified 2026-04-22 via direct probe).
 model: kimi-k2.6
-# Route all of Claude Code's class-based model slots (HAIKU/SONNET/OPUS/
-# SUBAGENT/ANTHROPIC_MODEL) to the same model so nothing silently hits
-# api.anthropic.com when the in-container UNIFIED_BASE_URL is set to
-# api.kimi.com/coding.
-default_haiku_model: kimi-k2.6
+default_agent_model: kimi-k2.6
 timeout: 18000
-# Endpoint is Anthropic-native + supports the context_management beta header
-# server-side — the point of using api.kimi.com/coding instead of OpenRouter.
+auto_compact_window: 200000
+enable_tool_search: false
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

@@ -1,10 +1,10 @@
 data_root: ${SWE_MILESTONE_DATA_ROOT}
-trial_name: claude-code_opus-4.6
+trial_name: claude-code_glm-5.2
 agent: claude-code
-model: claude-opus-4-6
-default_agent_model: claude-opus-4-6
+model: glm-5.2
+default_agent_model: glm-5.2
+reasoning_effort: max
 timeout: 18000
-# Default 200K context regime (bare model id).
 auto_compact_window: 200000
 
 # Uncomment to pin the claude-code CLI version instead of installing latest.

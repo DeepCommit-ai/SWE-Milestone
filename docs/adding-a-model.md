@@ -22,7 +22,7 @@ model: <the endpoint's exact model id>
 timeout: 18000
 # reasoning_effort: high      # optional: low | medium | high | xhigh | max
 # auto_compact_window: 200000 # claude-code only: compact at 200K (omit = no compaction, ~1M); see note
-# default_haiku_model: <model># claude-code only: pin all model slots (see Step 5)
+# default_agent_model: <model># claude-code only: pin all model slots (see Step 5)
 ```
 
 ```bash
@@ -148,13 +148,16 @@ Claude Code picks a model **by class** at five decision points
 (HAIKU / SONNET / OPUS / SUBAGENT / global default) for background tasks,
 fallbacks, and subagent spawns. Left unset, those hit `api.anthropic.com` with
 hard-coded defaults (e.g. `claude-haiku-4-5`) — bypassing your endpoint and
-billing a separate account. Point all five at your model:
+billing a separate account. Point all of them at your model:
 
 ```yaml
-default_haiku_model: your-model
+default_agent_model: your-model
 ```
 
-(Despite the name, this drives all five slots.) **Vertex mode sets this
+(One value drives ALL of Claude Code's class-based slots:
+`ANTHROPIC_DEFAULT_HAIKU/SONNET/OPUS/FABLE_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`, `ANTHROPIC_MODEL`. Renamed from
+`default_haiku_model`, which is now a hard error.) **Vertex mode sets this
 automatically** to the trial `model`, so background/subagent calls stay on the
 one model you enabled on Vertex.
 
@@ -215,7 +218,7 @@ agent: claude-code
 model: claude-opus-4-8
 vertex_ai: true
 vertex_location: global
-default_haiku_model: claude-opus-4-8
+default_agent_model: claude-opus-4-8
 reasoning_effort: max        # ⚠️ see #48051 above; unset = built-in xhigh
 timeout: 18000
 ```
@@ -240,7 +243,7 @@ Code talks to Vertex directly.
 - [ ] auth chosen: key + base URL **or** `vertex_ai: true` + ADC
 - [ ] endpoint domain in `WHITELISTED_DOMAINS` (if new)
 - [ ] pricing row in `pricing.py` (or a family match already covers it)
-- [ ] (claude-code) `default_haiku_model` set
+- [ ] (claude-code) `default_agent_model` set
 - [ ] `reasoning_effort` decided (mind claude-code #48051)
 - [ ] config created, launched, monitored
 

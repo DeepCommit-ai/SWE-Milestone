@@ -107,10 +107,12 @@ def test_check_match_returns_metadata(data_repo, capsys):
     assert "WARNING" not in capsys.readouterr().out
 
 
-def test_check_default_pin_warns_but_runs(data_repo, capsys):
-    meta = check_data_version(data_repo, context="test")  # tag-missing
-    assert meta["data_version"]["state"] == "tag-missing"
-    assert "WARNING" in capsys.readouterr().out
+def test_check_default_pin_also_refuses(data_repo):
+    # Policy hardened 2026-07-17: score comparability is the core contract, so
+    # the DEFAULT pin refuses exactly like an explicit one (escape hatch:
+    # SWE_MILESTONE_DATA_VERSION_CHECK=off, recorded as unchecked).
+    with pytest.raises(SystemExit, match="pinned by default"):
+        check_data_version(data_repo, context="test")  # tag-missing
 
 
 def test_check_explicit_pin_refuses_mismatch(data_repo, monkeypatch):
@@ -142,12 +144,11 @@ def test_image_tag_consistent(capsys):
     assert "WARNING" not in capsys.readouterr().out
 
 
-def test_image_tag_mismatch_default_warns(capsys):
-    meta = check_image_tag_consistency(
-        "swe-milestone/x__base-offline:latest", context="test"
-    )
-    assert meta["state"] == "mismatch"
-    assert "WARNING" in capsys.readouterr().out
+def test_image_tag_mismatch_default_also_refuses():
+    with pytest.raises(SystemExit, match="pinned by default"):
+        check_image_tag_consistency(
+            "swe-milestone/x__base-offline:latest", context="test"
+        )
 
 
 def test_image_tag_mismatch_explicit_refuses(monkeypatch):

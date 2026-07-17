@@ -133,11 +133,12 @@ from harness.e2e.image_version import default_manifest_path, load_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-SAMPLE_TSV = """\
+_D = "sha256:" + "ab" * 32
+SAMPLE_TSV = f"""\
 # comment line
-navidrome\tnavidrome_navidrome_v0.57.0_v0.58.0\tbase
-navidrome\tnavidrome_navidrome_v0.57.0_v0.58.0\tmilestone_006
-go-zero\tzeromicro_go-zero_v1.6.0_v1.9.3\tm007.1
+swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0\thyd2apse/swe-milestone__navidrome_navidrome_v0.57.0_v0.58.0__base@{_D}
+swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__milestone_006:v1.0\thyd2apse/swe-milestone__navidrome_navidrome_v0.57.0_v0.58.0__milestone_006@{_D}
+swe-milestone/zeromicro_go-zero_v1.6.0_v1.9.3__m007.1:v1.0\thyd2apse/swe-milestone__zeromicro_go-zero_v1.6.0_v1.9.3__m007.1@{_D}
 """
 
 
@@ -146,21 +147,22 @@ class TestManifest:
         p = tmp_path / "m.tsv"
         p.write_text(SAMPLE_TSV)
         rows = load_manifest(p)
-        assert rows == [
+        assert [(r[0], r[1], r[2]) for r in rows] == [
             ("navidrome", "navidrome_navidrome_v0.57.0_v0.58.0", "base"),
             ("navidrome", "navidrome_navidrome_v0.57.0_v0.58.0", "milestone_006"),
             ("go-zero", "zeromicro_go-zero_v1.6.0_v1.9.3", "m007.1"),
         ]
+        assert all(r[3].endswith(_D) for r in rows)
 
     def test_load_manifest_rejects_bad_row(self, tmp_path):
         p = tmp_path / "m.tsv"
-        p.write_text("navidrome\tonly_two_cols\n")
+        p.write_text("swe-milestone/x__y:v1.0\tno-digest-here\n")
         with pytest.raises(ValueError):
             load_manifest(p)
 
     def test_default_manifest_path(self):
         assert default_manifest_path("v1.0") == (
-            REPO_ROOT / "manifests" / "images-v1.0.tsv"
+            REPO_ROOT / "manifests" / "digests-v1.0.tsv"
         )
 
     def test_shipped_v1_manifest_loads_and_validates(self):
@@ -172,8 +174,9 @@ class TestManifest:
             "go-zero", "element-web", "nushell",
         }
         # 每行都能构造合法名字(即隐含 __/大小写不变量成立)
-        for _, rf, ms in rows:
+        for _, rf, ms, hub in rows:
             local_ref(rf, ms, "v1.0")
+            assert "@sha256:" in hub
 
 
 def _run_cli(*argv, env_extra=None):
@@ -194,10 +197,11 @@ class TestPlanCLI:
         assert r.returncode == 0, r.stderr
         lines = r.stdout.strip().splitlines()
         assert len(lines) == 11  # navidrome: base + base-offline + 9 milestones
-        assert lines[0] == (
-            "hyd2apse/swe-milestone__navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0"
-            "\tswe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0"
+        hub, local = lines[0].split("\t")
+        assert hub.startswith(
+            "hyd2apse/swe-milestone__navidrome_navidrome_v0.57.0_v0.58.0__base@sha256:"
         )
+        assert local == "swe-milestone/navidrome_navidrome_v0.57.0_v0.58.0__base:v1.0"
 
     def test_pull_plan_all_repos(self):
         r = _run_cli("pull-plan", "--version", "v1.0")

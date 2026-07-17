@@ -1,15 +1,13 @@
-data_root: /data2/gangda/SWE-Milestone-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_opus-4.7-1m
 agent: claude-code
-# 1M-context variant (claude-code strips [1m] before API call and sets the
-# context-1m-2025-08-07 beta header). Quoted because YAML treats unquoted
-# [...] as a flow sequence.
+# Quoted: YAML would parse unquoted [...] as a flow sequence. claude-code
+# strips [1m] before the API call and sets the 1M-context beta header.
 model: "claude-opus-4-7[1m]"
+default_agent_model: "claude-opus-4-7[1m]"
+# reasoning_effort unset on purpose: opus-4-7's built-in default is xhigh.
 timeout: 18000
-# Route haiku slot (subagents / skills / auto-memory / context mgmt) to the
-# same 1M variant so background traffic doesn't silently drop to a different
-# model class.
-default_haiku_model: "claude-opus-4-7[1m]"
-# reasoning_effort intentionally unset — let opus-4-7 use its built-in
-# default (xhigh). Setting `max` triggers claude-code bug #48051 where it
-# runs as medium instead, collapsing thinking depth and trial score.
+# 1M-context variant: no auto_compact_window — runs the full model window.
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

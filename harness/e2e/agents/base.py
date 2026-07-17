@@ -1,11 +1,31 @@
 """Abstract base class for agent frameworks."""
 
 import os
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Type
 
 from harness.e2e.quarantine import GO_OFFLINE_FILE_PROXY, GO_OFFLINE_SHELL_ENV
+
+_AGENT_CLI_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def validate_agent_cli_version(value: Optional[str], *, agent_label: str) -> Optional[str]:
+    """Validate a trial-config ``agent_version`` selector for npm-installed CLIs.
+
+    Accepts an exact semantic version (a reproducibility pin) or ``latest``
+    (explicitly re-resolve the newest release at container setup time).
+    """
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "latest" or _AGENT_CLI_VERSION_RE.fullmatch(value):
+        return value
+    raise ValueError(
+        f"{agent_label} agent_version must be a semantic version such as "
+        "'1.2.3', or 'latest'"
+    )
 
 
 class AgentFramework(ABC):

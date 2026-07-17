@@ -27,9 +27,31 @@ names. Hub-side v0.9 naming gets NO compatibility code (docs/versioning.md).
 """
 
 import os
+import re
 import subprocess
+from pathlib import Path
 
-DEFAULT_IMAGE_TAG = "v1.0"
+def _read_benchmark_version() -> str:
+    """Single source of truth for the default benchmark data version.
+
+    manifests/BENCHMARK_VERSION names the current version; the digest manifest
+    digests-<version>.tsv freezes its content; SWE_MILESTONE_IMAGE_TAG
+    overrides at runtime (an explicit reproducibility pin). Bumping a release
+    = edit that one file (+ commit the new digest manifest).
+    """
+    path = Path(__file__).resolve().parents[2] / "manifests" / "BENCHMARK_VERSION"
+    try:
+        value = path.read_text().strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read benchmark version file {path}: {exc}") from exc
+    if not re.fullmatch(r"v\d+\.\d+(\.\d+)?", value):
+        raise RuntimeError(
+            f"{path} must contain a version like 'v1.0' (got {value!r})"
+        )
+    return value
+
+
+DEFAULT_IMAGE_TAG = _read_benchmark_version()
 PREFIX = "swe-milestone"
 SEP = "__"
 
@@ -165,16 +187,36 @@ from pathlib import Path
 
 
 def default_manifest_path(version: str) -> Path:
-    """<repo_root>/manifests/images-<version>.tsv (one file per benchmark version)."""
-    return Path(__file__).resolve().parents[2] / "manifests" / f"images-{version}.tsv"
+    """<repo_root>/manifests/digests-<version>.tsv.
+
+    Single per-version manifest: it both enumerates the images that make up
+    the benchmark version AND freezes their byte identity (hub digest).  The
+    former images-<version>.tsv name inventory was merged into it — the
+    local_ref column carries the full name structure.
+    """
+    return Path(__file__).resolve().parents[2] / "manifests" / f"digests-{version}.tsv"
 
 
-def load_manifest(path: Path) -> list[tuple[str, str, str]]:
-    """Parse the inventory TSV -> [(short, repo_full, milestone), ...].
+def short_name(repo_full: str) -> str:
+    """Project short name: the second '_'-separated token of repo_full.
 
-    Blank lines and '#' comments are skipped. Every row is validated through
-    validate_component so a bad future addition fails here, loudly, not at
-    docker-pull time.
+    e.g. apache_dubbo_dubbo-3.3.3_dubbo-3.3.6 -> dubbo;
+    navidrome_navidrome_v0.57.0_v0.58.0 -> navidrome. Holds for every
+    benchmark repo because owner/project names never contain underscores.
+    """
+    parts = repo_full.split("_")
+    if len(parts) < 2 or not parts[1]:
+        raise ValueError(f"cannot derive short name from repo_full: {repo_full!r}")
+    return parts[1]
+
+
+def load_manifest(path: Path) -> list[tuple[str, str, str, str]]:
+    """Parse the digest manifest -> [(short, repo_full, milestone, hub_digest_ref)].
+
+    Row format: '<local_ref>\\t<hub_name>@sha256:<digest>' where local_ref is
+    'swe-milestone/<repo_full>__<milestone>:<tag>'. Blank lines and '#'
+    comments are skipped. Every row is validated through validate_component
+    so a bad future addition fails here, loudly, not at docker-pull time.
     """
     rows = []
     for lineno, raw in enumerate(Path(path).read_text().splitlines(), 1):
@@ -182,10 +224,23 @@ def load_manifest(path: Path) -> list[tuple[str, str, str]]:
         if not line or line.startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) != 3:
-            raise ValueError(f"{path}:{lineno}: expected 3 tab-separated columns, got {len(parts)}")
-        short, repo_full, milestone = (p.strip() for p in parts)
-        rows.append((short, validate_component(repo_full), validate_component(milestone)))
+        if len(parts) != 2:
+            raise ValueError(f"{path}:{lineno}: expected 2 tab-separated columns, got {len(parts)}")
+        local, hub = (p.strip() for p in parts)
+        if not local.startswith(f"{PREFIX}/"):
+            raise ValueError(f"{path}:{lineno}: local ref must start with {PREFIX}/: {local!r}")
+        if "@sha256:" not in hub:
+            raise ValueError(f"{path}:{lineno}: hub ref must be digest-pinned: {hub!r}")
+        name = local.split("/", 1)[1].rsplit(":", 1)[0]
+        if SEP not in name:
+            raise ValueError(f"{path}:{lineno}: local ref lacks '{SEP}' separator: {local!r}")
+        repo_full, milestone = name.rsplit(SEP, 1)
+        rows.append((
+            short_name(repo_full),
+            validate_component(repo_full),
+            validate_component(milestone),
+            hub,
+        ))
     if not rows:
         raise ValueError(f"{path}: manifest is empty")
     return rows
@@ -239,11 +294,15 @@ def _cli(argv: list[str] | None = None) -> int:
     if args.repo:
         rows = [r for r in rows if r[0] in args.repo]
 
-    for _, rf, ms in rows:
+    for _, rf, ms, hub_digest in rows:
         local = local_ref(rf, ms, version)
         hub = hub_ref(args.org, rf, ms, version)
         if args.cmd == "pull-plan":
-            print(f"{hub}\t{local}")
+            # Digest-exact pull: the manifest freezes content identity, so the
+            # plan pulls bytes, not a mutable tag. --org rewrites the registry
+            # namespace but keeps the digest (same bytes wherever mirrored).
+            digest_ref = f"{args.org}/{hub_digest.split('/', 1)[1]}"
+            print(f"{digest_ref}\t{local}")
         elif args.cmd == "push-plan":
             print(f"{local}\t{hub}")
         else:  # retag-plan: OLD-format source -> new-format destination

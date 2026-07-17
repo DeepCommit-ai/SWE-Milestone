@@ -8,20 +8,22 @@ same tasks, same environments, same grading.
 
 | Axis | Format | Covers |
 |---|---|---|
-| **Benchmark data version** | `vX.Y` — the image tag (`SWE_MILESTONE_IMAGE_TAG`, default in `harness/e2e/image_version.py`) | tasks, tests, image environments, **grading semantics** |
+| **Benchmark data version** | `vX.Y` — the image tag (`SWE_MILESTONE_IMAGE_TAG`; default = **`manifests/BENCHMARK_VERSION`**, the single source of truth) | tasks, tests, image environments, **grading semantics** |
 | **Harness version** | git commits / tags | everything score-neutral (refactors, logging, agent integrations) |
 
 Images have no version identity of their own — their tag *is* the benchmark
-version. The binding layer is `manifests/images-<v>.tsv` (inventory; drives
-pull/push plans) + `manifests/digests-<v>.tsv` (content freeze — diff two
-versions to prove exactly which images changed). Digests and commit SHAs are
-identity; tags are labels.
+version. The binding layer is `manifests/digests-<v>.tsv` — the single
+per-version manifest: it enumerates the version's images AND freezes their
+content digests (drives pull/push plans; diff two versions to prove exactly
+which images changed). Digests and commit SHAs are identity; tags are labels.
 
 ## Data version
 
 The workspace data (SWE-Milestone-data git clone) is the other score-moving
 input, so it carries the **same `vX.Y` tags** as the images. One knob pins
-both: `SWE_MILESTONE_IMAGE_TAG` (default `v1.0`).
+both: `SWE_MILESTONE_IMAGE_TAG` (default = `manifests/BENCHMARK_VERSION`;
+bumping a release = edit that one file + commit the new digest manifest —
+code, scripts, and CI all read it).
 
 At launch (`scripts/run_all.py` and `harness/e2e/run_e2e.py`),
 `harness/e2e/data_version.py` verifies — by read-only git fact check, never a
@@ -34,12 +36,15 @@ tag points at, and `run_e2e` persists the verdict in `trial_metadata.json`:
                  "explicit_pin": false, "checked": true}
 ```
 
-Enforcement mirrors `resolve_image()`: with the **default** pin a mismatch /
-missing tag / non-git data root prints a loud warning and the run continues
-(development must not be blocked); with an **explicit** `SWE_MILESTONE_IMAGE_TAG`
-any non-match refuses the launch. `SWE_MILESTONE_DATA_VERSION_CHECK=off` is the
-escape hatch, recorded as `checked: false`. Align a stale checkout with
-`./scripts/pull_data.sh --checkout` (report-only without the flag).
+Enforcement (hardened 2026-07-17): a mismatch / missing tag / non-git data
+root **refuses the launch under the default pin exactly as under an explicit
+`SWE_MILESTONE_IMAGE_TAG`** — score comparability is the benchmark's core
+contract, so an unverified data checkout never runs silently.
+`SWE_MILESTONE_DATA_VERSION_CHECK=off` is the deliberate escape hatch for
+development (recorded as `checked: false` in trial metadata); a digest-pinned
+image ref (`@sha256:…`) similarly overrides the image-tag gate deliberately.
+Align a stale checkout with `./scripts/pull_data.sh` (aligns by default;
+`--report-only` to inspect without changing anything).
 
 ## Bump rules
 
@@ -84,6 +89,13 @@ no tooling reads them.
 
 Run on the machine holding the source images. Example values: v0.9 → v1.0.
 
+> The digest manifest (`manifests/digests-<version>.tsv`) is the single
+> per-version manifest: it enumerates the images AND freezes their content
+> digests. When cutting a NEW version its manifest does not exist yet — point
+> the plan commands at the previous version's file with
+> `--manifest manifests/digests-<prev>.tsv` (the name set carries over);
+> step 4 then writes the new file.
+
 ```bash
 # 1. Inventory check — every manifest row has a local source (expect no output)
 python3 -m harness.e2e.image_version retag-plan --version v1.0 \
@@ -111,15 +123,20 @@ while IFS=$'\t' read -r local hub; do
     printf '%s\t%s\n' "$local" "${digest:-PUSH-FIRST}"
 done > manifests/digests-v1.0.tsv
 
-# 5. Verify: plan sanity, spot-check registry digests, smoke one eval
+# 5. Verify: local + Hub against the frozen manifest, then smoke one eval.
+#    --local BEFORE pushing images catches "rebuilt locally, manifest stale";
+#    --hub AFTER pushing confirms the Hub tags point at the frozen bytes.
+#    (CI reruns the --hub check on every manifests/ change and daily:
+#    .github/workflows/verify-image-digests.yml)
+python3 scripts/verify_image_digests.py --local --version v1.0
+python3 scripts/verify_image_digests.py --hub --version v1.0
 ./scripts/pull_images.sh --dry-run
-docker manifest inspect <hub_ref>        # digest must equal the frozen value
 python3 scripts/verify_quarantine.py --repo <short>
 
 # 6. Tag the data repo with the SAME version (from the release data checkout)
 git -C <SWE-Milestone-data> tag v1.0 && git -C <SWE-Milestone-data> push origin v1.0
 ```
 
-After release: bump `DEFAULT_IMAGE_TAG` in `image_version.py` (if not already
-done with the code change); other machines align via `./scripts/pull_images.sh`
-(layer dedup makes it near-free) or step 2 above.
+After release: bump `manifests/BENCHMARK_VERSION` (the single source of truth
+read by code, scripts, and CI); other machines align via
+`./scripts/pull_images.sh` (layer dedup makes it near-free) or step 2 above.

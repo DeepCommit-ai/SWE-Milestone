@@ -1,13 +1,12 @@
-data_root: /data2/gangda/SWE-Milestone-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_opus-4.7
 agent: claude-code
 model: "claude-opus-4-7"
-# claude-opus-4-7 alone defaults to 200K and adaptively falls back to [1m] 
-# only when prompts approach the limit).
+default_agent_model: "claude-opus-4-7"
+# reasoning_effort unset on purpose: opus-4-7's built-in default is xhigh.
 timeout: 18000
-default_haiku_model: "claude-opus-4-7"
-# reasoning_effort intentionally unset — let opus-4-7 use its built-in
-# default (xhigh). (Bug #48051 — forced high/max collapsing to medium — is
-# fixed in current claude-code: effort now rides in output_config.effort
-# server-side, verified on 2.1.158, so `max` is safe if you ever want it
-# explicitly. Left unset here to keep this trial on the built-in xhigh.)
+# Default 200K context regime (bare model id; 1M variant is the separate -1m config).
+auto_compact_window: 200000
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210
