@@ -30,6 +30,11 @@ Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But re
   <img src="assets/swe-milestone_illustration.png" width="820" alt="How SWE-Milestone works: Continuous Task Evaluation with DAG, Agent Loop, and Test-Based Grading" />
 </p>
 
+<p align="center">
+  <img src="assets/milestone_dag_sklearn.svg" width="820" alt="Example milestone DAG extracted from the scikit-learn 1.5.2 → 1.6.0 release history" />
+</p>
+<p align="center"><i>A real milestone DAG: the scikit-learn 1.5.2 → 1.6.0 itinerary — nodes are milestones, edges are dependencies that gate when downstream tasks unlock.</i></p>
+
 Currently focused on **software evolution**, SWE-Milestone's architecture is designed to extend to other domains.
 
 ## ✨ Key Features
