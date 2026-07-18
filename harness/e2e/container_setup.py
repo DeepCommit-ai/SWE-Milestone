@@ -34,6 +34,9 @@ from harness.e2e.sni_tunnel import tunnel_plan
 # rewrite — the sidecar runs as root in its own container, so binding 443 is
 # free. See _ensure_sni_sidecar + harness/e2e/sni_tunnel.py.
 SNI_SIDECAR_PORT = 443
+# The sidecar reuses the repo's agent image when it ships python3; images
+# without it (Java/Rust bases) fall back to this stdlib-only python image.
+SNI_SIDECAR_FALLBACK_IMAGE = "python:3.12-slim"
 from harness.e2e.runtime_policy_binding import (
     RUNTIME_POLICY_ENV_KEYS,
     RuntimePolicyBinding,
@@ -1776,6 +1779,22 @@ echo "Git history truncated successfully"
         if running != "true":
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             sni_src = str(Path(sni_tunnel_module.__file__).resolve())
+            # The tunnel is stdlib-only python3. Probe the repo image for it at
+            # runtime (Java/Rust bases don't ship python3) instead of trusting
+            # the image; fall back to a plain python image when absent.
+            sidecar_image = self.image_name
+            probe = subprocess.run(
+                ["docker", "run", "--rm", "--entrypoint", "python3",
+                 sidecar_image, "--version"],
+                capture_output=True, text=True,
+            )
+            if probe.returncode != 0:
+                logger.warning(
+                    f"  Image {sidecar_image} has no usable python3 "
+                    f"({probe.stderr.strip().splitlines()[-1] if probe.stderr.strip() else 'probe failed'}); "
+                    f"using {SNI_SIDECAR_FALLBACK_IMAGE} for the SNI sidecar"
+                )
+                sidecar_image = SNI_SIDECAR_FALLBACK_IMAGE
             # --entrypoint python3 bypasses the image's own ENTRYPOINT (e.g. the
             # node image's docker-entrypoint.sh) so the tunnel runs directly.
             launch = subprocess.run(
@@ -1784,7 +1803,7 @@ echo "Git history truncated successfully"
                     "--name", name,
                     "-v", f"{sni_src}:/sni_tunnel.py:ro",
                     "--entrypoint", "python3",
-                    self.image_name,
+                    sidecar_image,
                     "/sni_tunnel.py",
                     "--pin", host,
                     "--listen", f"0.0.0.0:{SNI_SIDECAR_PORT}",
