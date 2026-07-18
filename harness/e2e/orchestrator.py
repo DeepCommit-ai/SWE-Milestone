@@ -183,6 +183,42 @@ def derive_resolution(
     return is_resolved, actual_passed
 
 
+def classify_unevaluated_milestones(
+    *,
+    all_milestones: Set[str],
+    evaluated: Set[str],
+    runnable: List[str],
+    skipped: Set[str],
+    dag_submitted: Set[str],
+    was_submitted: Callable[[str], bool],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Split never-evaluated milestones into (available, submitted, blocked).
+
+    Single source of truth for the summary's pending-milestone buckets. The
+    subtle case is early-unlock mode: submission calls ``dag.mark_complete``
+    (so dependents unlock immediately) instead of ``dag.mark_submitted``, which
+    removes the milestone from every DAG pending set — the naive
+    "pending − available − skipped − dag.submitted" arithmetic then labels an
+    in-flight or crashed-evaluation milestone "blocked", which is a lie: the
+    agent demonstrably submitted it. ``was_submitted`` supplies that evidence
+    (runtime facts such as an on-disk source snapshot, which survive process
+    restarts, plus the in-memory early-unlock set).
+    """
+    pending = all_milestones - evaluated
+    available = sorted(m for m in runnable if m in pending)
+    available_set = set(available)
+    submitted_set = {m for m in dag_submitted if m in pending}
+    blocked: List[str] = []
+    for m in sorted(pending):
+        if m in available_set or m in skipped or m in submitted_set:
+            continue
+        if was_submitted(m):
+            submitted_set.add(m)
+        else:
+            blocked.append(m)
+    return available, sorted(submitted_set), blocked
+
+
 def run_evaluation_task(
     milestone_id: str,
     snapshot_path: Path,
@@ -1943,27 +1979,24 @@ class E2EOrchestrator:
             early_unlocked = sorted([m for m, r in summary["results"].items() if r.get("dag_status") == "unlocked"])
             evaluated_set = set(evaluated_passed) | set(evaluated_failed) | set(evaluated_error)
 
-            # Calculate pending milestones status from DAG
-            pending_milestones = self.dag.all_milestones - evaluated_set
-
-            # Get runnable (available) milestones
-            available = sorted([m for m in self.dag.get_next_runnable() if m not in evaluated_set])
-
             # Get skipped milestones (blocked by strong dependency failure)
             skipped = sorted(list(self.dag.skipped_milestones))
 
-            # Get submitted milestones (awaiting evaluation)
-            submitted = sorted(list(self.dag.submitted_milestones))
-
-            # Get blocked milestones (dependencies not yet met, not skipped, not submitted)
-            blocked = sorted(
-                [
-                    m
-                    for m in pending_milestones
-                    if m not in available
-                    and m not in self.dag.skipped_milestones
-                    and m not in self.dag.submitted_milestones
-                ]
+            # Split the never-evaluated remainder into available / submitted /
+            # blocked. Submission evidence beyond the DAG's submitted set is
+            # required because early-unlock mode marks submissions "complete"
+            # in the DAG: the on-disk source snapshot is the restart-proof
+            # runtime fact that the agent submitted the milestone.
+            available, submitted, blocked = classify_unevaluated_milestones(
+                all_milestones=self.dag.all_milestones,
+                evaluated=evaluated_set,
+                runnable=self.dag.get_next_runnable(),
+                skipped=self.dag.skipped_milestones,
+                dag_submitted=self.dag.submitted_milestones,
+                was_submitted=lambda m: (
+                    m in self._early_unlocked_milestones
+                    or (self.trial_root / "evaluation" / m / "source_snapshot.tar").exists()
+                ),
             )
 
             # Update statistics with counts
