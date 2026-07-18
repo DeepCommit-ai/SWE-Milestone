@@ -4336,8 +4336,13 @@ fi
                 f"directories: {sorted(unsafe_test_imports)}"
             )
 
+        # The tab separator is rendered by Go's template engine (printf "%s\t%s"),
+        # not embedded in this Python/shell string: template literal text does no
+        # escape processing, so a raw "\t" here would emit a literal backslash-t
+        # and every row would fail the tab partition below.
         listed = self._go_exec(
-            "go list -mod=readonly -f '{{.ImportPath}}\\t{{.Dir}}' ./...",
+            "go list -mod=readonly -f "
+            "'{{printf \"%s\\t%s\" .ImportPath .Dir}}' ./...",
             workdir=workdir,
             env=base_env,
         )
