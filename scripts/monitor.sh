@@ -49,7 +49,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --full              Full wide table with all columns"
             echo ""
             echo "Filters:"
-            echo "  --data-root PATH    Path to SWE-Milestone-data (default: from trial_config.yaml)"
+            echo "  --data-root PATH    Path to SWE-Milestone-data (default: data_root from trial"
+            echo "                      configs or SWE_MILESTONE_DATA_ROOT from .env/.env_private)"
             echo "  --repos REPO ...    Only show these repos"
             echo "  -- ...              Extra args passed to collect_results.py"
             exit 0
@@ -63,38 +64,78 @@ done
 # ─────────────────────────────────────────────
 # Resolve data_root (needed before trial auto-detect)
 # ─────────────────────────────────────────────
-SWE_MILESTONE_CONFIG="$PROJECT_ROOT/trial_config.yaml"
 if [[ -z "$DATA_ROOT" ]]; then
-    # Try reading from trial_config.yaml
-    if [[ -f "$SWE_MILESTONE_CONFIG" ]]; then
-        DATA_ROOT=$(python3 -c "
-import yaml
-with open('$SWE_MILESTONE_CONFIG') as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('data_root', ''))
-" 2>/dev/null)
-    fi
-    # Fallback: scan trial_configs/ directory for any config with data_root
-    if [[ -z "$DATA_ROOT" && -d "$PROJECT_ROOT/trial_configs" ]]; then
-        for cfg_file in "$PROJECT_ROOT"/trial_configs/*.yaml; do
-            [[ -f "$cfg_file" ]] || continue
-            DATA_ROOT=$(python3 -c "
-import yaml
-with open('$cfg_file') as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('data_root', ''))
-" 2>/dev/null)
-            [[ -n "$DATA_ROOT" ]] && break
-        done
-    fi
+    # Same resolution as run_all.py: load .env/.env_private (shell-exported vars
+    # win over .env_private, which wins over .env), expand ${VAR} in config
+    # data_root values, and fall back to SWE_MILESTONE_DATA_ROOT when no config
+    # provides one.
+    DATA_ROOT=$(python3 - "$PROJECT_ROOT" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+
+# Mirror scripts/run_all.py::_load_dotenv_files (keep the two in sync).
+merged = {}
+for fname in (".env", ".env_private"):  # .env_private overrides .env
+    path = os.path.join(root, fname)
+    if not os.path.exists(path):
+        continue
+    for raw in open(path).read().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        merged[key] = val
+for key, val in merged.items():
+    os.environ.setdefault(key, val)  # real shell-exported vars win
+
+
+def config_data_root(path):
+    try:
+        import yaml
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return str(cfg.get("data_root") or "")
+    except Exception:
+        return ""
+
+
+candidates = [os.path.join(root, "trial_config.yaml")]
+trial_configs = os.path.join(root, "trial_configs")
+if os.path.isdir(trial_configs):
+    candidates += [
+        os.path.join(trial_configs, name)
+        for name in sorted(os.listdir(trial_configs))
+        if name.endswith(".yaml")
+    ]
+
+raw = ""
+for candidate in candidates:
+    if os.path.isfile(candidate):
+        raw = config_data_root(candidate)
+        if raw:
+            break
+raw = raw or os.environ.get("SWE_MILESTONE_DATA_ROOT", "")
+print(os.path.expanduser(os.path.expandvars(raw)))
+PY
+    )
     if [[ -z "$DATA_ROOT" ]]; then
-        echo "Error: --data-root not specified and no data_root found in trial_config.yaml or trial_configs/*.yaml"
+        echo "Error: --data-root not specified, no data_root in trial_config.yaml or trial_configs/*.yaml, and SWE_MILESTONE_DATA_ROOT not set (see .env_private)"
         exit 1
     fi
 fi
 
-# Resolve to absolute path
-DATA_ROOT="$(cd "$DATA_ROOT" 2>/dev/null && pwd)" || { echo "Error: data_root not found: $DATA_ROOT"; exit 1; }
+# Resolve to absolute path (keep the original value for the error message)
+RESOLVED_DATA_ROOT="$(cd "$DATA_ROOT" 2>/dev/null && pwd)" || { echo "Error: data_root not found: $DATA_ROOT"; exit 1; }
+DATA_ROOT="$RESOLVED_DATA_ROOT"
 
 # ─────────────────────────────────────────────
 # Auto-detect trial name if not provided
