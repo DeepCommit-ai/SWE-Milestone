@@ -1375,6 +1375,82 @@ class EvaluationResult:
             result["eval_status"] = "failed"
         return result
 
+    @classmethod
+    def from_result_dict(cls, data: Dict[str, Any]) -> "EvaluationResult":
+        """Rebuild an EvaluationResult from a persisted ``to_dict`` payload.
+
+        Partial inverse of ``to_dict``: reconstructs the fields consumed by
+        summary registration and threshold resolution (test counts, scoring-
+        safety flags feeding ``resolution_locked_false`` / ``scoring_untrusted``,
+        binding metadata). Purely-diagnostic metadata not needed for those
+        decisions keeps its dataclass default. Raises KeyError/TypeError on a
+        payload missing the required core sections — callers treat that as
+        "not a finished result" and fall back to re-evaluating.
+        """
+        tests = data["tests_status"]
+        summary = data["test_summary"]
+        f2p = tests["FAIL_TO_PASS"]
+        n2p = tests["NONE_TO_PASS"]
+        p2p = tests["PASS_TO_PASS"]
+        policy = data.get("build_failure_policy") or {}
+        residue = data.get("residue_prune") or {}
+        integrity = data.get("snapshot_integrity") or {}
+        environment = data.get("evaluation_environment") or {}
+        go_closure = data.get("go_module_closure") or {}
+        return cls(
+            milestone_id=data["milestone_id"],
+            patch_is_None=bool(data["patch_is_None"]),
+            patch_exists=bool(data["patch_exists"]),
+            patch_successfully_applied=bool(data["patch_successfully_applied"]),
+            resolved=bool(data["resolved"]),
+            fail_to_pass_success=list(f2p.get("success") or []),
+            fail_to_pass_failure=list(f2p.get("failure") or []),
+            pass_to_pass_success_count=int(p2p["success_count"]),
+            pass_to_pass_failure=list(p2p.get("failure") or []),
+            pass_to_pass_missing=int(p2p.get("missing") or 0),
+            none_to_pass_success=list(n2p.get("success") or []),
+            none_to_pass_failure=list(n2p.get("failure") or []),
+            total_tests=int(summary["total"]),
+            passed_tests=int(summary["passed"]),
+            failed_tests=int(summary["failed"]),
+            error_tests=int(summary.get("error") or 0),
+            skipped_tests=int(summary.get("skipped") or 0),
+            fail_to_pass_required=int(summary["fail_to_pass_required"]),
+            fail_to_pass_achieved=int(summary["fail_to_pass_achieved"]),
+            pass_to_pass_required=int(summary["pass_to_pass_required"]),
+            none_to_pass_required=int(summary["none_to_pass_required"]),
+            none_to_pass_achieved=int(summary["none_to_pass_achieved"]),
+            base_tag=str(data.get("base_tag") or ""),
+            fallback_triggered=bool(data.get("fallback_triggered") or False),
+            end_compile_error=str(data.get("end_compile_error") or ""),
+            start_compile_error=str(data.get("start_compile_error") or ""),
+            build_failure_fail_closed=bool(policy.get("fail_closed") or False),
+            partial_test_universe=bool(policy.get("partial_test_universe") or False),
+            build_failure_diagnostics=list(policy.get("diagnostics") or []),
+            residue_prune_skipped_reason=str(residue.get("skipped_reason") or ""),
+            snapshot_integrity_ok=integrity.get("ok"),
+            snapshot_legacy_unverified=bool(integrity.get("legacy_unverified") or False),
+            snapshot_missing_count=int(integrity.get("missing_count") or 0),
+            infrastructure_failure=str(data.get("infrastructure_failure") or ""),
+            infra_invalid_reason=str(data.get("infra_invalid_reason") or ""),
+            scored_failure_reason=str(data.get("scored_failure_reason") or ""),
+            go_module_production_compile_error=str(
+                go_closure.get("production_compile_error") or ""
+            ),
+            go_module_test_graph_contract_error=str(
+                go_closure.get("test_graph_contract_error") or ""
+            ),
+            repo_config_binding_mode=str(
+                environment.get("repo_config_binding_mode") or ""
+            ),
+            repo_config_sha256=str(environment.get("repo_config_sha256") or ""),
+            runtime_policy_binding_mode=str(
+                environment.get("runtime_policy_binding_mode") or ""
+            ),
+            runtime_policy_sha256=str(environment.get("runtime_policy_sha256") or ""),
+            runtime_policy_mode=str(environment.get("runtime_policy_mode") or ""),
+        )
+
     def summary(self) -> str:
         """Generate human-readable summary."""
         lines = [

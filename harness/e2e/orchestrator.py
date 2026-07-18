@@ -92,10 +92,16 @@ def _run_evaluation_once(
     )
     eval_res = evaluator.evaluate()
 
-    with open(eval_result_path, "w") as f:
+    # Atomic write: a half-written result must never look like a finished
+    # evaluation (resume-side reconciliation trusts this file's completeness).
+    eval_result_tmp = eval_result_path.with_suffix(eval_result_path.suffix + ".tmp")
+    with open(eval_result_tmp, "w") as f:
         import json
 
         json.dump(eval_res.to_dict(), f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(eval_result_tmp, eval_result_path)
 
     # F-2a: an infrastructure failure or an incomplete zero-test universe
     # poisoned the run.  The flagged JSON is already on disk as evidence;
@@ -107,35 +113,11 @@ def _run_evaluation_once(
             f"{milestone_id}: evaluation result is not safe to score: {reason}"
         )
 
-    # Use config thresholds to determine resolution
-    # Calculate rates for each test category
-    if eval_res.fail_to_pass_required > 0:
-        f2p_rate = eval_res.fail_to_pass_achieved / eval_res.fail_to_pass_required
-    else:
-        f2p_rate = 1.0  # If no F2P tests, assume 100% success
-
-    # P2P rate: use pass_to_pass_required as denominator to account for missing tests
-    # Missing tests (tests that were expected but not found in results) should be treated as failures
-    p2p_required = eval_res.pass_to_pass_required
-    if p2p_required > 0:
-        p2p_rate = eval_res.pass_to_pass_success_count / p2p_required
-    else:
-        p2p_rate = 1.0  # If no P2P tests, assume 100% success
-
-    if eval_res.none_to_pass_required > 0:
-        n2p_rate = eval_res.none_to_pass_achieved / eval_res.none_to_pass_required
-    else:
-        n2p_rate = 1.0  # If no N2P tests, assume 100% success
-
-    # Check all thresholds - milestone is resolved only if all pass.
-    # F1 fail-closed: never let the threshold recompute overturn a scoring-
-    # untrusted verdict (residue prune requested but did not complete -> the
-    # eval tree may be the additive GT solution). AND in the safety flag.
-    is_resolved = (
-        f2p_rate >= fail_to_pass_threshold
-        and p2p_rate >= pass_to_pass_threshold
-        and n2p_rate >= none_to_pass_threshold
-        and not eval_res.resolution_locked_false
+    is_resolved, actual_passed = derive_resolution(
+        eval_res,
+        fail_to_pass_threshold=fail_to_pass_threshold,
+        pass_to_pass_threshold=pass_to_pass_threshold,
+        none_to_pass_threshold=none_to_pass_threshold,
     )
     if eval_res.resolution_locked_false:
         logger.warning(
@@ -148,18 +130,57 @@ def _run_evaluation_once(
             f"— resolution locked False (fail-closed)"
         )
 
-    # Actual test result: did tests actually pass 100%? (ignoring thresholds)
-    # This is used for eval_status reporting, independent of DAG resolution
-    actual_passed = (
-        f2p_rate == 1.0
-        and p2p_rate == 1.0
-        and n2p_rate == 1.0
-        and not eval_res.resolution_locked_false
-    )
-
     # Update eval_res.resolved to reflect Config decision
     eval_res.resolved = is_resolved
     return milestone_id, is_resolved, actual_passed, eval_res, None
+
+
+def derive_resolution(
+    eval_res: EvaluationResult,
+    *,
+    fail_to_pass_threshold: float,
+    pass_to_pass_threshold: float,
+    none_to_pass_threshold: float,
+) -> Tuple[bool, bool]:
+    """Compute (is_resolved, actual_passed) from an evaluation's test counts.
+
+    Single source of truth for the threshold decision — used by the live
+    evaluation path and by resume-side reconciliation of results found on
+    disk, so the two can never drift.
+
+    - is_resolved: all category rates meet the configured thresholds (DAG).
+    - actual_passed: every category is at 100% (eval_status reporting).
+    F1 fail-closed: ``resolution_locked_false`` overrides both — a scoring-
+    untrusted verdict is never overturned by the rate recompute.
+    """
+    if eval_res.fail_to_pass_required > 0:
+        f2p_rate = eval_res.fail_to_pass_achieved / eval_res.fail_to_pass_required
+    else:
+        f2p_rate = 1.0  # If no F2P tests, assume 100% success
+
+    # P2P rate: use pass_to_pass_required as denominator to account for missing
+    # tests (expected but not found in results) — they count as failures.
+    if eval_res.pass_to_pass_required > 0:
+        p2p_rate = eval_res.pass_to_pass_success_count / eval_res.pass_to_pass_required
+    else:
+        p2p_rate = 1.0  # If no P2P tests, assume 100% success
+
+    if eval_res.none_to_pass_required > 0:
+        n2p_rate = eval_res.none_to_pass_achieved / eval_res.none_to_pass_required
+    else:
+        n2p_rate = 1.0  # If no N2P tests, assume 100% success
+
+    locked_false = eval_res.resolution_locked_false
+    is_resolved = (
+        f2p_rate >= fail_to_pass_threshold
+        and p2p_rate >= pass_to_pass_threshold
+        and n2p_rate >= none_to_pass_threshold
+        and not locked_false
+    )
+    actual_passed = (
+        f2p_rate == 1.0 and p2p_rate == 1.0 and n2p_rate == 1.0 and not locked_false
+    )
+    return is_resolved, actual_passed
 
 
 def run_evaluation_task(

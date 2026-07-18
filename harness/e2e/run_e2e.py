@@ -691,6 +691,18 @@ class E2ETrialRunner:
                         result_dir = snapshot_path.parent
                     result_dir.mkdir(parents=True, exist_ok=True)
 
+                    # A previous worker may have finished this evaluation after
+                    # its event loop stopped (late background eval). Runtime
+                    # fact check: a complete result on disk is ingested instead
+                    # of re-running the whole evaluation.
+                    if self._try_reconcile_finished_evaluation(mid, attempt, result_dir):
+                        tag_hash = payload.get("tag_hash")
+                        if isinstance(tag_hash, str) and tag_hash:
+                            evaluated_hashes[mid] = tag_hash
+                        if attempt > 0:
+                            retry_counts[mid] = max(retry_counts.get(mid, 0), attempt)
+                        continue
+
                     with self._state_lock:
                         self.running_evaluations.add((mid, attempt))
 
@@ -1047,6 +1059,70 @@ class E2ETrialRunner:
 
         return None
 
+    def _try_reconcile_finished_evaluation(
+        self, mid: str, attempt: int, result_dir: Path
+    ) -> bool:
+        """Ingest an already-finished evaluation from disk instead of re-running.
+
+        A prior worker can produce evaluation_result.json after its event loop
+        stopped consuming completions (late background eval past the wait
+        timeout), leaving a finished result on disk that summary.json never
+        registered — the resume pass would then re-run or, with the DAG already
+        done, silently mislabel the milestone as blocked.
+
+        Trust only runtime facts, fail closed: the file must exist, parse,
+        match the milestone, reconstruct, and be safe to score (results are
+        written atomically, so a parseable file is a finished one). Anything
+        less falls through to a normal re-evaluation. Ingestion goes through
+        ``_process_evaluation_result`` — the exact path the live watcher uses —
+        so DAG, summary, feedback, and filtered artifacts stay consistent.
+        """
+        from harness.e2e.evaluator import EvaluationResult
+        from harness.e2e.orchestrator import derive_resolution
+
+        result_path = result_dir / "evaluation_result.json"
+        try:
+            data = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or data.get("milestone_id") != mid:
+            logger.warning(
+                f"Resume priming: on-disk result at {result_path} does not "
+                f"match milestone {mid}; re-evaluating"
+            )
+            return False
+        if data.get("infrastructure_failure") or data.get("infra_invalid_reason"):
+            logger.info(
+                f"Resume priming: {mid} on-disk result is infra-flagged "
+                "(not safe to score); re-evaluating"
+            )
+            return False
+        try:
+            eval_res = EvaluationResult.from_result_dict(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                f"Resume priming: {mid} on-disk result incomplete ({exc}); re-evaluating"
+            )
+            return False
+
+        config = self.orchestrator.config
+        is_resolved, actual_passed = derive_resolution(
+            eval_res,
+            fail_to_pass_threshold=config.fail_to_pass_threshold,
+            pass_to_pass_threshold=config.pass_to_pass_threshold,
+            none_to_pass_threshold=config.none_to_pass_threshold,
+        )
+        eval_res.resolved = is_resolved
+        dag_status, eval_status, error_msg = self.orchestrator._process_evaluation_result(
+            mid, is_resolved, actual_passed, eval_res, None, attempt=attempt
+        )
+        self.eval_event_queue.put(("eval_complete", mid, dag_status, eval_status, error_msg))
+        logger.info(
+            f"♻️ Resume priming: reconciled finished evaluation for {mid} from "
+            f"disk (dag={dag_status}, eval={eval_status}); skipping re-run"
+        )
+        return True
+
     def _wait_for_evaluations(self, max_wait: int = None) -> str:
         """Wait for pending evaluations using event queue.
 
@@ -1073,6 +1149,12 @@ class E2ETrialRunner:
             max_wait = config.evaluation_timeout
 
         start_time = time.time()
+        # Late-eval harvest: after the primary wait expires we keep consuming
+        # completion events (bounded) instead of abandoning in-flight
+        # evaluations — their summary registration happens through this loop's
+        # normal consumers, so returning early silently drops finished results.
+        harvest_started: Optional[float] = None
+        harvest_grace = int(getattr(config, "eval_harvest_grace_seconds", 1800) or 0)
 
         # First, drain any pending events that accumulated while agent was running
         if self._drain_pending_events() == "all_done":
@@ -1126,8 +1208,26 @@ class E2ETrialRunner:
             elapsed = time.time() - start_time
             remaining = max_wait - elapsed
             if remaining <= 0:
-                logger.warning(f"Timeout after {max_wait}s waiting for evaluations")
-                return "timeout"
+                with self._state_lock:
+                    in_flight = sorted(self.running_evaluations)
+                if not in_flight or harvest_grace <= 0:
+                    logger.warning(f"Timeout after {max_wait}s waiting for evaluations")
+                    return "timeout"
+                if harvest_started is None:
+                    harvest_started = time.time()
+                    logger.warning(
+                        f"⏳ Primary wait ({max_wait}s) exhausted with "
+                        f"{len(in_flight)} in-flight evaluation(s) {in_flight}; "
+                        f"harvesting completions for up to {harvest_grace}s"
+                    )
+                if time.time() - harvest_started >= harvest_grace:
+                    logger.warning(
+                        f"Harvest grace ({harvest_grace}s) exhausted; abandoning "
+                        f"in-flight evaluation(s) {in_flight} — results that "
+                        "finish on disk will be reconciled on the next resume"
+                    )
+                    return "timeout"
+                remaining = 5.0  # keep consuming completion events during harvest
 
             # Wait for event from watcher (with timeout)
             try:
@@ -2687,7 +2787,38 @@ Example:
     )
 
     success = trial.run()
-    sys.exit(0 if success else 1)
+    _exit_after_thread_teardown(0 if success else 1)
+
+
+def _exit_after_thread_teardown(exit_code: int, join_budget_seconds: float = 120.0) -> None:
+    """Exit without letting stray non-daemon threads zombify the worker.
+
+    ThreadPoolExecutor workers are non-daemon and concurrent.futures registers
+    an atexit hook that joins them, so a plain sys.exit can hang the process
+    indefinitely on an abandoned in-flight evaluation (observed as workers
+    stuck in futex_wait for hours after "Cleanup complete"). Give stragglers a
+    bounded join, then force the exit — an abandoned evaluation either finished
+    its atomic result write (reconciled on next resume) or left nothing behind.
+    """
+    deadline = time.time() + join_budget_seconds
+    current = threading.current_thread()
+    for thread in threading.enumerate():
+        if thread is current or thread.daemon:
+            continue
+        thread.join(timeout=max(0.0, deadline - time.time()))
+    stragglers = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread is not current and not thread.daemon and thread.is_alive()
+    ]
+    if stragglers:
+        logger.warning(
+            f"Forcing exit (code {exit_code}) with {len(stragglers)} stuck "
+            f"non-daemon thread(s) after {join_budget_seconds:.0f}s: {stragglers}"
+        )
+        logging.shutdown()
+        os._exit(exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
