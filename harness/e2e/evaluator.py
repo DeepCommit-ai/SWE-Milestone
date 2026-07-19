@@ -5995,7 +5995,15 @@ fi
             pruned_files=self._eval_meta["pruned_files"],
             keep_list_hits=self._eval_meta["keep_list_hits"],
             snapshot_integrity_ok=self._eval_meta["snapshot_integrity_ok"],
-            snapshot_legacy_unverified=self._eval_meta.get("snapshot_legacy_unverified", False),
+            # The live attribute is the source of truth: the escape hatch sets
+            # it the moment the sidecar-less snapshot is accepted, while the
+            # _eval_meta copy is only synced by the residue-prune phase — on
+            # repos that skip pruning the stale False would let a legacy
+            # UNVERIFIED result masquerade as promotion-grade.
+            snapshot_legacy_unverified=bool(
+                self.snapshot_legacy_unverified
+                or self._eval_meta.get("snapshot_legacy_unverified", False)
+            ),
             snapshot_missing_count=self._eval_meta["snapshot_missing_count"],
             residue_prune_skipped_reason=self._eval_meta["residue_prune_skipped_reason"],
             manifest_evaluator_base=self._eval_meta["manifest_evaluator_base"],
@@ -6419,7 +6427,10 @@ Example:
         result.pruned_files = meta["pruned_files"]
         result.keep_list_hits = meta["keep_list_hits"]
         result.snapshot_integrity_ok = meta["snapshot_integrity_ok"]
-        result.snapshot_legacy_unverified = meta.get("snapshot_legacy_unverified", False)
+        result.snapshot_legacy_unverified = bool(
+            getattr(evaluator, "snapshot_legacy_unverified", False)
+            or meta.get("snapshot_legacy_unverified", False)
+        )
         result.snapshot_missing_count = meta["snapshot_missing_count"]
         result.residue_prune_skipped_reason = meta["residue_prune_skipped_reason"]
         result.manifest_evaluator_base = meta.get("manifest_evaluator_base", "")
