@@ -127,10 +127,19 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "qwen3.6-27b": {"input": 0.29, "output": 0.90, "cache_read": 0.058, "cache_write": 0.29},
 }
 
-# Fireworks dedicated-deployment IDs used for the qwen3.6-27b trials —
-# resolve them to the canonical entry above.
-MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/trm5ci0n"] = MODEL_PRICING["qwen3.6-27b"]
-MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/p016vorq"] = MODEL_PRICING["qwen3.6-27b"]
+# Fireworks dedicated-deployment IDs used for the qwen3.6-27b trials.
+# The Fireworks endpoint reported almost no cache (11% hit) — context tokens
+# landed in inputTokens at the cache-miss rate. On the official DashScope API
+# the same claude-code traffic hits the context cache (sibling opus-4.8 trials
+# on this harness measure a 96.9% cache-hit token share). Blend the official
+# rates (0.29 miss / 0.058 cache hit = 20% of input per Model Studio) at that
+# ratio for an effective input price:
+#   0.969 × 0.058 + 0.031 × 0.29 ≈ 0.065
+# (mirrors the deepseek-v4-pro Fireworks handling above; the canonical
+# "qwen3.6-27b" entry keeps the official per-token rates.)
+_QWEN36_FIREWORKS = {"input": 0.065, "output": 0.90, "cache_read": 0.058, "cache_write": 0.29}
+MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/trm5ci0n"] = _QWEN36_FIREWORKS
+MODEL_PRICING["accounts/gangdade-x2tm7md3a42/deployments/p016vorq"] = _QWEN36_FIREWORKS
 
 # Fireworks' Anthropic-compatible endpoint reported NO cache fields for the
 # deepseek-v4-pro trials — every context token landed in inputTokens at the
