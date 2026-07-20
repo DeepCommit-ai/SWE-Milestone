@@ -122,10 +122,9 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # ── MiniMax ───────────────────────────────────────────────────────────
     "minimax-2.5": {"input": 0.3, "output": 2.4, "cache_read": 0.03, "cache_write": 0.375},
     # ── Qwen ──────────────────────────────────────────────────────────────
-    # OpenRouter market average 2026-06 (no cache discount listed → cache
-    # billed at input rate). Actual trials ran on a Fireworks dedicated
-    # deployment (GPU-hour billed); this is the per-token market equivalent.
-    "qwen3.6-27b": {"input": 0.289, "output": 2.40, "cache_read": 0.289, "cache_write": 0.289},
+    # Alibaba DashScope (Model Studio) list price; cache_read = 20% of input
+    # per the Model Studio context-cache rule.
+    "qwen3.6-27b": {"input": 0.29, "output": 0.90, "cache_read": 0.058, "cache_write": 0.29},
 }
 
 # Fireworks dedicated-deployment IDs used for the qwen3.6-27b trials —
