@@ -37,8 +37,11 @@ class CodexFramework(AgentFramework):
     # Default model for Codex
     DEFAULT_MODEL = "gpt-5.2-codex"
 
-    # Valid reasoning effort levels
-    VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+    # Valid reasoning effort levels. gpt-5.6-sol (and later) add "max"
+    # (supported_reasoning_levels in the OAuth models cache); older codex
+    # models top out at xhigh. Passing an effort the model doesn't support is
+    # rejected by the CLI, so only set it for models that advertise it.
+    VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
     # Models that need litellm's /openai_passthrough endpoint because
     # litellm's native /v1/responses reconstructs the SSE stream and drops
