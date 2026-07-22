@@ -56,6 +56,7 @@ WHITELISTED_DOMAINS = [
     "claude.ai",
     "sentry.io",
     "api.openai.com",
+    "chatgpt.com",  # Codex ChatGPT OAuth model endpoint
     "generativelanguage.googleapis.com",
     # Vertex AI direct (gemini-cli + claude-code native Vertex): the aiplatform
     # endpoint + OAuth token refresh for ADC. Only reachable when SWE_MILESTONE_VERTEX
@@ -1767,7 +1768,8 @@ echo "Git history truncated successfully"
             for c in os.environ.get("SWE_MILESTONE_DENY_CIDRS", "").split(",")
             if c.strip()
         ]
-        host = tunnel_plan(os.environ.get("UNIFIED_BASE_URL", ""), deny_cidrs)
+        endpoint_url = self._framework.get_network_endpoint_url() or ""
+        host = tunnel_plan(endpoint_url, deny_cidrs)
         if not host:
             return None
 

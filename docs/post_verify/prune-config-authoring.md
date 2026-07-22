@@ -2,19 +2,20 @@
 
 Residue prune ([spec](../superpowers/specs/residue-prune-spec.md)) is
 **default-off**. A dataset must
-set `residue_prune: true` explicitly after its src/test partition and prune
-facts pass the acceptance gate below. An absent flag preserves the historical
+set `residue_prune: true` explicitly in its repository config after its
+src/test partition and prune facts pass the acceptance gate below. An absent
+flag preserves the historical
 additive overlay, including for datasets that already define a src/test
 partition; an explicit `false` also keeps pruning disabled. The mechanism is
-universal code, but its correctness is delegated to per-range metadata facts
+universal code, but its correctness is delegated to per-range repository facts
 that **cannot be derived mechanically** — deciding what is source, what is
 exam paper, what is environment supply, and what is a fixture-in-disguise is
 semantic judgment. Two layers:
 
 | Layer | Where | Decides |
 |---|---|---|
-| deterministic | `harness/e2e/residue_prune.py` (v2 predicate, START guard, V3b never-delete assertion, fail-closed `scoring_untrusted`) | everything expressible as code over the metadata facts |
-| this skill | agent authoring/auditing the metadata facts for each new range | the facts themselves, across any language / repo layout |
+| deterministic | `harness/e2e/residue_prune.py` (v2 predicate, START guard, V3b never-delete assertion, fail-closed `scoring_untrusted`) | everything expressible as code over the repository facts |
+| this skill | agent authoring/auditing the repo-config facts for each new range | the facts themselves, across any language / repo layout |
 
 If a rule can be written as code over existing fields, put it in the code
 layer. This skill exists to author the fields.
@@ -67,10 +68,13 @@ layer. This skill exists to author the fields.
    of a milestone's tree, and any V3 tar, must come from that milestone's
    OWN evaluation image, never a sibling's. Production evaluation is
    unaffected (it always runs inside the milestone's own image).
-6. **Write the fields into the range `metadata.json`** in the data repo, one
-   commit per range, citing this skill. Leave `residue_prune` absent or `false`
-   while authoring; set it to `true` only after recording a successful
-   acceptance run.
+6. **Write the fields into `config/<range>.yaml` in the data repo**, one commit
+   per range, citing this skill. New trials freeze this file as
+   `repo_config.yaml`, bind its SHA into every snapshot sidecar, and evaluate
+   from that frozen copy. Leave `residue_prune` absent or `false` while
+   authoring; set it to `true` only after recording a successful acceptance
+   run. Existing ranges that have not migrated retain their legacy
+   `metadata.json` policy for compatibility.
 
 ## Acceptance gate (must pass before the range goes live)
 
@@ -95,7 +99,7 @@ driver `run4.sh`, GT-tar builder pattern in the run's tooling).
 
 ## Output
 
-A data-repo PR per range: metadata fields + a short authoring record (what
+A data-repo PR per range: repo-config fields + a short authoring record (what
 the build system says, which conventions were verified, keep-list
 discriminator hits with evidence paths) + acceptance artifacts (V3 result,
 V4 attribution table). Config goes to the data repo; anything that smells

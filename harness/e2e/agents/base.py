@@ -118,6 +118,15 @@ class AgentFramework(ABC):
         """
         return []
 
+    def get_network_endpoint_url(self) -> Optional[str]:
+        """Return the LLM endpoint used to plan quarantine networking.
+
+        Most frameworks use the unified proxy directly. Frameworks with a
+        first-party OAuth mode can override this when no explicit base URL is
+        configured.
+        """
+        return os.environ.get("UNIFIED_BASE_URL")
+
     @staticmethod
     def _validate_docker_env_args(args: List[str], *, source: str) -> List[str]:
         """Validate the ``-e KEY=value`` representation used by Docker."""

@@ -40,6 +40,24 @@ from harness.e2e.runtime_policy_binding import (
 )
 
 
+def validate_agent_version(agent: str, value: object) -> str:
+    """Validate an agent CLI selector using that adapter's version contract."""
+    candidate = str(value).strip()
+    if agent == "claude-code":
+        from harness.e2e.agents.claude_code import validate_claude_code_version
+
+        return validate_claude_code_version(candidate)
+    if agent in ("codex", "gemini-cli"):
+        from harness.e2e.agents.base import validate_agent_cli_version
+
+        label = "Codex" if agent == "codex" else "gemini-cli"
+        return validate_agent_cli_version(candidate, agent_label=label)
+    raise ValueError(
+        "agent_version is supported only for agent: "
+        "claude-code, codex, or gemini-cli"
+    )
+
+
 def _adc_project() -> str | None:
     """Read quota_project_id from the host ADC file (Vertex project default)."""
     cfg = os.environ.get("CLOUDSDK_CONFIG") or os.path.expanduser("~/.config/gcloud")
@@ -321,15 +339,10 @@ def main():
     reasoning_effort = cfg.get("reasoning_effort", None)
     agent_version = cfg.get("agent_version", None)
     if agent_version is not None:
-        agent_version = str(agent_version).strip()
-        from harness.e2e.agents.claude_code import validate_claude_code_version
         try:
-            agent_version = validate_claude_code_version(agent_version)
+            agent_version = validate_agent_version(agent, agent_version)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-        if agent != "claude-code":
-            print("Error: agent_version is currently supported only for agent: claude-code", file=sys.stderr)
             sys.exit(1)
     # Optional milestone-prefix: run only the first N (or P%) of each repo's DAG,
     # dependency-closed. CLI --milestones overrides the trial config's 'milestones:'.

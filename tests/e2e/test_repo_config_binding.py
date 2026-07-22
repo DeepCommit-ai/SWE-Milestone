@@ -17,7 +17,7 @@ from harness.e2e.repo_config_binding import (
     resolve_repo_config,
 )
 from harness.e2e import run_milestone
-from harness.e2e.run_e2e import _resolve_trial_relative_path
+from harness.e2e.run_e2e import _resolve_trial_relative_path, load_workspace_metadata
 
 
 REPO = "example_owner_repo_v1_v2"
@@ -79,6 +79,38 @@ def test_resolve_uses_project_fallback_and_explicit_empty_when_absent(tmp_path: 
     assert absent.source_path is None
     assert absent.raw_bytes == EMPTY_REPO_CONFIG_BYTES
     assert absent.config == {}
+
+
+def test_residue_repo_config_is_capture_authority(tmp_path: Path) -> None:
+    workspace = tmp_path / REPO
+    workspace.mkdir()
+    (workspace / "metadata.json").write_text(
+        json.dumps(
+            {
+                "repo_src_dirs": ["live-src"],
+                "test_dirs": ["live-tests/**"],
+                "exclude_patterns": ["live-excluded/**"],
+                "generated_patterns": ["live-generated/**"],
+            }
+        )
+    )
+    repo_config = {
+        "repo_src_dirs": ["dubbo-rpc"],
+        "test_dirs": ["**/src/test/**"],
+        "exclude": ["**/target/**"],
+        "generated_patterns": ["**/generated/**"],
+        "residue_prune": True,
+        "prune_extensions": [".java"],
+        "prune_keep_list": [],
+    }
+
+    loaded = load_workspace_metadata(workspace, repo_config=repo_config)
+
+    assert loaded["repo_src_dirs"] == ["dubbo-rpc"]
+    assert loaded["test_dirs"] == ["**/src/test/**"]
+    assert loaded["exclude_patterns"] == ["**/target/**"]
+    assert loaded["generated_patterns"] == ["**/generated/**"]
+    assert loaded["modifiable_test_patterns"] == []
 
 
 def test_single_milestone_runner_freezes_config_and_rejects_live_drift(

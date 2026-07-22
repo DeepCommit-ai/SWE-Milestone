@@ -34,6 +34,11 @@ class CodexFramework(AgentFramework):
 
     FRAMEWORK_NAME = "codex"
 
+    # ChatGPT OAuth sends Codex requests to this first-party endpoint instead
+    # of api.openai.com. ContainerSetup uses it only for firewall/tunnel
+    # planning; it is not injected as OPENAI_BASE_URL.
+    OAUTH_ENDPOINT_URL = "https://chatgpt.com/backend-api/codex"
+
     # Default model for Codex
     DEFAULT_MODEL = "gpt-5.2-codex"
 
@@ -48,6 +53,21 @@ class CodexFramework(AgentFramework):
     # events (response.output_item.added, response.content_part.added),
     # causing Codex CLI to fail with "OutputTextDelta without active item".
     PASSTHROUGH_MODELS: set[str] = set()
+
+    # Server-side/product tools can bypass the container network boundary or
+    # expose account-connected data. Keep them out of benchmark sessions. The
+    # local shell/editing tools remain available.
+    BENCHMARK_DISABLED_FEATURES = (
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "image_generation",
+        "in_app_browser",
+        "plugins",
+        "remote_plugin",
+    )
 
     def __init__(
         self,
@@ -96,6 +116,14 @@ class CodexFramework(AgentFramework):
         """Return effective reasoning effort (default: xhigh)."""
         return self.reasoning_effort
 
+    def get_network_endpoint_url(self) -> Optional[str]:
+        """Return the actual endpoint host for quarantine network planning."""
+        if self.base_url:
+            return self.base_url
+        if not self.api_key:
+            return self.OAUTH_ENDPOINT_URL
+        return "https://api.openai.com/v1"
+
     def _build_reasoning_effort_args(self) -> List[str]:
         """Return Codex CLI overrides for reasoning effort and safety knobs.
 
@@ -110,6 +138,8 @@ class CodexFramework(AgentFramework):
         backup to the in-container config.toml.
         """
         args: List[str] = ["-c", 'web_search="disabled"']
+        for feature in self.BENCHMARK_DISABLED_FEATURES:
+            args.extend(["-c", f"features.{feature}=false"])
         if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
             args.extend(["-c", f'model_reasoning_effort="{self.reasoning_effort}"'])
         return args
@@ -319,7 +349,12 @@ try:
     # letting the agent fetch upstream code from github/etc even when the
     # repo's own network path is blocked. Kept strictly off for benchmark
     # integrity (valid values: disabled, cached, live).
-    config_lines = ['web_search = "disabled"']
+    config_lines = [
+        'web_search = "disabled"',
+        '',
+        '[features]',
+        *[f'{feature} = false' for feature in __CODEX_DISABLED_FEATURES__],
+    ]
     if base_url:
         config_lines.append(f'openai_base_url = "{base_url}"')
     with open(config_dst, 'w') as f:
@@ -333,6 +368,9 @@ except Exception as e:
 """
         return script.replace(
             "__CODEX_AGENT_VERSION__", repr(self._agent_version)
+        ).replace(
+            "__CODEX_DISABLED_FEATURES__",
+            repr(self.BENCHMARK_DISABLED_FEATURES),
         )
 
     def build_run_command(

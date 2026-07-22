@@ -176,6 +176,7 @@ def _fake_resolver(host):
     return {
         "api.kimi.com": ["104.18.20.246"],
         "api.moonshot.ai": ["104.18.28.136"],
+        "chatgpt.com": ["104.18.32.47"],
         "api.anthropic.com": ["160.79.104.10"],  # Anthropic ASN, not Cloudflare
     }.get(host, [])
 
@@ -187,6 +188,14 @@ def test_tunnel_plan_activates_for_cidr_blocked_llm_endpoint():
         deny_cidrs=["104.16.0.0/12"],
         resolver=_fake_resolver,
     ) == "api.kimi.com"
+
+
+def test_tunnel_plan_activates_for_cidr_blocked_codex_oauth_endpoint():
+    assert tunnel_plan(
+        "https://chatgpt.com/backend-api/codex",
+        deny_cidrs=["104.16.0.0/12"],
+        resolver=_fake_resolver,
+    ) == "chatgpt.com"
 
 
 def test_tunnel_plan_none_when_endpoint_not_cidr_blocked():

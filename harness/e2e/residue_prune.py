@@ -55,6 +55,14 @@ DEFAULT_PRUNE_EXTENSIONS: FrozenSet[str] = frozenset(
     }
 )
 
+# A repository opts into the trial-pinned residue policy by declaring at least
+# one of these fields in its repo config.  Repositories that have not migrated
+# retain the legacy metadata.json policy so existing trials keep their original
+# semantics.
+RESIDUE_PRUNE_POLICY_FIELDS: FrozenSet[str] = frozenset(
+    {"residue_prune", "prune_extensions", "prune_keep_list"}
+)
+
 # Back-compat alias (old name).
 CODE_SOURCE_EXTENSIONS = DEFAULT_PRUNE_EXTENSIONS
 
@@ -64,6 +72,18 @@ _SAMPLE_CAP = 20
 
 class ResiduePruneSafetyError(Exception):
     """A path in the prune set violates the never-delete classes (V3b)."""
+
+
+def repo_config_has_residue_prune_policy(config: object) -> bool:
+    """Whether a repo config is the authoritative residue-policy source.
+
+    This explicit opt-in keeps unmigrated datasets on their historical
+    metadata.json behavior while allowing new trials to freeze the complete
+    policy in the already SHA-bound repo_config.yaml.
+    """
+    return isinstance(config, dict) and any(
+        field in config for field in RESIDUE_PRUNE_POLICY_FIELDS
+    )
 
 
 def _has_code_extension(path: str, extensions: FrozenSet[str]) -> bool:

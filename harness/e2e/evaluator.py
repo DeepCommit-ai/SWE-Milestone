@@ -53,11 +53,13 @@ from harness.e2e.residue_prune import (
     ResiduePruneSafetyError,
     assert_prune_set_safe,
     capture_excluded_from_config,
+    capture_filter_config,
     check_snapshot_integrity,
     compute_prune_set,
     normalize_extensions,
     normalize_keep_list,
     normalize_tar_members,
+    repo_config_has_residue_prune_policy,
     resolve_prune_enablement,
 )
 from harness.utils.rust_test_filter import (
@@ -641,6 +643,112 @@ def load_bound_repo_config(
     return value
 
 
+@dataclass(frozen=True)
+class ResolvedResiduePruneConfig:
+    """Effective per-repository prune policy and authority partition."""
+
+    requested: bool
+    enable_reason: str
+    extensions: FrozenSet[str]
+    keep_list: FrozenSet[str]
+    src_filter: Optional[SrcFileFilter]
+    policy_source: str
+    policy_sha256: str
+
+
+def _residue_string_list(config: dict, field: str) -> List[str]:
+    value = config.get(field, [])
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise ValueError(f"{field} must be a list of strings")
+    return value
+
+
+def resolve_residue_prune_config(
+    repo_config: dict,
+    metadata: dict,
+    *,
+    repo_config_binding_mode: str,
+    repo_config_sha256: str,
+) -> ResolvedResiduePruneConfig:
+    """Resolve residue policy from a frozen repo config or legacy metadata.
+
+    Declaring any residue-policy field in repo_config migrates the repository
+    to that authority source.  The complete source/test partition then comes
+    from the same config, so a live metadata.json edit cannot alter pruning in
+    a running trial.  Unmigrated repositories preserve their historical
+    metadata behavior.
+    """
+    if repo_config_has_residue_prune_policy(repo_config):
+        config = repo_config
+        policy_source = (
+            "repo-config-pinned"
+            if repo_config_binding_mode == "trial-pinned"
+            else "repo-config-legacy-unbound"
+        )
+        policy_sha256 = (
+            repo_config_sha256
+            if repo_config_binding_mode == "trial-pinned"
+            else ""
+        )
+    else:
+        config = metadata
+        policy_source = "metadata-legacy"
+        policy_sha256 = ""
+
+    raw_flag = config.get("residue_prune")
+    if raw_flag is not None and not isinstance(raw_flag, bool):
+        raise ValueError("residue_prune must be a boolean or null")
+
+    src_dirs = _residue_string_list(config, "repo_src_dirs")
+    test_dirs = _residue_string_list(config, "test_dirs")
+    has_partition = bool(src_dirs and test_dirs)
+    requested, enable_reason = resolve_prune_enablement(raw_flag, has_partition)
+
+    raw_extensions = config.get("prune_extensions")
+    if raw_extensions is not None and (
+        not isinstance(raw_extensions, list)
+        or not all(isinstance(item, str) for item in raw_extensions)
+    ):
+        raise ValueError("prune_extensions must be a list of strings or null")
+    normalized_extensions = normalize_extensions(raw_extensions)
+    extensions = (
+        DEFAULT_PRUNE_EXTENSIONS
+        if normalized_extensions is None
+        else normalized_extensions
+    )
+    keep_list = normalize_keep_list(_residue_string_list(config, "prune_keep_list"))
+
+    if has_partition:
+        exclude_key = (
+            "exclude_patterns" if "exclude_patterns" in config else "exclude"
+        )
+        src_filter: Optional[SrcFileFilter] = SrcFileFilter(
+            src_dirs=src_dirs,
+            test_dirs=test_dirs,
+            exclude_patterns=_residue_string_list(config, exclude_key),
+            generated_patterns=_residue_string_list(config, "generated_patterns"),
+            modifiable_test_patterns=_residue_string_list(
+                config, "modifiable_test_patterns"
+            ),
+        )
+    else:
+        src_filter = None
+
+    return ResolvedResiduePruneConfig(
+        requested=requested,
+        enable_reason=enable_reason,
+        extensions=extensions,
+        keep_list=keep_list,
+        src_filter=src_filter,
+        policy_source=policy_source,
+        policy_sha256=policy_sha256,
+    )
+
+
 def load_bound_fallback_test_graft_policy(
     repo_name: str,
     policy_path: Path,
@@ -1108,6 +1216,11 @@ class EvaluationResult:
     partial_test_universe: bool = False
     build_failure_diagnostics: List[str] = field(default_factory=list)
     residue_prune_enabled: bool = False
+    residue_prune_extensions: List[str] = field(default_factory=list)
+    residue_prune_keep_list: List[str] = field(default_factory=list)
+    residue_prune_policy_source: str = ""
+    residue_prune_policy_sha256: str = ""
+    residue_prune_enablement_source: str = ""
     pruned_files_count: int = 0
     pruned_files: List[str] = field(default_factory=list)
     keep_list_hits: List[str] = field(default_factory=list)
@@ -1285,6 +1398,11 @@ class EvaluationResult:
         }
         result["residue_prune"] = {
             "enabled": self.residue_prune_enabled,
+            "extensions": self.residue_prune_extensions,
+            "keep_list": self.residue_prune_keep_list,
+            "policy_source": self.residue_prune_policy_source,
+            "policy_sha256": self.residue_prune_policy_sha256,
+            "enablement_source": self.residue_prune_enablement_source,
             "pruned_files_count": self.pruned_files_count,
             "pruned_files": self.pruned_files,
             "keep_list_hits": self.keep_list_hits,
@@ -1427,6 +1545,14 @@ class EvaluationResult:
             build_failure_fail_closed=bool(policy.get("fail_closed") or False),
             partial_test_universe=bool(policy.get("partial_test_universe") or False),
             build_failure_diagnostics=list(policy.get("diagnostics") or []),
+            residue_prune_enabled=bool(residue.get("enabled") or False),
+            residue_prune_extensions=list(residue.get("extensions") or []),
+            residue_prune_keep_list=list(residue.get("keep_list") or []),
+            residue_prune_policy_source=str(residue.get("policy_source") or ""),
+            residue_prune_policy_sha256=str(residue.get("policy_sha256") or ""),
+            residue_prune_enablement_source=str(
+                residue.get("enablement_source") or ""
+            ),
             residue_prune_skipped_reason=str(residue.get("skipped_reason") or ""),
             snapshot_integrity_ok=integrity.get("ok"),
             snapshot_legacy_unverified=bool(integrity.get("legacy_unverified") or False),
@@ -2011,59 +2137,43 @@ class PatchEvaluator:
                 "requires an explicit frozen policy path, SHA256, and mode"
             )
 
-        # Load test_dir and test_workdir from metadata.json if available
+        # Runtime knobs remain workspace metadata.  Residue policy is resolved
+        # separately below: migrated repositories use the SHA-bound repo config,
+        # while unmigrated repositories retain the legacy metadata behavior.
         metadata_path = workspace_root / "metadata.json"
+        metadata: Dict[str, Any] = {}
         if metadata_path.exists():
             with open(metadata_path) as f:
                 metadata = json.load(f)
-                self.test_dir = metadata.get("test_dir", "test/")
-                # test_workdir is the directory to cd into before running tests
-                # defaults to /testbed for backwards compatibility
-                self.test_workdir = metadata.get("test_workdir", "/testbed")
-                # test_timeout: timeout per test in seconds (0 or None to disable)
-                # supports legacy key "pytest_timeout" for backwards compatibility
-                self.test_timeout = metadata.get("test_timeout") or metadata.get("pytest_timeout", 50)
-                # docker_cpus: number of CPUs for Docker container (default: 16)
-                self.docker_cpus = metadata.get("docker_cpus", 16)
-                # Residue prune (docs/residue-prune-spec.md): metadata carries the
-                # per-range facts — keep-list, optional extension pin, optional
-                # enablement override; the mechanism lives here. DEFAULT-OFF:
-                # preserve the historical additive overlay unless a dataset
-                # explicitly opts into deletion inference.
-                _has_partition = bool(metadata.get("repo_src_dirs") and metadata.get("test_dirs"))
-                prune_requested, _enable_reason = resolve_prune_enablement(
-                    metadata.get("residue_prune"), _has_partition
-                )
-                if _enable_reason == "legacy-no-partition":
-                    print(
-                        "ℹ️  residue prune: metadata lacks repo_src_dirs/test_dirs — "
-                        "additive overlay retained (legacy dataset, pruning undefined)"
-                    )
-                self.prune_keep_list = normalize_keep_list(metadata.get("prune_keep_list", []))
-                # F3/F6: per-range language scope. Metadata may pin prune_extensions
-                # (phase 1 navidrome -> [".go"] so its ui/src TS is never pruned);
-                # absent -> the multi-language default; empty list -> prune nothing.
-                pe = normalize_extensions(metadata.get("prune_extensions"))
-                self.prune_extensions = DEFAULT_PRUNE_EXTENSIONS if pe is None else pe
-                if metadata.get("repo_src_dirs") and metadata.get("test_dirs"):
-                    self._prune_filter: Optional[SrcFileFilter] = SrcFileFilter(
-                        src_dirs=metadata["repo_src_dirs"],
-                        test_dirs=metadata["test_dirs"],
-                        exclude_patterns=metadata.get("exclude_patterns", []),
-                        generated_patterns=metadata.get("generated_patterns", []),
-                        modifiable_test_patterns=metadata.get("modifiable_test_patterns", []),
-                    )
-                else:
-                    self._prune_filter = None
-        else:
-            self.test_dir = "test/"
-            self.test_workdir = "/testbed"
-            self.test_timeout = 50
-            self.docker_cpus = 16
-            prune_requested = False
-            self.prune_keep_list = frozenset()
-            self.prune_extensions = DEFAULT_PRUNE_EXTENSIONS
-            self._prune_filter = None
+        self.test_dir = metadata.get("test_dir", "test/")
+        # test_workdir is the directory to cd into before running tests;
+        # defaults to /testbed for backwards compatibility.
+        self.test_workdir = metadata.get("test_workdir", "/testbed")
+        # test_timeout: timeout per test in seconds (0 or None to disable),
+        # with the historical pytest_timeout alias.
+        self.test_timeout = metadata.get("test_timeout") or metadata.get(
+            "pytest_timeout", 50
+        )
+        self.docker_cpus = metadata.get("docker_cpus", 16)
+
+        residue_config = resolve_residue_prune_config(
+            self.repo_config,
+            metadata,
+            repo_config_binding_mode=self.repo_config_binding_mode,
+            repo_config_sha256=self.repo_config_sha256,
+        )
+        prune_requested = residue_config.requested
+        self.prune_keep_list = residue_config.keep_list
+        self.prune_extensions = residue_config.extensions
+        self._prune_filter = residue_config.src_filter
+        self.residue_prune_policy_source = residue_config.policy_source
+        self.residue_prune_policy_sha256 = residue_config.policy_sha256
+        self.residue_prune_enablement_source = residue_config.policy_source
+        if residue_config.enable_reason == "legacy-no-partition":
+            print(
+                "ℹ️  residue prune: policy lacks repo_src_dirs/test_dirs — "
+                "additive overlay retained (legacy dataset, pruning undefined)"
+            )
 
         # A/B override for re-evaluation experiments: SWE_MILESTONE_RESIDUE_PRUNE=1/0.
         # M4: unparseable values raise rather than silently disabling.
@@ -2076,6 +2186,7 @@ class PatchEvaluator:
                 prune_requested = False
             else:
                 raise ValueError(f"SWE_MILESTONE_RESIDUE_PRUNE: unparseable value {env_prune!r}")
+            self.residue_prune_enablement_source = "environment-override"
 
         # F3 (codex): pruning must NOT silently downgrade to disabled when it was
         # requested but its config is unusable — that fails OPEN (partial snapshot
@@ -2101,6 +2212,11 @@ class PatchEvaluator:
             "partial_test_universe": False,
             "build_failure_diagnostics": [],
             "residue_prune_enabled": self.residue_prune_enabled,
+            "residue_prune_extensions": sorted(self.prune_extensions),
+            "residue_prune_keep_list": sorted(self.prune_keep_list),
+            "residue_prune_policy_source": self.residue_prune_policy_source,
+            "residue_prune_policy_sha256": self.residue_prune_policy_sha256,
+            "residue_prune_enablement_source": self.residue_prune_enablement_source,
             "pruned_files_count": 0,
             "pruned_files": [],
             "keep_list_hits": [],
@@ -2968,6 +3084,28 @@ if test -x /usr/bin/git.real; then git_bin=/usr/bin/git.real; fi
             return frozenset(filtered)
         return None
 
+    def _load_capture_src_filter(self) -> Optional[SrcFileFilter]:
+        """Rebuild the immutable snapshot-authority filter from the sidecar."""
+        data, _ = self._load_and_validate_snapshot_metadata()
+        config = data.get("capture_filter")
+        if config is None:
+            return None
+        if not isinstance(config, dict):
+            raise ValueError("capture_filter must be an object")
+        src_dirs = _residue_string_list(config, "src_dirs")
+        test_dirs = _residue_string_list(config, "test_dirs")
+        if not src_dirs or not test_dirs:
+            raise ValueError("capture_filter must contain src_dirs and test_dirs")
+        return SrcFileFilter(
+            src_dirs=src_dirs,
+            test_dirs=test_dirs,
+            exclude_patterns=_residue_string_list(config, "exclude_patterns"),
+            generated_patterns=_residue_string_list(config, "generated_patterns"),
+            modifiable_test_patterns=_residue_string_list(
+                config, "modifiable_test_patterns"
+            ),
+        )
+
     def _load_capture_build_manifests(self) -> Set[str]:
         """Load the exact manifest exception set recorded at capture time.
 
@@ -3547,6 +3685,28 @@ printf 'merged\n'
             meta["residue_prune_skipped_reason"] = "ls-tree-failed"
             return False, "residue prune: cannot list git trees in container (ls-tree-failed)"
 
+        try:
+            capture_filter = self._load_capture_src_filter()
+        except (TypeError, ValueError) as exc:
+            meta["residue_prune_skipped_reason"] = "config-invalid"
+            return False, f"residue prune: invalid capture_filter: {exc}"
+
+        # New pinned policies require the capture side to have used the same
+        # frozen authority partition.  This catches config/capture drift before
+        # any deletion is attempted.  Legacy snapshots retain their historical
+        # fallback to the evaluator-side filter.
+        if self.residue_prune_policy_source == "repo-config-pinned":
+            if capture_filter is None:
+                meta["residue_prune_skipped_reason"] = "config-invalid"
+                return False, "residue prune: pinned policy requires capture_filter"
+            if capture_filter_config(capture_filter) != capture_filter_config(
+                self._prune_filter
+            ):
+                meta["residue_prune_skipped_reason"] = "config-invalid"
+                return False, (
+                    "residue prune: capture_filter does not match pinned repo config"
+                )
+        prune_filter = capture_filter or self._prune_filter
         capture_excluded = self._load_capture_excluded(start_files)
 
         # Snapshot integrity is DIAGNOSTIC ONLY — there is no safety gate. By
@@ -3558,7 +3718,7 @@ printf 'merged\n'
         integrity = check_snapshot_integrity(
             start_files,
             tar_files,
-            self._prune_filter,
+            prune_filter,
             extra_build_manifests=self._load_capture_build_manifests(),
         )
         meta["snapshot_integrity_ok"] = integrity.ok
@@ -3575,7 +3735,7 @@ printf 'merged\n'
             base_files,
             tar_files,
             start_files,
-            self._prune_filter,
+            prune_filter,
             self.prune_keep_list,
             extensions=self.prune_extensions,
             capture_excluded=capture_excluded,
@@ -3590,7 +3750,7 @@ printf 'merged\n'
         try:
             assert_prune_set_safe(
                 prune_set,
-                self._prune_filter,
+                prune_filter,
                 self.prune_keep_list,
                 extensions=self.prune_extensions,
                 capture_excluded=capture_excluded,
@@ -5991,6 +6151,17 @@ fi
             partial_test_universe=self._eval_meta["partial_test_universe"],
             build_failure_diagnostics=self._eval_meta["build_failure_diagnostics"],
             residue_prune_enabled=self._eval_meta["residue_prune_enabled"],
+            residue_prune_extensions=self._eval_meta["residue_prune_extensions"],
+            residue_prune_keep_list=self._eval_meta["residue_prune_keep_list"],
+            residue_prune_policy_source=self._eval_meta[
+                "residue_prune_policy_source"
+            ],
+            residue_prune_policy_sha256=self._eval_meta[
+                "residue_prune_policy_sha256"
+            ],
+            residue_prune_enablement_source=self._eval_meta[
+                "residue_prune_enablement_source"
+            ],
             pruned_files_count=self._eval_meta["pruned_files_count"],
             pruned_files=self._eval_meta["pruned_files"],
             keep_list_hits=self._eval_meta["keep_list_hits"],
@@ -6423,6 +6594,19 @@ Example:
         result.partial_test_universe = meta.get("partial_test_universe", False)
         result.build_failure_diagnostics = meta.get("build_failure_diagnostics", [])
         result.residue_prune_enabled = meta["residue_prune_enabled"]
+        result.residue_prune_extensions = meta.get(
+            "residue_prune_extensions", []
+        )
+        result.residue_prune_keep_list = meta.get("residue_prune_keep_list", [])
+        result.residue_prune_policy_source = meta.get(
+            "residue_prune_policy_source", ""
+        )
+        result.residue_prune_policy_sha256 = meta.get(
+            "residue_prune_policy_sha256", ""
+        )
+        result.residue_prune_enablement_source = meta.get(
+            "residue_prune_enablement_source", ""
+        )
         result.pruned_files_count = meta["pruned_files_count"]
         result.pruned_files = meta["pruned_files"]
         result.keep_list_hits = meta["keep_list_hits"]

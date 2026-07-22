@@ -366,12 +366,65 @@ def test_evaluation_result_fail_loud_defaults():
     assert d["end_compile_error"] == ""
     assert d["residue_prune"] == {
         "enabled": False,
+        "extensions": [],
+        "keep_list": [],
+        "policy_source": "",
+        "policy_sha256": "",
+        "enablement_source": "",
         "pruned_files_count": 0,
         "pruned_files": [],
         "keep_list_hits": [],
         "skipped_reason": "",
     }
     assert d["snapshot_integrity"] == {"ok": None, "missing_count": 0, "legacy_unverified": False}
+
+
+def test_pinned_repo_config_is_java_only_and_ignores_live_metadata_drift():
+    from harness.e2e.evaluator import resolve_residue_prune_config
+
+    digest = "a" * 64
+    repo_config = {
+        "repo_src_dirs": ["dubbo-rpc"],
+        "test_dirs": ["**/src/test/**", "**/*Test.java"],
+        "exclude": ["**/target/**"],
+        "residue_prune": True,
+        "prune_extensions": [".java"],
+        "prune_keep_list": [],
+    }
+    # Deliberately conflicting live metadata: the frozen repo config must win.
+    metadata = {
+        "repo_src_dirs": ["wrong-live-root"],
+        "test_dirs": ["wrong-live-tests/**"],
+        "residue_prune": False,
+        "prune_extensions": [".groovy"],
+        "prune_keep_list": ["dubbo-rpc/Keep.java"],
+    }
+
+    resolved = resolve_residue_prune_config(
+        repo_config,
+        metadata,
+        repo_config_binding_mode="trial-pinned",
+        repo_config_sha256=digest,
+    )
+
+    assert resolved.requested is True
+    assert resolved.policy_source == "repo-config-pinned"
+    assert resolved.policy_sha256 == digest
+    assert resolved.extensions == frozenset({".java"})
+    assert resolved.keep_list == frozenset()
+    assert resolved.src_filter is not None
+    assert is_prunable(
+        "dubbo-rpc/src/main/java/Service.java",
+        resolved.src_filter,
+        resolved.keep_list,
+        resolved.extensions,
+    )
+    assert not is_prunable(
+        "dubbo-rpc/src/main/groovy/Service.groovy",
+        resolved.src_filter,
+        resolved.keep_list,
+        resolved.extensions,
+    )
 
 
 def test_scoring_untrusted_property():
@@ -467,6 +520,11 @@ def test_evaluation_result_fail_loud_populated():
         fallback_triggered=True,
         end_compile_error="core/service.go:42:7: undefined: missingSymbol",
         residue_prune_enabled=True,
+        residue_prune_extensions=[".java"],
+        residue_prune_keep_list=[],
+        residue_prune_policy_source="repo-config-pinned",
+        residue_prune_policy_sha256="a" * 64,
+        residue_prune_enablement_source="repo-config-pinned",
         pruned_files_count=2,
         pruned_files=["core/a.go", "core/b.go"],
         keep_list_hits=["core/mock_library_service.go"],
@@ -477,10 +535,21 @@ def test_evaluation_result_fail_loud_populated():
     assert d["base_tag"] == "milestone-m1-start"
     assert d["fallback_triggered"] is True
     assert d["end_compile_error"] == "core/service.go:42:7: undefined: missingSymbol"
+    assert d["residue_prune"]["extensions"] == [".java"]
+    assert d["residue_prune"]["policy_source"] == "repo-config-pinned"
+    assert d["residue_prune"]["policy_sha256"] == "a" * 64
     assert d["residue_prune"]["pruned_files_count"] == 2
     assert d["residue_prune"]["keep_list_hits"] == ["core/mock_library_service.go"]
     assert d["residue_prune"]["skipped_reason"] == "ls-tree-failed"
     assert d["snapshot_integrity"] == {"ok": True, "missing_count": 1, "legacy_unverified": False}
+
+    from harness.e2e.evaluator import EvaluationResult
+
+    restored = EvaluationResult.from_result_dict(d)
+    assert restored.residue_prune_enabled is True
+    assert restored.residue_prune_extensions == [".java"]
+    assert restored.residue_prune_policy_source == "repo-config-pinned"
+    assert restored.residue_prune_policy_sha256 == "a" * 64
 
 
 # ---------------------------------------------------------------------------

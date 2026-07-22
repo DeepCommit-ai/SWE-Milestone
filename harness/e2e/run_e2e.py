@@ -47,6 +47,7 @@ from harness.e2e.repo_config_binding import (
     load_trial_repo_config_binding,
     resolve_repo_config,
 )
+from harness.e2e.residue_prune import repo_config_has_residue_prune_policy
 from harness.e2e.runtime_policy_binding import (
     RUNTIME_POLICY_ENV_KEYS,
     RUNTIME_POLICY_MODE_PROTECTED,
@@ -141,7 +142,29 @@ def load_workspace_metadata(
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
 
-    # Validate required fields
+    # A migrated repository keeps the complete residue-prune policy and its
+    # source/test partition in repo_config.  Use those exact facts for capture,
+    # then freeze the same config into the trial.  This prevents live
+    # metadata.json drift from changing snapshot authority between milestones.
+    if repo_config_has_residue_prune_policy(repo_config):
+        missing_repo_fields = [
+            field for field in ("repo_src_dirs", "test_dirs")
+            if field not in repo_config
+        ]
+        if missing_repo_fields:
+            raise KeyError(
+                "Residue-prune repo config is missing capture field(s): "
+                + ", ".join(missing_repo_fields)
+            )
+        metadata["repo_src_dirs"] = repo_config["repo_src_dirs"]
+        metadata["test_dirs"] = repo_config["test_dirs"]
+        metadata["exclude_patterns"] = repo_config.get(
+            "exclude_patterns", repo_config.get("exclude", [])
+        )
+        for field in ("generated_patterns", "modifiable_test_patterns"):
+            metadata[field] = repo_config.get(field, [])
+
+    # Validate required capture fields after applying the pinned policy.
     required_fields = ["repo_src_dirs", "test_dirs", "exclude_patterns"]
     missing_fields = [f for f in required_fields if f not in metadata]
     if missing_fields:

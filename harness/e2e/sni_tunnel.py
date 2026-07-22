@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 SNI_TUNNELABLE_DOMAINS: frozenset[str] = frozenset({
     "api.kimi.com",
     "api.moonshot.ai",
+    "chatgpt.com",  # Codex ChatGPT OAuth endpoint
 })
 
 # Cap on how much we buffer while looking for the ClientHello. A ClientHello is
