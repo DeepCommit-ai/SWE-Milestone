@@ -10,17 +10,53 @@ Uses ast-grep for accurate parsing to detect:
 - Test-related macros (proptest!, macro_rules! with "test" in name)
 """
 
+import os
 import re
+import shutil
 import sys
 import json
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class RustTestDetectionError(RuntimeError):
     """Raised when Rust test/source separation cannot be proven safely."""
+
+
+@lru_cache(maxsize=1)
+def resolve_ast_grep() -> str:
+    """Locate the ast-grep binary independently of the launcher's PATH.
+
+    The ast-grep-cli wheel installs the binary next to the Python interpreter,
+    so prefer that location: a trial launched from a shell without .venv/bin
+    on PATH must still find it (codex_gpt-5.6-sol_003/_004 lost 23 nushell
+    evaluations to exactly that). Falls back to PATH lookup; when neither
+    resolves, keeps the bare name so non-strict callers retain their
+    historical "tool unavailable -> no matches" behaviour.
+    """
+    candidate = Path(sys.executable).parent / "ast-grep"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    found = shutil.which("ast-grep")
+    if found:
+        return found
+    return "ast-grep"
+
+
+def ensure_ast_grep() -> str:
+    """Return the resolved ast-grep path, raising if no real binary exists."""
+    resolved = resolve_ast_grep()
+    if resolved == "ast-grep" and shutil.which(resolved) is None:
+        raise RustTestDetectionError(
+            "ast-grep binary not found next to the interpreter "
+            f"({Path(sys.executable).parent}) or on PATH; Rust test filtering "
+            "would fail closed at evaluation time. Install ast-grep-cli in "
+            "this environment or launch from the project venv."
+        )
+    return resolved
 
 
 def _run_ast_grep_json(
@@ -35,6 +71,7 @@ def _run_ast_grep_json(
     malformed output are different: evaluation callers use ``strict=True`` so
     those conditions cannot silently turn into "there are no tests".
     """
+    command = [resolve_ast_grep(), *command[1:]]
     try:
         result = subprocess.run(
             command,

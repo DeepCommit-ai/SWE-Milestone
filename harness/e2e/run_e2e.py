@@ -48,6 +48,10 @@ from harness.e2e.repo_config_binding import (
     resolve_repo_config,
 )
 from harness.e2e.residue_prune import repo_config_has_residue_prune_policy
+from harness.prepare_repo.split_test_patches.test_detector import (
+    RustTestDetectionError,
+    ensure_ast_grep,
+)
 from harness.e2e.runtime_policy_binding import (
     RUNTIME_POLICY_ENV_KEYS,
     RUNTIME_POLICY_MODE_PROTECTED,
@@ -2223,9 +2227,25 @@ def _run_resume_mode(args):
     sys.exit(0 if success else 1)
 
 
+def _preflight_ast_grep() -> None:
+    """Refuse to start a trial whose Rust evaluations would fail closed.
+
+    ast-grep is resolved next to the interpreter (with a PATH fallback), so
+    this only trips when the environment genuinely lacks ast-grep-cli — the
+    codex_gpt-5.6-sol_003/_004 launches surfaced that gap hours later, at
+    evaluation time, as 23 errored nushell cells.
+    """
+    try:
+        ensure_ast_grep()
+    except RustTestDetectionError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+
 def main():
     reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
     setup_logging()
+    _preflight_ast_grep()
     parser = argparse.ArgumentParser(
         description="Run End-to-End Agent Trial (Continuous Task Queue Mode with Recovery)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
