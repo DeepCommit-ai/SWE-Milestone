@@ -40,3 +40,17 @@ def test_codex_disables_server_side_product_tools(monkeypatch):
     assert "*[f'{feature} = false'" in init_script
     assert 'web_search="disabled"' in command
     assert 'web_search = "disabled"' in init_script
+
+
+def test_codex_uses_standalone_installer_without_npm():
+    framework = CodexFramework(api_key="test-key", agent_version="0.145.0")
+
+    init_script = framework.get_container_init_script("codex")
+
+    assert "https://chatgpt.com/codex/install.sh" in init_script
+    assert "'CODEX_RELEASE': target_version" in init_script
+    assert "'CODEX_NON_INTERACTIVE': '1'" in init_script
+    assert "'CODEX_HOME': '/opt/codex'" in init_script
+    assert "'CODEX_INSTALL_DIR': '/usr/local/bin'" in init_script
+    assert "npm', 'i'" not in init_script
+    assert "deb.nodesource.com" not in init_script

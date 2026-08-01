@@ -209,7 +209,7 @@ class CodexFramework(AgentFramework):
         """Return Python init script for Codex setup.
 
         The script:
-        1. Installs Codex CLI via npm (if not present)
+        1. Installs Codex CLI via the official standalone installer (if not present)
         2. Copies OAuth credentials from mounted host files (when available)
         3. Verifies installation
 
@@ -222,6 +222,8 @@ class CodexFramework(AgentFramework):
         script = """
 # === Codex: Install Codex CLI ===
 try:
+    import os
+    import re as _re
     import subprocess
     import shutil
 
@@ -238,48 +240,8 @@ try:
         except Exception as e:
             return False, '', str(e)
 
-    # Check current Node.js version
-    success, node_version, _ = run_cmd(['node', '--version'])
-    if success:
-        print(f"Current Node.js version: {node_version}")
-        try:
-            major = int(node_version.lstrip('v').split('.')[0])
-            need_upgrade = major < 20
-        except:
-            need_upgrade = True
-    else:
-        print("Node.js not found")
-        need_upgrade = True
-
-    # Install Node.js 20 if needed
-    if need_upgrade:
-        print("Installing Node.js 20 via NodeSource...")
-
-        # Ensure curl is available
-        if not shutil.which('curl'):
-            print("Installing curl...")
-            run_cmd(['apt-get', 'update'])
-            run_cmd(['apt-get', 'install', '-y', 'curl', 'ca-certificates'])
-
-        # Add NodeSource repository and install Node.js 20
-        success, stdout, stderr = run_cmd(
-            'curl -fsSL https://deb.nodesource.com/setup_20.x | bash -',
-            shell=True
-        )
-        if not success:
-            print(f"Warning: NodeSource setup output: {stderr}")
-
-        success, stdout, stderr = run_cmd(['apt-get', 'install', '-y', 'nodejs'])
-        if success:
-            success, node_version, _ = run_cmd(['node', '--version'])
-            print(f"Node.js installed: {node_version}")
-        else:
-            print(f"Failed to install Node.js: {stderr}")
-            raise Exception("Node.js installation failed")
-
     # Check if codex is already installed. An exact requested version can be
-    # reused only when it matches; 'latest' always re-resolves via npm.
-    import re as _re
+    # reused only when it matches; 'latest' always re-resolves via the installer.
     requested_version = __CODEX_AGENT_VERSION__
     result = subprocess.run(['which', 'codex'], capture_output=True, text=True)
     needs_install = result.returncode != 0
@@ -294,27 +256,77 @@ try:
     if not needs_install:
         print(f"Codex already installed at: {result.stdout.strip()}")
     else:
-        pkg = '@openai/codex' + (f'@{requested_version}' if requested_version else '')
-        print(f"Installing Codex CLI via npm ({pkg})...")
-        install_result = subprocess.run(
-            ['npm', 'i', '-g', pkg],
+        target_version = requested_version or 'latest'
+        print(f"Installing Codex CLI standalone release ({target_version})...")
+
+        if not shutil.which('curl'):
+            print("Installing curl...")
+            success, _, stderr = run_cmd(['apt-get', 'update'])
+            if not success:
+                raise RuntimeError(f"Failed to update apt metadata for curl: {stderr}")
+            success, _, stderr = run_cmd(
+                ['apt-get', 'install', '-y', 'curl', 'ca-certificates']
+            )
+            if not success:
+                raise RuntimeError(f"Failed to install curl: {stderr}")
+
+        installer_result = subprocess.run(
+            ['curl', '-fsSL', 'https://chatgpt.com/codex/install.sh'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=300,
         )
-        if install_result.returncode == 0:
-            print("Codex CLI installed successfully")
-        else:
-            print(f"Failed to install Codex: {install_result.stderr}")
+        if installer_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to download Codex standalone installer: "
+                f"{installer_result.stderr.strip()}"
+            )
+
+        # Keep the root-owned standalone package outside /root so the fakeroot
+        # agent user can traverse the symlink installed in /usr/local/bin.
+        # CODEX_RELEASE preserves exact agent_version pins while avoiding npm,
+        # whose container-wide offline flag is intentionally active in some
+        # quarantined repositories.
+        install_env = os.environ.copy()
+        install_env.update({
+            'CODEX_HOME': '/opt/codex',
+            'CODEX_INSTALL_DIR': '/usr/local/bin',
+            'CODEX_NON_INTERACTIVE': '1',
+            'CODEX_RELEASE': target_version,
+        })
+        install_result = subprocess.run(
+            ['sh'],
+            input=installer_result.stdout,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=install_env,
+        )
+        if install_result.returncode != 0:
+            detail = install_result.stderr.strip() or install_result.stdout.strip()
+            raise RuntimeError(f"Failed to install Codex standalone release: {detail}")
+        print(install_result.stdout.strip() or "Codex CLI installed successfully")
 
     # Verify installation
     version_result = subprocess.run(['codex', '--version'], capture_output=True, text=True)
-    if version_result.returncode == 0:
-        print(f"Codex version: {version_result.stdout.strip()}")
-    else:
-        print("Warning: Could not verify Codex installation")
+    if version_result.returncode != 0:
+        raise RuntimeError(
+            f"Could not verify Codex installation: "
+            f"{version_result.stderr.strip() or version_result.stdout.strip()}"
+        )
+    installed_output = version_result.stdout.strip()
+    installed_match = _re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', installed_output)
+    installed_version = installed_match.group(1) if installed_match else None
+    if requested_version not in (None, 'latest') and installed_version != requested_version:
+        raise RuntimeError(
+            f"Codex version mismatch: requested {requested_version}, "
+            f"installed {installed_version or installed_output or 'unknown'}"
+        )
+    print(f"Codex version: {installed_output}")
 
 except Exception as e:
     print(f"Error setting up Codex: {e}")
+    raise
 
 # === Codex: Setup OAuth credentials ===
 try:

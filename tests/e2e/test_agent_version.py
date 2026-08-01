@@ -9,6 +9,9 @@ from harness.e2e.agents.claude_code import (
     parse_claude_code_version,
     validate_claude_code_version,
 )
+from harness.e2e.agents.base import validate_agent_cli_version
+from harness.e2e.agents.codex import CodexFramework
+from harness.e2e.agents.gemini import GeminiFramework
 from harness.e2e.container_setup import ContainerSetup
 from harness.e2e.orchestrator import E2EOrchestrator
 
@@ -94,13 +97,8 @@ def test_orchestrator_records_actual_agent_version(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# codex / gemini-cli agent_version support (npm-installed CLIs)
+# codex / gemini-cli agent_version support
 # ---------------------------------------------------------------------------
-from harness.e2e.agents.base import validate_agent_cli_version
-from harness.e2e.agents.codex import CodexFramework
-from harness.e2e.agents.gemini import GeminiFramework
-
-
 @pytest.mark.parametrize("value", ["0.144.5", "latest", None])
 def test_validate_agent_cli_version_accepts_semver_and_latest(value):
     assert validate_agent_cli_version(value, agent_label="Codex") == value
@@ -113,24 +111,32 @@ def test_validate_agent_cli_version_rejects_bad_selectors(value):
 
 
 @pytest.mark.parametrize(
-    "cls,pkg,placeholder",
+    "cls,installer_marker,placeholder",
     [
-        (CodexFramework, "@openai/codex", "__CODEX_AGENT_VERSION__"),
+        (
+            CodexFramework,
+            "https://chatgpt.com/codex/install.sh",
+            "__CODEX_AGENT_VERSION__",
+        ),
         (GeminiFramework, "@google/gemini-cli", "__GEMINI_AGENT_VERSION__"),
     ],
 )
-def test_npm_agents_version_interface_and_script_injection(cls, pkg, placeholder):
+def test_agents_version_interface_and_script_injection(
+    cls, installer_marker, placeholder
+):
     fw = cls(api_key="k", agent_version="1.2.3")
     assert fw.get_requested_version() == "1.2.3"
     assert fw.get_version_command()
-    assert fw.parse_version_output(f"{pkg} 1.2.3 (something)") == "1.2.3"
+    assert fw.parse_version_output(
+        f"{installer_marker} 1.2.3 (something)"
+    ) == "1.2.3"
     assert fw.version_matches_request("1.2.3")
     assert not fw.version_matches_request("1.2.4")
 
     script = fw.get_container_init_script("tester")
     assert placeholder not in script  # placeholder must be substituted
     assert "requested_version = '1.2.3'" in script
-    assert pkg in script
+    assert installer_marker in script
 
     # latest always matches whatever the installer resolved
     fw_latest = cls(api_key="k", agent_version="latest")
