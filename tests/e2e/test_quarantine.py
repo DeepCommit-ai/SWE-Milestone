@@ -22,8 +22,8 @@ def _write_config(root, repo, text):
 
 
 class TestMirrorDomainsAndGoproxy:
-    """#4: go-proxy mirror domains are a cross-ecosystem answer channel poisoned
-    only in quarantine containers; GOPROXY must agree with that poisoning."""
+    """Public source mirrors are cross-ecosystem answer channels poisoned only
+    in quarantine containers; GOPROXY must agree with that poisoning."""
 
     def test_mirror_domains_cover_all_go_proxies(self):
         from harness.e2e.quarantine import QUARANTINE_MIRROR_DOMAINS
@@ -34,6 +34,17 @@ class TestMirrorDomainsAndGoproxy:
             "index.golang.org",
             "goproxy.cn",
             "goproxy.io",
+        }
+
+    def test_mirror_domains_cover_jsdelivr_github_routes(self):
+        from harness.e2e.quarantine import QUARANTINE_MIRROR_DOMAINS
+
+        assert set(QUARANTINE_MIRROR_DOMAINS) >= {
+            "cdn.jsdelivr.net",
+            "fastly.jsdelivr.net",
+            "gcore.jsdelivr.net",
+            "testingcf.jsdelivr.net",
+            "data.jsdelivr.com",
         }
 
     def test_goproxy_uses_local_file_proxy_under_go_offline(self):

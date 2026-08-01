@@ -15,12 +15,20 @@ deny_domains:
 
 deny_cidrs:
   - 104.16.0.0/12      # Cloudflare (fronts npm registry)
+  # jsDelivr's /gh/ route serves arbitrary GitHub refs. element-web _002
+  # fetched exact f59af37 source/tests through fastly.jsdelivr.net, whose IP
+  # was re-admitted by the generic Fastly ACCEPT. Deny both Fastly ranges so
+  # /etc/hosts cannot be bypassed with curl --resolve.
+  - 151.101.0.0/16
+  - 146.75.0.0/16
 
 npm_offline: true
 
 verify_fetch_urls:
   - https://registry.npmjs.org/matrix-js-sdk
   - https://registry.yarnpkg.com/matrix-js-sdk
+  - https://fastly.jsdelivr.net/gh/element-hq/element-web@f59af37/src/SlidingSyncManager.ts
+  - https://cdn.jsdelivr.net/gh/element-hq/element-web@f59af37/src/SlidingSyncManager.ts
 
 closure:
   cache_paths:

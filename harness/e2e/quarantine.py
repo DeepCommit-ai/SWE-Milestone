@@ -62,21 +62,29 @@ FIREWALL_EXEMPTABLE_DOMAINS: frozenset[str] = frozenset({
     "pkg.go.dev",
 })
 
-# Public module-proxy mirror domains. A Go module proxy mirrors ANY public repo
-# with a v-prefixed semver tag (not just Go projects — element-web's v1.11.97 is
-# reachable too) at proxy.golang.org/<host>/<owner>/<repo>/@v/<tag>.zip, so it is
-# a cross-ecosystem answer-fetch channel. proxy/sum/index.golang.org ride Google
-# IP ranges shared with Vertex aiplatform, so they can't be CIDR-denied without
-# cutting the LLM path; the defense is domain-level /etc/hosts poisoning applied
-# to EVERY quarantine container, plus a local-only/offline GOPROXY. Poisoned ONLY under quarantine
-# (container_setup._poison_domain_list) so non-quarantine/baseline containers keep
-# working go module fetches (parity).
+# Public source-mirror domains. Go module proxies and jsDelivr's ``/gh/`` route
+# can mirror arbitrary public GitHub repositories, so both are cross-ecosystem
+# answer-fetch channels. In particular, fastly.jsdelivr.net shares the Fastly
+# range that the generic firewall accepts for legitimate dependency domains;
+# element-web _002 used it to fetch exact target-commit source and tests.
+#
+# These names are poisoned in EVERY quarantine container. The owning repo's
+# policy must additionally deny the mirror's CDN CIDRs when they overlap a
+# generic ACCEPT range: /etc/hosts alone is bypassable with ``curl --resolve``.
+# The Go domains that share Vertex's Google ranges instead rely on hosts poison
+# plus a local-only/offline GOPROXY. Poisoning stays quarantine-only so
+# non-quarantine baselines retain their sanctioned dependency access.
 QUARANTINE_MIRROR_DOMAINS: list[str] = [
     "proxy.golang.org",
     "sum.golang.org",
     "index.golang.org",
     "goproxy.cn",
     "goproxy.io",
+    "cdn.jsdelivr.net",
+    "fastly.jsdelivr.net",
+    "gcore.jsdelivr.net",
+    "testingcf.jsdelivr.net",
+    "data.jsdelivr.com",
 ]
 
 GO_OFFLINE_FILE_PROXY = "file:///go/pkg/mod/cache/download"

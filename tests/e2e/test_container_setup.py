@@ -21,7 +21,7 @@ from harness.e2e.quarantine import QUARANTINE_MIRROR_DOMAINS
 
 
 class TestPoisonDomainList:
-    """#4: mirror domains are poisoned only in quarantine containers; code
+    """Source-mirror domains are poisoned only in quarantine containers; code
     hosting is always poisoned."""
 
     def test_excludes_mirrors_when_not_quarantined(self):
@@ -35,6 +35,7 @@ class TestPoisonDomainList:
         for d in QUARANTINE_MIRROR_DOMAINS:
             assert d in domains
         assert "github.com" in domains
+        assert "fastly.jsdelivr.net" in domains
 
     def test_mirror_domains_not_in_base_code_hosting(self):
         # The mirror domains must live in QUARANTINE_MIRROR_DOMAINS (conditional),

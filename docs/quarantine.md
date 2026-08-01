@@ -95,11 +95,13 @@ subtracts from that:
 ### Layer 2 — DNS poisoning (`/etc/hosts`)
 
 Code-hosting domains (github/gitlab/…) are poisoned to `0.0.0.0` in **every**
-container. Under quarantine, the **Go module-proxy mirror domains**
-(`QUARANTINE_MIRROR_DOMAINS` in `harness/e2e/quarantine.py`) are poisoned too —
-in every quarantined container regardless of ecosystem, because the go proxy is
-a cross-ecosystem answer channel (§1). Non-quarantine baselines keep working go
-fetches (parity).
+container. Under quarantine, public source mirrors in
+`QUARANTINE_MIRROR_DOMAINS` (`harness/e2e/quarantine.py`) are poisoned too:
+Go module proxies and jsDelivr's `/gh/` route can both mirror arbitrary public
+GitHub repositories, so they are cross-ecosystem answer channels (§1).
+Non-quarantine baselines keep their normal dependency access. Hosts poisoning
+is defense-in-depth only; a policy must also deny a mirror's shared CDN CIDRs
+when those ranges are otherwise accepted, so `curl --resolve` cannot bypass it.
 
 ### Layer 3 — package managers forced offline
 
