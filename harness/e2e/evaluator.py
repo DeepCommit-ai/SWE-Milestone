@@ -63,6 +63,8 @@ from harness.e2e.residue_prune import (
     resolve_prune_enablement,
 )
 from harness.utils.rust_test_filter import (
+    _read_file_from_container,
+    _write_file_to_container,
     get_rust_files_from_tar,
     process_rust_files_in_container,
 )
@@ -103,6 +105,106 @@ GO_EVALUATOR_PATH = (
 )
 INTERNAL_EVALUATION_NETWORK = "evoclaw-eval-internal-v1"
 FALLBACK_TEST_GRAFT_POLICY_SCHEMA_VERSION = 1
+
+def _resolve_toml_duplicate_root_keys(
+    merged_text: str, prepared_text: str
+) -> Tuple[str, List[str], List[str]]:
+    """Resolve duplicate (table, root-key) pairs a three-way manifest merge can
+    produce when the agent and the evaluator ENV-PATCH each added the same key
+    in different hunks (textually clean, semantically a TOML duplicate-key
+    error).
+
+    Policy mirrors the hunk-conflict rule: the evaluator-prepared line wins.
+    A duplicate group is resolved only when the surviving line is verbatim
+    present in the prepared manifest (or all duplicates are identical text);
+    anything else stays a hard error so agent-internal duplicates keep failing
+    closed.
+
+    Returns (new_text, resolutions, errors); resolutions entries are
+    "table::key" for each group actually collapsed.
+    """
+    key_re = re.compile(r"^([A-Za-z0-9_-]+)(?:\.[A-Za-z0-9_.\"'-]+)?\s*=")
+    table_re = re.compile(r"^\[+([^\]]+)\]+")
+
+    def index_keys(text: str) -> Dict[Tuple[str, str], List[int]]:
+        table = ""
+        found: Dict[Tuple[str, str], List[int]] = {}
+        for i, line in enumerate(text.split("\n")):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            t = table_re.match(stripped)
+            if t:
+                table = t.group(1).strip()
+                continue
+            k = key_re.match(stripped)
+            if k:
+                found.setdefault((table, k.group(1)), []).append(i)
+        return found
+
+    merged_lines = merged_text.split("\n")
+    prepared_lines = {line.strip() for line in prepared_text.split("\n")}
+    duplicates = {k: v for k, v in index_keys(merged_text).items() if len(v) > 1}
+    if not duplicates:
+        return merged_text, [], []
+
+    drop: Set[int] = set()
+    resolutions: List[str] = []
+    errors: List[str] = []
+    for (table, key), idxs in sorted(duplicates.items()):
+        texts = [merged_lines[i].strip() for i in idxs]
+        if len(set(texts)) == 1:
+            drop.update(idxs[1:])
+            resolutions.append(f"[{table}] {key} (identical duplicates)")
+            continue
+        keep = [i for i in idxs if merged_lines[i].strip() in prepared_lines]
+        if len(keep) == 1:
+            drop.update(i for i in idxs if i != keep[0])
+            resolutions.append(f"[{table}] {key} (evaluator-prepared line kept)")
+        else:
+            errors.append(
+                f"unresolvable duplicate TOML key [{table}] {key}: "
+                f"{len(idxs)} occurrences, {len(keep)} match the prepared manifest"
+            )
+    if errors:
+        return merged_text, [], errors
+    new_text = "\n".join(
+        line for i, line in enumerate(merged_lines) if i not in drop
+    )
+    return new_text, resolutions, []
+
+
+_HARNESS_REVISION_CACHE: Optional[str] = None
+
+
+def _harness_revision() -> str:
+    """Best-effort identity of the harness code that produced a result.
+
+    Evaluation results have outlived several harness revisions; diagnosing an
+    old cell then requires reconstructing which code ran from message shapes.
+    Record it explicitly instead. Fail-soft: a non-git deployment yields "".
+    """
+    global _HARNESS_REVISION_CACHE
+    if _HARNESS_REVISION_CACHE is None:
+        revision = ""
+        repo_root = str(Path(__file__).resolve().parent.parent.parent)
+        try:
+            head = subprocess.run(
+                ["git", "-C", repo_root, "rev-parse", "--short=12", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if head.returncode == 0 and head.stdout.strip():
+                revision = head.stdout.strip()
+                dirty = subprocess.run(
+                    ["git", "-C", repo_root, "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if dirty.returncode == 0 and dirty.stdout.strip():
+                    revision += "+dirty"
+        except Exception:
+            revision = ""
+        _HARNESS_REVISION_CACHE = revision
+    return _HARNESS_REVISION_CACHE
 
 
 def _validated_repo_glob_patterns(value: object, *, field: str) -> Tuple[str, ...]:
@@ -1247,6 +1349,14 @@ class EvaluationResult:
     gt_test_graft_mode: str = "legacy-test-dirs"
     gt_test_graft_fixture_paths: List[str] = field(default_factory=list)
     gt_test_graft_unlisted_changed_paths: List[str] = field(default_factory=list)
+    # Nested GT test regions whose anchor scope is absent from the agent's file
+    # (test-injection-scope-mismatch): reported, not injected; scored as missing.
+    # Counts lexical REGIONS (one ``mod tests`` block = 1); each entry lists the
+    # fn names it contains so reports map back to classified test IDs.
+    rust_gt_unplaced_count: int = 0
+    rust_gt_unplaced_tests: List[str] = field(default_factory=list)
+    manifest_duplicate_key_resolutions: List[str] = field(default_factory=list)
+    harness_revision: str = ""
     fallback_test_graft_policy_binding_mode: str = "absent-legacy"
     fallback_test_graft_policy_sha256: str = ""
     offline_cache_overlay_image: str = ""
@@ -1438,6 +1548,10 @@ class EvaluationResult:
             "gt_test_graft_unlisted_changed_paths": (
                 self.gt_test_graft_unlisted_changed_paths
             ),
+            "rust_gt_unplaced_count": self.rust_gt_unplaced_count,
+            "rust_gt_unplaced_tests": self.rust_gt_unplaced_tests,
+            "manifest_duplicate_key_resolutions": self.manifest_duplicate_key_resolutions,
+            "harness_revision": self.harness_revision,
             "fallback_test_graft_policy_binding_mode": (
                 self.fallback_test_graft_policy_binding_mode
             ),
@@ -1557,6 +1671,9 @@ class EvaluationResult:
             snapshot_integrity_ok=integrity.get("ok"),
             snapshot_legacy_unverified=bool(integrity.get("legacy_unverified") or False),
             snapshot_missing_count=int(integrity.get("missing_count") or 0),
+            rust_gt_unplaced_count=int(environment.get("rust_gt_unplaced_count") or 0),
+            rust_gt_unplaced_tests=list(environment.get("rust_gt_unplaced_tests") or []),
+            harness_revision=str(environment.get("harness_revision") or ""),
             infrastructure_failure=str(data.get("infrastructure_failure") or ""),
             infra_invalid_reason=str(data.get("infra_invalid_reason") or ""),
             scored_failure_reason=str(data.get("scored_failure_reason") or ""),
@@ -2245,6 +2362,10 @@ class PatchEvaluator:
             "gt_test_graft_mode": "legacy-test-dirs",
             "gt_test_graft_fixture_paths": [],
             "gt_test_graft_unlisted_changed_paths": [],
+            "rust_gt_unplaced_count": 0,
+            "rust_gt_unplaced_tests": [],
+            "manifest_duplicate_key_resolutions": [],
+            "harness_revision": _harness_revision(),
             "fallback_test_graft_policy_binding_mode": (
                 self.fallback_test_graft_policy_binding_mode
             ),
@@ -3617,6 +3738,13 @@ printf 'merged\n'
                     f"Failed to merge build manifest {path}: unexpected merge state {state!r}"
                 )
             states[state] += 1
+            # A textually clean three-way merge can still produce a TOML
+            # duplicate-key error when agent and ENV-PATCH added the same key
+            # in different hunks; collapse those per the evaluator-wins policy.
+            if state in ("merged", "merged-evaluator-conflict") and path.endswith("Cargo.toml"):
+                dedupe_ok, dedupe_error = self._dedupe_merged_cargo_manifest(path, prepared_head)
+                if not dedupe_ok:
+                    return False, dedupe_error
 
         self._eval_meta["manifest_merged_count"] = states["merged"]
         self._eval_meta["manifest_agent_exact_count"] = states["agent-exact"]
@@ -3635,6 +3763,51 @@ printf 'merged\n'
             f"(evaluator-wins), agent-exact={states['agent-exact']}, "
             f"agent-added={states['agent-added']}, evaluator-missing={states['evaluator-missing']}, "
             f"agent-authoritative={states['agent-authoritative']}"
+        )
+        return True, ""
+
+    def _dedupe_merged_cargo_manifest(
+        self, path: str, prepared_head: str
+    ) -> Tuple[bool, str]:
+        """Collapse duplicate TOML root keys in a just-merged Cargo manifest.
+
+        Only acts when the merged file actually contains a same-table duplicate
+        root key; the surviving line must be the evaluator-prepared one (see
+        _resolve_toml_duplicate_root_keys). No duplicates = no rewrite.
+        """
+        merged_text = _read_file_from_container(self.container_name, path)
+        if merged_text is None:
+            return False, f"cannot read merged manifest {path} for duplicate-key check"
+        prepared = subprocess.run(
+            [
+                "docker", "exec", self.container_name, "bash", "-c",
+                f"cd /testbed && git show {prepared_head}:{path}",
+            ],
+            capture_output=True, text=True,
+        )
+        if prepared.returncode != 0:
+            return False, (
+                f"cannot read prepared manifest {prepared_head}:{path} for "
+                f"duplicate-key check: {prepared.stderr.strip()[:200]}"
+            )
+        new_text, resolutions, errors = _resolve_toml_duplicate_root_keys(
+            merged_text, prepared.stdout
+        )
+        if errors:
+            return False, (
+                f"manifest merge produced duplicate TOML keys in {path} that "
+                "cannot be attributed to the prepared environment: " + "; ".join(errors)
+            )
+        if not resolutions:
+            return True, ""
+        if not _write_file_to_container(self.container_name, path, new_text):
+            return False, f"failed to write deduplicated manifest {path}"
+        self._eval_meta["manifest_duplicate_key_resolutions"].extend(
+            f"{path} :: {entry}" for entry in resolutions
+        )
+        print(
+            f"🧩 Manifest duplicate-key resolution in {path}: "
+            + "; ".join(resolutions)
         )
         return True, ""
 
@@ -5389,6 +5562,12 @@ fi
         """
         gt_test_suffix = gt_test_suffix or base_suffix
 
+        # Each application pass owns its injection diagnostics. Without this
+        # reset, an END pass's unplaced records would survive into a START
+        # fallback that aborts before reaching Rust filtering.
+        self._eval_meta["rust_gt_unplaced_count"] = 0
+        self._eval_meta["rust_gt_unplaced_tests"] = []
+
         # Validate the sidecar before mutating the evaluator container. Missing,
         # stale, or malformed manifest semantics are an infrastructure error, not
         # a reason to fall back to an additive overlay.
@@ -5501,6 +5680,13 @@ fi
                 print(f"   Processed: {filter_result['processed']} files")
                 print(f"   Agent test regions removed: {filter_result['total_agent_tests_removed']}")
                 print(f"   GT test regions appended: {filter_result['total_gt_tests_appended']}")
+            # Record unplaced diagnostics before the fail-closed gate so an
+            # invalidated cell still carries them; print the score consequence
+            # only when the cell actually proceeds to scoring.
+            unplaced_count = filter_result.get("total_gt_tests_unplaced", 0)
+            unplaced_tests = filter_result.get("unplaced_gt_tests", [])
+            self._eval_meta["rust_gt_unplaced_count"] = unplaced_count
+            self._eval_meta["rust_gt_unplaced_tests"] = unplaced_tests
             if filter_result["failed"] > 0:
                 failures = [
                     f"{detail['file']}: {detail['reason']}"
@@ -5511,6 +5697,16 @@ fi
                     "Rust test filtering failed closed for "
                     f"{filter_result['failed']} file(s): " + "; ".join(failures)
                 )
+            if unplaced_count:
+                print(
+                    f"   ⚠️  test-injection-scope-mismatch: {unplaced_count} nested GT test "
+                    "region(s) have no matching scope in agent code; not injected, "
+                    "affected required tests will score as missing:"
+                )
+                for entry in unplaced_tests[:10]:
+                    print(f"      - {entry}")
+                if len(unplaced_tests) > 10:
+                    print(f"      … and {len(unplaced_tests) - 10} more")
 
         return True, ""
 
@@ -6202,6 +6398,12 @@ fi
             gt_test_graft_unlisted_changed_paths=self._eval_meta[
                 "gt_test_graft_unlisted_changed_paths"
             ],
+            rust_gt_unplaced_count=self._eval_meta["rust_gt_unplaced_count"],
+            rust_gt_unplaced_tests=self._eval_meta["rust_gt_unplaced_tests"],
+            manifest_duplicate_key_resolutions=self._eval_meta[
+                "manifest_duplicate_key_resolutions"
+            ],
+            harness_revision=self._eval_meta["harness_revision"],
             fallback_test_graft_policy_binding_mode=self._eval_meta[
                 "fallback_test_graft_policy_binding_mode"
             ],
@@ -6644,6 +6846,12 @@ Example:
         result.gt_test_graft_unlisted_changed_paths = meta.get(
             "gt_test_graft_unlisted_changed_paths", []
         )
+        result.rust_gt_unplaced_count = meta.get("rust_gt_unplaced_count", 0)
+        result.rust_gt_unplaced_tests = meta.get("rust_gt_unplaced_tests", [])
+        result.manifest_duplicate_key_resolutions = meta.get(
+            "manifest_duplicate_key_resolutions", []
+        )
+        result.harness_revision = meta.get("harness_revision", "")
         result.fallback_test_graft_policy_binding_mode = meta.get(
             "fallback_test_graft_policy_binding_mode", "absent-legacy"
         )

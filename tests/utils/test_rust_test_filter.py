@@ -231,7 +231,11 @@ def test_cfg_test_block_expression_is_replaced_in_place():
     assert stats["nested_test_regions_replaced"] == 1
 
 
-def test_missing_agent_scope_for_nested_gt_test_fails_closed():
+def test_missing_agent_scope_for_nested_gt_test_is_reported_not_fatal():
+    """A nested GT test whose anchor scope is absent from the agent file is a
+    structural mismatch the merger fully understands: it must be reported as
+    unplaced (scored as missing downstream) instead of invalidating the cell.
+    Detector/tool failures still fail closed elsewhere."""
     agent = """struct Value(i32);
 fn production(value: &Value) -> i32 { value.0 }
 """
@@ -242,8 +246,86 @@ impl Value {
 }
 """
 
-    with pytest.raises(RustTestFilterError, match="agent scope"):
-        merge_src_with_gt_tests(agent, ground_truth, "src/lib.rs")
+    merged, stats = merge_src_with_gt_tests(agent, ground_truth, "src/lib.rs")
+
+    assert stats["gt_test_regions_unplaced"] == 1
+    assert stats["unplaced_gt_tests"] == [
+        "impl:Value[0] :: fn:test_value :: fns=test_value"
+    ]
+    assert stats["gt_test_regions_appended"] == 0
+    # Agent production code is untouched and no GT test text leaks in.
+    assert "fn production" in merged
+    assert "test_value" not in merged
+
+
+def test_relocated_module_scores_other_tests_instead_of_failing_cell():
+    """Behavior-correct layout divergence (the nushell split_read shape): the
+    agent relocated a module the GT anchors nested tests in.  The merge must
+    still deliver every placeable GT test (root-level module) and report only
+    the truly unanchorable nested ones."""
+    agent = """pub struct SplitRead(i32);
+pub fn production() -> i32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_written() { assert_eq!(super::production(), 1); }
+}
+"""
+    ground_truth = """mod split_read {
+    pub struct SplitRead(pub i32);
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn simple() { assert_eq!(super::SplitRead(1).0, 1); }
+    }
+}
+pub fn production() -> i32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gt_root() { assert_eq!(super::production(), 1); }
+}
+"""
+
+    merged, stats = merge_src_with_gt_tests(
+        agent, ground_truth, "crates/nu-protocol/src/pipeline/byte_stream.rs"
+    )
+
+    assert stats["gt_test_regions_unplaced"] == 1
+    assert stats["unplaced_gt_tests"] == ["mod:split_read[0] :: fn:simple :: fns=simple"]
+    # The root-level GT test module still replaces the agent's tests.
+    assert "fn gt_root" in merged
+    assert "fn agent_written" not in merged
+    # The unplaced nested GT test is not smuggled in anywhere.
+    assert "fn simple" not in merged
+
+
+def test_unsafe_region_in_absent_scope_is_unplaced_not_fatal():
+    """A GT test region that is BOTH insertion-unsafe and anchored in a scope
+    the agent does not have cannot be placed under any policy; it must land in
+    the unplaced report, while unsafe regions in EXISTING scopes keep their
+    fail-closed replacement contract (covered by the in-place tests above)."""
+    agent = "pub fn production() -> i32 { 1 }\n"
+    ground_truth = """pub fn production() -> i32 { helper() }
+
+fn helper() -> i32 {
+    let value = {
+        #[cfg(test)]
+        fn scoped_probe() -> i32 { 1 }
+        1
+    };
+    value
+}
+"""
+
+    merged, stats = merge_src_with_gt_tests(agent, ground_truth, "src/lib.rs")
+
+    assert stats["gt_test_regions_unplaced"] == 1
+    assert stats["unplaced_gt_tests"][0].endswith("fns=scoped_probe")
+    assert "scoped_probe" not in merged
 
 
 def test_ast_grep_failure_is_not_reported_as_no_tests(monkeypatch, tmp_path):

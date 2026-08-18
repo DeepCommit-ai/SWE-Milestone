@@ -578,7 +578,7 @@ def extract_test_regions(content: str, ranges: List[Tuple[int, int]]) -> str:
     return "\n\n".join(extracted_parts)
 
 
-def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str) -> Tuple[str, Dict[str, int]]:
+def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str) -> Tuple[str, Dict[str, Any]]:
     """
     Merge agent's src code with GT test regions.
 
@@ -588,13 +588,18 @@ def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str)
         file_path: File path (for detection)
 
     Returns:
-        Tuple of (merged_content, stats_dict)
+        Tuple of (merged_content, stats_dict).  ``gt_test_regions_unplaced`` /
+        ``unplaced_gt_tests`` record nested GT test regions whose anchor scope
+        does not exist in the agent file: they are reported instead of injected,
+        and score as missing downstream.
     """
-    stats = {
+    stats: Dict[str, Any] = {
         "agent_test_regions_removed": 0,
         "gt_test_regions_appended": 0,
         "nested_test_regions_replaced": 0,
         "nested_test_regions_inserted": 0,
+        "gt_test_regions_unplaced": 0,
+        "unplaced_gt_tests": [],
     }
 
     agent_regions, agent_scopes = _analyze_test_regions(agent_content, file_path)
@@ -646,10 +651,38 @@ def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str)
         paired_counts[key] = index + 1
 
     missing_by_scope: Dict[Tuple[Tuple[str, str, int], ...], List[_RustTestRegion]] = {}
+    unplaced: List[str] = []
     for key, regions in gt_by_key.items():
         used = paired_counts.get(key, 0)
         if used < len(regions):
             missing = regions[used:]
+            scope_path = key[0]
+            if scope_path not in agent_scopes:
+                # The agent file has no lexical scope to anchor these GT tests
+                # (e.g. the enclosing module was legitimately relocated by a
+                # refactor).  Injecting them anywhere else could not compile
+                # against the agent's layout, and failing the whole cell would
+                # erase every other measurement.  Record them instead: the
+                # affected required tests remain in the frozen universe and
+                # score as missing.  This branch covers complete knowledge of a
+                # structural mismatch (including regions that would be
+                # insertion-unsafe — with no anchor scope they cannot be placed
+                # regardless); detector/tool failures still fail closed.
+                rendered_scope = " / ".join(
+                    f"{kind}:{header}[{ordinal}]" for kind, header, ordinal in scope_path
+                )
+                for region in missing:
+                    # A region is a lexical block, not a single test: an entire
+                    # ``#[cfg(test)] mod tests`` counts once here.  List the fn
+                    # names it contains so reports map back to classified IDs.
+                    fn_names = re.findall(
+                        r"\bfn\s+([A-Za-z_]\w*)", region_text(gt_content, region)
+                    )
+                    unplaced.append(
+                        f"{rendered_scope} :: {region.identity[0]}:{region.identity[1]}"
+                        f" :: fns={','.join(fn_names) or '-'}"
+                    )
+                continue
             unsafe = [region for region in missing if not region.insertion_safe]
             if unsafe:
                 sample = ", ".join(
@@ -659,19 +692,23 @@ def merge_src_with_gt_tests(agent_content: str, gt_content: str, file_path: str)
                     f"cannot insert nested GT test nodes inside a lexical expression "
                     f"scope in {file_path}: {sample}"
                 )
-            missing_by_scope.setdefault(key[0], []).extend(missing)
+            missing_by_scope.setdefault(scope_path, []).extend(missing)
+
+    if unplaced:
+        stats["gt_test_regions_unplaced"] = len(unplaced)
+        stats["unplaced_gt_tests"] = unplaced
+        stats["gt_test_regions_appended"] = len(gt_regions) - len(unplaced)
+        logger.warning(
+            "%d nested GT test region(s) in %s have no matching agent scope; "
+            "reported as unplaced: %s",
+            len(unplaced),
+            file_path,
+            "; ".join(unplaced[:5]),
+        )
 
     insertion_ops: List[Tuple[int, str]] = []
     for scope_path, regions in missing_by_scope.items():
-        agent_scope = agent_scopes.get(scope_path)
-        if agent_scope is None:
-            rendered_scope = " / ".join(
-                f"{kind}:{header}[{ordinal}]" for kind, header, ordinal in scope_path
-            )
-            raise RustTestFilterError(
-                f"cannot place nested GT tests in {file_path}: agent scope "
-                f"{rendered_scope!r} does not exist"
-            )
+        agent_scope = agent_scopes[scope_path]
         snippets = [
             region_text(gt_content, region)
             for region in sorted(regions, key=lambda item: item.start)
@@ -738,6 +775,8 @@ def replace_agent_tests_with_ground_truth(
         "reason": "",
         "agent_test_regions_removed": 0,
         "gt_test_regions_appended": 0,
+        "gt_test_regions_unplaced": 0,
+        "unplaced_gt_tests": [],
     }
 
     # Only process .rs files
@@ -780,9 +819,16 @@ def replace_agent_tests_with_ground_truth(
 
     # Merge src with GT tests
     merged_content, stats = merge_src_with_gt_tests(agent_content, gt_content, file_path)
+    result["gt_test_regions_unplaced"] = stats["gt_test_regions_unplaced"]
+    result["unplaced_gt_tests"] = stats["unplaced_gt_tests"]
 
-    # Check if any changes were made
-    if stats["agent_test_regions_removed"] == 0 and stats["gt_test_regions_appended"] == 0:
+    # Check if any changes were made.  A file whose only outcome is unplaced GT
+    # tests is still a reportable result, not a silent skip.
+    if (
+        stats["agent_test_regions_removed"] == 0
+        and stats["gt_test_regions_appended"] == 0
+        and stats["gt_test_regions_unplaced"] == 0
+    ):
         result["skipped"] = True
         result["reason"] = "no test regions in either file"
         return result
@@ -792,6 +838,8 @@ def replace_agent_tests_with_ground_truth(
         result["success"] = True
         result["agent_test_regions_removed"] = stats["agent_test_regions_removed"]
         result["gt_test_regions_appended"] = stats["gt_test_regions_appended"]
+        result["gt_test_regions_unplaced"] = stats["gt_test_regions_unplaced"]
+        result["unplaced_gt_tests"] = stats["unplaced_gt_tests"]
     else:
         result["reason"] = "failed to write merged file"
 
@@ -822,6 +870,8 @@ def process_rust_files_in_container(
         "failed": 0,
         "total_agent_tests_removed": 0,
         "total_gt_tests_appended": 0,
+        "total_gt_tests_unplaced": 0,
+        "unplaced_gt_tests": [],
         "details": [],
     }
 
@@ -841,9 +891,19 @@ def process_rust_files_in_container(
                 "reason": f"Rust test filtering failed closed: {exc}",
                 "agent_test_regions_removed": 0,
                 "gt_test_regions_appended": 0,
+                "gt_test_regions_unplaced": 0,
+                "unplaced_gt_tests": [],
             }
         results["details"].append(file_result)
 
+        # Unplaced diagnostics are aggregated for every non-skipped file — a
+        # later write failure must not erase what the merge already knows.
+        if not file_result["skipped"]:
+            results["total_gt_tests_unplaced"] += file_result.get("gt_test_regions_unplaced", 0)
+            results["unplaced_gt_tests"].extend(
+                f"{file_result['file']} :: {entry}"
+                for entry in file_result.get("unplaced_gt_tests", [])
+            )
         if file_result["skipped"]:
             results["skipped"] += 1
         elif file_result["success"]:

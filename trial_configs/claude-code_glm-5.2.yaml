@@ -1,6 +1,11 @@
 data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: claude-code_glm-5.2
 agent: claude-code
+# Z.AI bigmodel Anthropic-compatible endpoint (ZAI_BASE_URL / ZAI_API_KEY in
+# .env_private). Earlier runs used the removed UNIFIED_* globals; without an
+# explicit endpoint this config cannot launch.
+base_url: ${ZAI_BASE_URL}
+api_key_env: ZAI_API_KEY
 model: glm-5.2
 default_agent_model: glm-5.2
 reasoning_effort: max
