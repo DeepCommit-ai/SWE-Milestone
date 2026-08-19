@@ -104,40 +104,14 @@ automated update:
    a decision document; the decision is human. Published rows that are not
    updated stay labeled with the version that produced them.
 
-### Spec debt: when a release ships a change re-evaluation cannot back-apply
-
-A spec/SRS change acts at *generation* time — the agent's decision is already
-frozen in its submission, so re-evaluation recovers nothing. Fully recovering it
-means **re-running agents**, which costs real money, unlike re-evaluation, which
-is compute-only. When the maintainer judges that cost unjustified:
-
-> Re-run only the materially affected trials, and **record the residual
-> inconsistency** in [spec-debt.md](spec-debt.md). Let the debt accumulate;
-> clear it with one full re-run and a **minor** bump when the batch justifies
-> the cost.
-
-This deliberately trades a bounded amount of correctness for cost. It stays
-honest only if all three obligations are met — the cheap ones are not optional:
-
-1. **Record it.** Every spec change shipped this way gets a row in
-   `docs/spec-debt.md`: what changed, why re-evaluation cannot back-apply it,
-   which published trials are affected, and whether they were re-run. A patch
-   with unrecorded spec debt is indistinguishable from a comparable patch, which
-   is the failure mode this rule exists to prevent.
-2. **Re-run the material subset.** Identify affected trials from evidence, not
-   guesswork — for a contract-style fix, scan the corpus for the failure
-   signature the change removes (see `docs/re-evaluation.md`). Re-run the trials
-   where the change plausibly moved the score materially; leave the rest.
-3. **Label what was not re-run.** Rows still carrying pre-change scores are
-   marked as such wherever scores are shown. Do not present them as measured on
-   the current spec.
-
 Worked example — the nushell frozen-API-contract fix (2026-08-18). Three
 milestones' SRS left a public signature under-specified; agents that guessed
 wrong had 8-10 of 13 cells score zero on a compile failure. Same models, same
 images, same grading: **14.0% before, ~56% after**. Re-evaluation recovers
-nothing here — the agent's decision is frozen in the submission — so it ships in
-an ordinary minor release and carries spec debt.
+nothing here — the agent's decision is frozen in the submission. It shipped in
+the ordinary minor release `v1.0.1`; recovering those trials would require
+re-running the agents, which the impact analysis reports and the maintainer
+decides on.
 
 Worked example (the other shape) — the element-web `html-react-parser` env
 repair (2026-08-18). Eval images lacked a dependency the SRS declared and the
