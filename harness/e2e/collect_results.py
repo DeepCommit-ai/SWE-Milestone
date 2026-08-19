@@ -1954,6 +1954,12 @@ def calculate_score_v2(result: Dict) -> Optional[float]:
 
     Returns None only when no result exists.  Infrastructure-invalid and build
     failures both score 0.0 and remain in the graded denominator.
+
+    ``result`` is the FULL evaluation_result dict, not ``result["test_summary"]``
+    — the inner dict has none of the keys read below, so passing it silently
+    scores every cell ``1.0 x 1.0`` instead of raising.  Load it with
+    ``load_evaluation_result()``, which also applies the filtered-file
+    preference the collectors use (playbook catalog #4/#5).
     """
     if not result:
         return None

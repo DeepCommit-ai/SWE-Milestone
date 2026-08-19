@@ -26,6 +26,19 @@ verified**.
 
 **#3 now hardened** (`4e09cae`): `_resolve_test_framework` infers framework from the milestone test_config and fails loud when a baseline needs go_test normalization but it didn't resolve. Cross-repo normalizer drift (the deeper cause) tracked in DeepCommit-Env#30.
 
+| # | Signature | Root cause | How it hid | Catch |
+|---|---|---|---|---|
+| 4 | A promotion "succeeds" but `collect_results` still reports the old score for some cells | `load_e2e_results(prefer_filtered=True)` reads **`evaluation_result_filtered.json` in preference to `evaluation_result.json`**. Promoting only the unfiltered file leaves a stale filtered file that shadows it — and the same asymmetry silently mis-states the *before* side of any comparison | every file you wrote is present and correct; the reader simply prefers a different one. Only 6 of 98 cells had a filtered file, so 92 cells corroborated the wrong conclusion | compare and promote through the **same** filtered-preference rule the reader uses; when the replay produced no filtered file but the destination has one, **delete the destination's stale filtered file** |
+| 5 | An impact prediction says "nothing will change" against known-changed data | `calculate_score_v2` / `calculate_score_reliable` take the **full result dict**, not `result["test_summary"]`. Passing the inner dict makes every field default to 0 ⇒ every score computes as `1.0 × 1.0` ⇒ before == after everywhere | a uniform, self-consistent answer — every cell agrees, which reads as a clean result rather than a broken one | sanity-check the prediction against one cell you already know moved; a prediction that contradicts known data is the bug, not the finding |
+
+**#4 / #5 (2026-08-19, element ENV-PATCH promotion).** Both were caught before
+any wrong number was published — #5 because "0 cells will change" contradicted
+measured data, #4 because the promotion procedure was re-read against
+`collect_results`' actual preference before executing. The general lesson is one
+rule: **read the record exactly the way the consumer reads it.** A comparison or
+a promotion that uses a different file, a different field, or a different
+preference than `collect_results` is not measuring the thing that gets published.
+
 The pattern behind all three: **an environment/config gap makes the evaluator
 emit a well-formed but wrong result, with no error raised.** Backlog for each:
 the evaluator should fail-loud instead of silently degrading (webServer/pool →

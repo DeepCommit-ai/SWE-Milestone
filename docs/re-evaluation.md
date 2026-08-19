@@ -37,7 +37,9 @@ EvoClaw-log/reeval/                      # gitignored scratch area, safe to dele
 The tree **mirrors the primary layout** under `EvoClaw-log/<range>/…`, so any
 comparison is "same relative path, two roots". Patched images get a distinct
 local tag (recorded in `EXPECTATION.md`); published tags are never
-overwritten.
+overwritten. The full standard for building, gating, naming, and promoting
+patched images — including the rc-tag convention (`:<vX.Y.Z>-rc<N>`) and
+the patch-release runbook — is **[image-patching.md](image-patching.md)**.
 
 **Evaluation-time repo hooks** live in the data workspace, wired via the repo
 config key `evaluation_post_snapshot_script` (e.g. dubbo's Maven closure,
@@ -128,6 +130,20 @@ promoted once, by hand, after user sign-off.
    `reeval/promotion_backup/<range>/<arm>/<milestone>/`. Never delete.
 2. **Copy in the re-eval outputs** from the reeval mirror path. **Never touch
    `source_snapshot.tar`** (frozen agent artifact — input, not output).
+   Two rules that are easy to miss and each silently void the promotion:
+   - **Filtered files shadow unfiltered ones.** `collect_results` reads
+     `evaluation_result_filtered.json` in preference to `evaluation_result.json`.
+     Copy the replay's filtered file when it produced one; when it did **not**,
+     **delete the destination's existing filtered file** — leaving it behind
+     means the reader keeps serving the pre-promotion score while every file you
+     wrote looks correct (playbook catalog #4).
+   - **Promote `artifacts/` too, not just the result files.** A promotion that
+     replaces `evaluation_result.json` and leaves the old artifacts produces a
+     cell whose stored summary and raw artifacts disagree. This is not
+     hypothetical: the 2026-07-16 `webset_replay` promotion did exactly that and
+     left 19 self-contradictory element-web cells that went unnoticed for three
+     months, corrupting any later raw-artifact comparison against those
+     primaries. Regenerate `artifacts.tar.gz` from the promoted artifacts.
 3. **Sync `summary.json`**: update `results[<milestone>]` (`eval_status`,
    `test_summary`, keep `attempt`) to match the new evaluation_result.
    Required because `collect_results.load_e2e_results` only replaces a

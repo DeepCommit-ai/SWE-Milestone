@@ -50,13 +50,168 @@ Align a stale checkout with `./scripts/pull_data.sh` (aligns by default;
 
 | Change | Bump |
 |---|---|
-| Task / test / image-environment change | benchmark |
-| Grading logic change — even with zero image changes | benchmark |
-| Single-task fix | benchmark patch (`v1.0.1`) |
-| Anything score-neutral | harness only |
+| Anything that could touch a score — tasks, tests, image environments, grading logic, spec/SRS text | **minor: increment the last digit** (`v1.0` → `v1.0.1` → `v1.0.2`) |
+| Anything score-neutral — refactors, logging, agent integrations, monitoring, docs | harness only, no benchmark bump |
+| A larger jump (`v1.1`, `v2.0`) | **only when the maintainer says so** |
 
-There is no "backward compatible" benchmark change — only *comparable* and
-*not comparable*; cross-version scores must be labeled.
+### The rule: minor by default, by decree
+
+The version is set **by decision, not by inference**:
+
+> **Every score-touching release is a minor bump — the last digit — unless the
+> maintainer explicitly calls for a bigger one.** This is a standing rule, not a
+> judgement call to be re-derived per change.
+
+A minor release may bundle whatever the maintainer bundles: an environment
+repair, a config change, an SRS correction, or all three. There is **no
+per-change test that decides the version number** — earlier revisions of this
+document tried to derive it from whether re-evaluation could back-apply a
+change, and that framing is retired. Deriving version numbers from a mechanism
+is a judgement call made per change, under time pressure, by whoever is doing
+the work; it drifts and it invites arguments. A standing default does not.
+
+The mechanism question still matters, but only as **analysis**: it tells you
+what work a change implies (what re-scoring can recover, what needs re-runs) —
+see the impact analysis below. It does not name the release.
+
+Release notes describe what went into a release; they are not a consistency
+proof, and a release that bundles unrelated work is normal.
+
+### Impact analysis: required on every score-touching change
+
+A version bump is only half the obligation. The other half is knowing what it
+did to results that already exist. Every score-touching change — patch or minor
+— carries this procedure, and it ends at the maintainer's desk, not in an
+automated update:
+
+1. **Scan `SWE-Milestone-log` for trials that could be affected.** Derive the
+   set from evidence, not reasoning: search the published corpus for the failure
+   signature the change removes (or the tests/milestones it touches). Two
+   completeness rules learned the hard way:
+   - **Signature ∪ no-result.** A signature sweep is blind to cells whose
+     evaluation failed before producing any test output — there is nothing to
+     grep. The scope is *cells carrying the signature* **UNION** *cells with no
+     valid evaluation result on the affected milestones*.
+   - **Verify the exclusions.** Check the cells you plan to leave out, and say
+     what you checked. "We believe the sweep was complete" is not a finding;
+     "every excluded cell on the affected milestones was inspected and carries
+     no relevant signature" is.
+2. **Report what syncing would involve** — which cells, which artifacts, what it
+   costs, and crucially what re-evaluation *cannot* recover (spec changes need
+   agent re-runs; environment repairs do not).
+3. **The maintainer decides whether to update scores.** Do not promote, do not
+   refresh the leaderboard, do not "just fix" the affected rows. The analysis is
+   a decision document; the decision is human. Published rows that are not
+   updated stay labeled with the version that produced them.
+
+### Spec debt: when a release ships a change re-evaluation cannot back-apply
+
+A spec/SRS change acts at *generation* time — the agent's decision is already
+frozen in its submission, so re-evaluation recovers nothing. Fully recovering it
+means **re-running agents**, which costs real money, unlike re-evaluation, which
+is compute-only. When the maintainer judges that cost unjustified:
+
+> Re-run only the materially affected trials, and **record the residual
+> inconsistency** in [spec-debt.md](spec-debt.md). Let the debt accumulate;
+> clear it with one full re-run and a **minor** bump when the batch justifies
+> the cost.
+
+This deliberately trades a bounded amount of correctness for cost. It stays
+honest only if all three obligations are met — the cheap ones are not optional:
+
+1. **Record it.** Every spec change shipped this way gets a row in
+   `docs/spec-debt.md`: what changed, why re-evaluation cannot back-apply it,
+   which published trials are affected, and whether they were re-run. A patch
+   with unrecorded spec debt is indistinguishable from a comparable patch, which
+   is the failure mode this rule exists to prevent.
+2. **Re-run the material subset.** Identify affected trials from evidence, not
+   guesswork — for a contract-style fix, scan the corpus for the failure
+   signature the change removes (see `docs/re-evaluation.md`). Re-run the trials
+   where the change plausibly moved the score materially; leave the rest.
+3. **Label what was not re-run.** Rows still carrying pre-change scores are
+   marked as such wherever scores are shown. Do not present them as measured on
+   the current spec.
+
+Worked example — the nushell frozen-API-contract fix (2026-08-18). Three
+milestones' SRS left a public signature under-specified; agents that guessed
+wrong had 8-10 of 13 cells score zero on a compile failure. Same models, same
+images, same grading: **14.0% before, ~56% after**. Re-evaluation recovers
+nothing here — the agent's decision is frozen in the submission — so it ships in
+an ordinary minor release and carries spec debt.
+
+Worked example (the other shape) — the element-web `html-react-parser` env
+repair (2026-08-18). Eval images lacked a dependency the SRS declared and the
+GT tests required, so correct solutions scored zero. Re-evaluation *can*
+back-apply it (agents were never re-run; frozen submissions were re-scored
+against repaired images), and the impact analysis found the movement confined
+to 4 milestones / 15 cells / 6 trials, +1.70 to +5.97 element-repo points on the
+board metric, `resolved` unchanged everywhere. It shipped in `v1.0.1` — an
+ordinary minor release, bundled with the dubbo prune-config and nushell SRS
+work that landed in the same window. The back-application property made the
+*work* cheap; it had no bearing on the version number.
+
+Patch releases (`vX.Y.Z`) — repairing published images, rc-tag campaigns,
+and the promotion runbook that reuses steps 3-5 below with carried-over
+name sets — are specified in **[image-patching.md](image-patching.md)**.
+Their core invariant: the released image is digest-identical to what the
+re-evaluation campaign scored ("evaluate-then-christen").
+
+### Displaying the version: minor in public, patch for reproduction
+
+The version has two audiences, and they need different precision. The public
+presentation therefore shows the **minor** level only:
+
+> **The website badge reads `v1.0`, never `v1.0.1`.** The patch level is not
+> hidden — it lives in the data (trial metadata, digest manifests, release
+> notes) where anyone reproducing a number will find it.
+
+This is deliberate, and it follows from what the two levels mean:
+
+- **Minor is the comparability class.** A patch is, by definition, an
+  explicitly declared assertion that old and new scores sit on one scale
+  (see the rule above — patches exist only by decree, precisely because that
+  assertion has to be made consciously). So everything inside `v1.0.x` is one
+  comparable set, and `v1.0` is the honest name for that set. A first-time
+  reader comparing a `v1.0.1` score against a `v1.0` score is doing something
+  the version system supports.
+- **Patch is the reproduction coordinate.** Someone re-running a cell needs to
+  know exactly which image bytes produced a number — that is what
+  `manifests/digests-v1.0.1.tsv`, the data-repo tag, and the release notes are
+  for. Surfacing it in a headline badge would add precision the casual reader
+  cannot use and does not need, while implying a discontinuity that does not
+  exist.
+
+Consequence for tooling: **do not "fix" the badge to render the full version.**
+If the badge is ever derived from `manifests/BENCHMARK_VERSION` instead of being
+written by hand, it must be truncated to `major.minor` — that keeps the
+single-source-of-truth property without leaking the patch level into the public
+comparability statement.
+
+### One label, three repos
+
+A bump is never "just tag the data repo". The same `vX.Y` label is applied to
+all three, and the launcher resolves them through **one** knob
+(`expected_benchmark_version()` — `SWE_MILESTONE_IMAGE_TAG`, defaulting to
+`manifests/BENCHMARK_VERSION`):
+
+| Repo | Carries the tag? | Why |
+|---|---|---|
+| Images | **Yes — every row of the digest manifest** | Images have no identity of their own; their tag *is* the version. Whatever the change was, every repo's image must exist under the new label or that repo cannot launch. |
+| `SWE-Milestone-data` | **Yes** | Same knob derives the expected data tag; the launcher fact-checks HEAD against it. |
+| `SWE-Milestone` (harness) | **Yes, as a release marker** | `manifests/BENCHMARK_VERSION` lives here, so the bump is a harness commit anyway. The tag records *which harness commit shipped with vX.Y*. |
+
+**A data-only change still retags every image.** Nothing about the images
+changed — but `BENCHMARK_VERSION` drives image resolution for all seven repos,
+so tagging only the data repo leaves the launcher looking for images that do not
+exist. The carry-over is a pointer operation (`docker tag`) and pushes 0 bytes;
+see image-patching.md §6 step 1. Its by-product is the cleanest possible
+evidence: `diff manifests/digests-<old>.tsv manifests/digests-<new>.tsv` must
+show **no digest changes at all**, proving the release touched no environment.
+
+**The harness tag is a marker, not a lockstep.** Score-neutral harness work
+(refactors, logging, agent integrations, monitoring) moves freely between
+benchmark versions and never bumps one. Only the release commit is tagged. Do
+not read "harness has no tag for vX.Y.Z" as a version inconsistency.
 
 ## Immutability
 
