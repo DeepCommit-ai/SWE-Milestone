@@ -181,11 +181,11 @@ python scripts/run_all.py --config trial_config.yaml
 Containers start with `--pull=never`: a missing local image fails loudly instead of silently fetching. Align your machine with the release (digest-exact, near-free thanks to layer dedup):
 
 ```bash
-./scripts/pull_images.sh                          # pulls by content digest from manifests/digests-v1.0.tsv
+./scripts/pull_images.sh                          # pulls by content digest from manifests/digests-<version>.tsv (version = manifests/BENCHMARK_VERSION)
 python3 scripts/verify_image_digests.py --local   # confirm local bytes match the frozen manifest
 ```
 
-The launcher also checks that the data repo is on the matching version tag (default `v1.0`, from `SWE_MILESTONE_IMAGE_TAG`); if it refuses with a version mismatch, update the data checkout: `git -C $SWE_MILESTONE_DATA_ROOT fetch --tags && git -C $SWE_MILESTONE_DATA_ROOT checkout v1.0`.
+The launcher also checks that the data repo is on the matching version tag (default = `manifests/BENCHMARK_VERSION`, overridable with `SWE_MILESTONE_IMAGE_TAG`); if it refuses with a version mismatch, update the data checkout: `git -C $SWE_MILESTONE_DATA_ROOT fetch --tags && git -C $SWE_MILESTONE_DATA_ROOT checkout $(cat manifests/BENCHMARK_VERSION)`.
 
 </details>
 

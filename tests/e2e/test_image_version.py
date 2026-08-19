@@ -1,4 +1,5 @@
 """Tests for the single naming authority (image_version.py)."""
+import re
 import pytest
 
 from harness.e2e.image_version import (
@@ -29,8 +30,20 @@ REAL_CASES = [
 
 
 class TestConstruct:
-    def test_default_tag_is_v1_0(self):
-        assert DEFAULT_IMAGE_TAG == "v1.0"
+    def test_default_tag_tracks_benchmark_version_file(self):
+        """The default tag is whatever manifests/BENCHMARK_VERSION says.
+
+        Pinning a literal here would make every release edit this test and
+        would let the two drift; BENCHMARK_VERSION is the single source of
+        truth the code, scripts and CI all read.
+        """
+        from pathlib import Path
+
+        version_file = (
+            Path(__file__).resolve().parents[2] / "manifests" / "BENCHMARK_VERSION"
+        )
+        assert DEFAULT_IMAGE_TAG == version_file.read_text().strip()
+        assert re.fullmatch(r"v\d+\.\d+(\.\d+)?", DEFAULT_IMAGE_TAG)
 
     def test_local_ref_navidrome(self):
         assert (

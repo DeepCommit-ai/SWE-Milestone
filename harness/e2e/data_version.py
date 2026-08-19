@@ -7,11 +7,12 @@ data checkout (the SWE-Milestone-data git clone). The data repo carries the
 same ``vX.Y`` tags as the images; a run is "on version vX.Y" iff the data
 HEAD is the commit that tag points at.
 
-Semantics deliberately mirror resolve_image():
-- env var unset (default pin): any non-match prints a loud warning and the
-  run continues — day-to-day development must not be blocked;
-- ``SWE_MILESTONE_IMAGE_TAG`` set explicitly: a reproducibility run — any
-  non-match or unverifiable state refuses the launch;
+Semantics (hardened 2026-07-17 — the default pin is enforced exactly as an
+explicit one; score comparability is the benchmark's core contract, so an
+unverified data checkout never runs silently):
+- env var unset (default pin): any non-match or unverifiable state REFUSES
+  the launch;
+- ``SWE_MILESTONE_IMAGE_TAG`` set explicitly: same — refuses;
 - ``SWE_MILESTONE_DATA_VERSION_CHECK=off``: explicit escape hatch, recorded
   as ``checked: false`` in trial metadata so the trial is honest about it.
 
