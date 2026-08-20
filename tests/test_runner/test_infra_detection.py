@@ -546,3 +546,168 @@ class TestTransientClassification:
 
     def test_existing_string_heuristics_preserved(self):
         assert _is_transient_error(RuntimeError("Connection reset by peer")) is True
+
+
+GINKGO_COMPILE_FAILURE_REASON = (
+    "Failed to compile plugins:\n\n"
+    "# github.com/example/proj/plugins\n"
+    "./wasm_base_plugin.go:28:6: loaderFunc redeclared in this block\n"
+    "\t./base_capability.go:29:6: other declaration of loaderFunc"
+)
+
+
+def _ginkgo_report(*, broken=True, healthy=True):
+    suites = []
+    if broken:
+        suites.append(
+            {
+                "SuitePath": "/testbed/plugins",
+                "SuiteDescription": "Plugins Suite",
+                "SuiteSucceeded": False,
+                "SpecReports": None,
+                "SpecialSuiteFailureReasons": [GINKGO_COMPILE_FAILURE_REASON],
+                "RunTime": 0,
+            }
+        )
+    if healthy:
+        suites.append(
+            {
+                "SuitePath": "/testbed/utils",
+                "SuiteDescription": "Utils Suite",
+                "SuiteSucceeded": True,
+                "SpecReports": [
+                    {
+                        "ContainerHierarchyTexts": ["Utils"],
+                        "LeafNodeType": "It",
+                        "LeafNodeText": "does the thing",
+                        "LeafNodeLocation": {
+                            "FileName": "/testbed/utils/x_test.go",
+                            "LineNumber": 10,
+                        },
+                        "State": "passed",
+                        "RunTime": 1000000,
+                    }
+                ],
+                "SpecialSuiteFailureReasons": None,
+                "RunTime": 2000000,
+            }
+        )
+    return json.dumps(suites)
+
+
+class TestGinkgoMaskedBuildFailure:
+    """Issue #22: a Ginkgo suite that fails to compile (SuiteSucceeded=false,
+    empty SpecReports, compiler output in SpecialSuiteFailureReasons) must
+    reach the build-failure policy instead of being recorded as an ordinary
+    completed run. Record-only: default (compatibility) scoring is unchanged.
+    """
+
+    def test_scan_detects_compile_dead_suite(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            _scan_report_for_masked_build_failure_details,
+        )
+
+        report = tmp_path / "eval_default.json"
+        report.write_text(_ginkgo_report())
+        details = _scan_report_for_masked_build_failure_details(report, "ginkgo")
+
+        assert details is not None
+        signature, context = details
+        assert signature == "Failed to compile plugins:"
+        assert "loaderFunc redeclared in this block" in context
+
+    def test_scan_ignores_suite_failed_by_ordinary_specs(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            _scan_report_for_masked_build_failure_details,
+        )
+
+        failing_spec_suite = [
+            {
+                "SuitePath": "/testbed/core",
+                "SuiteDescription": "Core Suite",
+                "SuiteSucceeded": False,
+                "SpecReports": [
+                    {
+                        "ContainerHierarchyTexts": ["Core"],
+                        "LeafNodeType": "It",
+                        "LeafNodeText": "fails normally",
+                        "LeafNodeLocation": {
+                            "FileName": "/testbed/core/x_test.go",
+                            "LineNumber": 5,
+                        },
+                        "State": "failed",
+                        "RunTime": 1000,
+                        "Failure": {"Message": "assertion failed"},
+                    }
+                ],
+                "SpecialSuiteFailureReasons": None,
+                "RunTime": 1000,
+            }
+        ]
+        report = tmp_path / "eval_default.json"
+        report.write_text(json.dumps(failing_spec_suite))
+
+        assert _scan_report_for_masked_build_failure_details(report, "ginkgo") is None
+
+    def test_scan_clean_report_returns_none(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            _scan_report_for_masked_build_failure_details,
+        )
+
+        report = tmp_path / "eval_default.json"
+        report.write_text(_ginkgo_report(broken=False))
+
+        assert _scan_report_for_masked_build_failure_details(report, "ginkgo") is None
+
+    def test_scan_malformed_json_returns_none(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            _scan_report_for_masked_build_failure_details,
+        )
+
+        report = tmp_path / "eval_default.json"
+        report.write_text("{not json")
+
+        assert _scan_report_for_masked_build_failure_details(report, "ginkgo") is None
+
+    def test_ginkgo_build_failure_rejects_partial_report_when_fail_closed(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import (
+            RunnerBuildFailureError,
+            run_single_state_tests,
+        )
+
+        ws, out = _single_mode_workspace(tmp_path, "ginkgo")
+        runner = _TimeoutCapturingRunner(out, {"eval_default.json": _ginkgo_report()})
+        diagnostics = []
+
+        with pytest.raises(RunnerBuildFailureError, match="partial test universe") as exc_info:
+            run_single_state_tests(
+                runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+                workers=1, timeout=60, build_failure_fail_closed=True,
+                build_failure_diagnostics=diagnostics,
+            )
+
+        message = str(exc_info.value)
+        assert "Failed to compile plugins:" in message
+        assert "loaderFunc redeclared" in message
+        assert not (out / "eval.json").exists()
+        assert diagnostics and "loaderFunc redeclared" in diagnostics[0]
+
+    def test_ginkgo_build_failure_default_still_scores_completed_suites(self, tmp_path):
+        from harness.test_runner.core.milestone_attempt import run_single_state_tests
+
+        ws, out = _single_mode_workspace(tmp_path, "ginkgo")
+        runner = _TimeoutCapturingRunner(out, {"eval_default.json": _ginkgo_report()})
+        diagnostics = []
+
+        merged = run_single_state_tests(
+            runner, workspace_root=ws, milestone_id="M1", output_dir=out,
+            workers=1, timeout=60, build_failure_fail_closed=False,
+            build_failure_diagnostics=diagnostics,
+        )
+
+        report = json.loads(merged.read_text())
+        assert report["summary"]["total"] == 1
+        assert report["summary"]["passed"] == 1
+        assert len(diagnostics) == 1
+        assert "Failed to compile plugins:" in diagnostics[0]
+        assert "loaderFunc redeclared" in diagnostics[0]
