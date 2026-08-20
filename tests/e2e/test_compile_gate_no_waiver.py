@@ -15,6 +15,7 @@ become.
 """
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -178,3 +179,44 @@ class TestNoUndefinedNames:
         )
 
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+class TestRealBuildOutput:
+    """The decisive case, captured from a real container rather than written
+    by hand.
+
+    Issue #21 could not show the waiver firing: the build command's stdout is
+    not persisted, so no recorded run contains the evidence. Running
+    navidrome's configured build_command inside the milestone image supplies
+    it — and the tree used was the reference solution's own END tag with no
+    agent patch, so this is the gate waiving a broken *golden* state, not a
+    submission's mistake.
+    """
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "navidrome_end_build_output.txt"
+
+    def _real_output(self):
+        if not self.FIXTURE.exists():
+            pytest.skip(f"fixture missing: {self.FIXTURE}")
+        return "\n".join(
+            line
+            for line in self.FIXTURE.read_text().splitlines()
+            if not line.startswith("#")
+        )
+
+    def test_the_captured_output_still_has_the_shape_that_fooled_the_waiver(self):
+        """Guard the fixture itself: if a future edit strips the npm warnings
+        or the Go error, the test below would pass for the wrong reason."""
+        output = self._real_output()
+
+        assert sum("npm warn" in l.lower() for l in output.splitlines()) >= 10
+        assert "has no field or method" in output
+
+    def test_real_npm_warnings_do_not_waive_the_real_go_error(self, monkeypatch):
+        evaluator = _gate(monkeypatch, returncode=1, stdout=self._real_output())
+
+        success, error = evaluator._check_compilation()
+
+        assert success is False
+        assert "pls.AddTracks undefined" in error
+        assert "exit 1" in error
