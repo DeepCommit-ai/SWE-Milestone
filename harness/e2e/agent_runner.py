@@ -29,6 +29,94 @@ logger = logging.getLogger("e2e.runner")
 # Prompt template directory
 PROMPT_DIR = Path(__file__).parent / "prompt"
 
+# Kill an invocation's in-container process tree and verify it died (#19).
+#
+# Killing the host-side `docker exec` client (proc.kill / subprocess timeout)
+# only severs the stream; the payload keeps running inside the container. Each
+# invocation therefore records its payload shell's PID in a pidfile, and this
+# script — run via a fresh `docker exec` — walks /proc for that PID's
+# descendant tree, TERMs it, waits out a grace period, escalates to KILL, and
+# reports what (if anything) survived.
+#
+# POSIX sh only: agent images span several distro bases, so no bash/pkill/
+# setsid assumptions — /proc + kill + sed are the common denominator.
+# $1 = pidfile path, $2 = TERM grace period in seconds (default 8).
+_KILL_INVOCATION_SCRIPT = r"""
+PIDFILE="$1"
+GRACE="${2:-8}"
+[ -f "$PIDFILE" ] || { echo "RESULT:NO_PIDFILE"; exit 0; }
+ROOT="$(cat "$PIDFILE" 2>/dev/null)"
+case "$ROOT" in
+    ''|*[!0-9]*) rm -f "$PIDFILE"; echo "RESULT:BAD_PIDFILE"; exit 0 ;;
+esac
+if [ ! -d "/proc/$ROOT" ]; then
+    rm -f "$PIDFILE"
+    echo "RESULT:ALREADY_DEAD"
+    exit 0
+fi
+
+# A process only counts as alive if it can still execute: zombies (Z) keep a
+# /proc entry until reaped, and a detached invocation's orphans get adopted by
+# a container PID 1 that never reaps — [ -d /proc/PID ] alone would report
+# permanently-dead processes as survivors.
+is_alive() {
+    st="$(sed -n 's/^State:[[:space:]]*//p' "/proc/$1/status" 2>/dev/null | cut -c1)"
+    [ -n "$st" ] && [ "$st" != "Z" ] && [ "$st" != "X" ]
+}
+
+# Iterative BFS over /proc for ROOT's descendants. /proc/PID/status has a
+# "PPid:<tab><pid>" line; comm-with-spaces makes /proc/PID/stat unsafe to
+# field-split, so status is the one to read.
+TARGETS="$ROOT"
+frontier="$ROOT"
+while [ -n "$frontier" ]; do
+    next=""
+    for st in /proc/[0-9]*/status; do
+        [ -f "$st" ] || continue
+        p="${st#/proc/}"; p="${p%/status}"
+        pp="$(sed -n 's/^PPid:[[:space:]]*//p' "$st" 2>/dev/null)"
+        [ -n "$pp" ] || continue
+        for f in $frontier; do
+            if [ "$pp" = "$f" ]; then
+                case " $TARGETS " in
+                    *" $p "*) ;;
+                    *) TARGETS="$TARGETS $p"; next="$next $p" ;;
+                esac
+            fi
+        done
+    done
+    frontier="$next"
+done
+
+kill -TERM $TARGETS 2>/dev/null
+
+i=0
+alive=""
+while [ "$i" -lt "$GRACE" ]; do
+    sleep 1
+    alive=""
+    for p in $TARGETS; do is_alive "$p" && alive="$alive $p"; done
+    [ -z "$alive" ] && break
+    i=$((i+1))
+done
+
+if [ -n "$alive" ]; then
+    kill -KILL $TARGETS 2>/dev/null
+    sleep 1
+fi
+
+rm -f "$PIDFILE"
+
+survivors=""
+for p in $TARGETS; do is_alive "$p" && survivors="$survivors $p"; done
+if [ -z "$survivors" ]; then
+    echo "RESULT:KILLED"
+    exit 0
+fi
+echo "RESULT:SURVIVORS$survivors"
+exit 1
+"""
+
 
 class AgentRunner:
     """Base agent runner with common functionality.
@@ -97,6 +185,8 @@ class AgentRunner:
         self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
         self._last_invalid_session = False  # Set when resume session ID is invalid
         self._last_fatal_error: Optional[str] = None  # Set on fatal config errors (no retry)
+        # Container path of the current invocation's pidfile (see _wrap_with_pidfile).
+        self._invocation_pidfile: Optional[str] = None
 
     def _get_exec_env_vars(self) -> list[str]:
         """Return env var args for docker exec."""
@@ -549,6 +639,106 @@ class AgentRunner:
 
         return result
 
+    def _wrap_with_pidfile(self, agent_cmd: str) -> str:
+        """Prefix agent_cmd so the payload shell records its own PID (#19).
+
+        The prefix turns the `sh -c` payload into a compound command, so the
+        shell stays alive as the ancestor of everything the agent spawns; $$
+        names that shell, and _kill_container_invocation walks its descendant
+        tree. An `exec` prefix would be wrong here: agent commands can be
+        compound (env-var prefixes, `&&` chains, redirections), and `exec`
+        would silently drop everything after the first command.
+        """
+        self._invocation_pidfile = f"/tmp/evoclaw_invocation_{uuid.uuid4().hex[:12]}.pid"
+        return f'echo $$ >"{self._invocation_pidfile}"; {agent_cmd}'
+
+    def _handle_invocation_timeout(self, context: str) -> None:
+        """Shared post-timeout contract for every invocation path (#19).
+
+        Kills the in-container tree and verifies death; when survivors remain
+        (or death cannot be verified), sets _last_fatal_error so the trial
+        loop aborts instead of launching a concurrent invocation.
+        """
+        self._last_fatal_error = None
+        if not self._kill_container_invocation(context):
+            self._last_fatal_error = (
+                f"agent invocation in {self.container_name} survived kill after timeout "
+                f"({context}); refusing to start a concurrent invocation (#19)"
+            )
+        self._append_session_history(
+            {
+                "event": "invocation_timeout_kill",
+                "session_id": self.session_id,
+                "context": context,
+                "verified_dead": self._last_fatal_error is None,
+            }
+        )
+
+    def _kill_container_invocation(self, context: str, grace_seconds: int = 8) -> bool:
+        """Kill the current invocation's in-container process tree; verify it died.
+
+        Called after a harness-side timeout: the host-side docker exec client
+        is already dead, but the payload keeps running in the container and
+        would race any recovery invocation on /testbed, submission tags and
+        the session JSONL (#19).
+
+        Returns True when the tree is confirmed gone (or never existed).
+        Returns False when survivors remain or their death cannot be verified
+        while the container is running — the caller must then treat the
+        invocation as fatal instead of launching a concurrent one.
+        """
+        pidfile = self._invocation_pidfile
+        if not pidfile:
+            return True
+        self._invocation_pidfile = None
+
+        kill_cmd = [
+            "docker", "exec", self.container_name,
+            "/bin/sh", "-c", _KILL_INVOCATION_SCRIPT,
+            "kill_invocation", pidfile, str(grace_seconds),
+        ]
+        try:
+            result = subprocess.run(
+                kill_cmd, capture_output=True, text=True,
+                timeout=max(120, grace_seconds + 60),
+            )
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Invocation kill script timed out ({context}); cannot verify death")
+            return False
+
+        stdout = result.stdout or ""
+        marker = next((ln for ln in stdout.splitlines() if ln.startswith("RESULT:")), None)
+
+        if marker in ("RESULT:KILLED", "RESULT:ALREADY_DEAD", "RESULT:NO_PIDFILE", "RESULT:BAD_PIDFILE"):
+            self.logger.info(f"In-container invocation cleanup ({context}): {marker.removeprefix('RESULT:')}")
+            return True
+        if marker and marker.startswith("RESULT:SURVIVORS"):
+            self.logger.error(
+                f"In-container invocation SURVIVED kill ({context}): "
+                f"pids{marker.removeprefix('RESULT:SURVIVORS')}"
+            )
+            return False
+
+        # No marker: the docker exec itself failed. If the container is gone,
+        # so is every process in it — that counts as dead. If the container is
+        # still running (or its state can't be read), death is unverified:
+        # fail closed rather than allow a concurrent invocation.
+        inspect = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
+            capture_output=True, text=True,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip() == "false":
+            self.logger.warning(f"Container stopped during invocation kill ({context}); treating tree as dead")
+            return True
+        if inspect.returncode != 0 and "No such" in (inspect.stderr or ""):
+            self.logger.warning(f"Container removed during invocation kill ({context}); treating tree as dead")
+            return True
+        self.logger.error(
+            f"Invocation kill could not run in container ({context}): "
+            f"rc={result.returncode} stderr={(result.stderr or '')[-300:]}"
+        )
+        return False
+
     def _append_session_history(self, event: dict) -> None:
         """Append a single JSON event to session_history.jsonl (best-effort)."""
         if not self.log_dir:
@@ -619,6 +809,7 @@ class AgentRunner:
             session_id=self.session_id,
             prompt_path=container_prompt_path,
         )
+        agent_cmd = self._wrap_with_pidfile(agent_cmd)
 
         docker_exec_cmd = [
             "docker",
@@ -758,12 +949,20 @@ class AgentRunner:
         """
         if not self.log_dir:
             # Simple execution without streaming
-            result = subprocess.run(
-                docker_exec_cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_ms / 1000.0,
-            )
+            try:
+                result = subprocess.run(
+                    docker_exec_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_ms / 1000.0,
+                )
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"Agent execution timed out after {self.timeout_ms / 1000 / 60:.1f} minutes")
+                self._handle_invocation_timeout("run timeout (no streaming)")
+                self._run_command(
+                    ["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False
+                )
+                return False
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
             return result.returncode == 0
 
@@ -808,6 +1007,11 @@ class AgentRunner:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 self.logger.error(f"Agent execution timed out after {self.timeout_ms / 1000 / 60:.1f} minutes")
+                # proc.kill() only killed the host-side docker exec client; the
+                # payload is still running in the container. Kill its tree and
+                # verify, or recovery would run a second agent concurrently
+                # against the same /testbed and session (#19).
+                self._handle_invocation_timeout("run timeout")
                 self._run_command(
                     ["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False
                 )
@@ -823,8 +1027,12 @@ class AgentRunner:
             stdout_file.close()
             stderr_file.close()
 
-        # Cleanup prompt file
-        self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
+        # Cleanup prompt file + this invocation's pidfile (the payload is done)
+        cleanup_paths = [container_prompt_path]
+        if self._invocation_pidfile:
+            cleanup_paths.append(self._invocation_pidfile)
+            self._invocation_pidfile = None
+        self._run_command(["docker", "exec", self.container_name, "rm", "-f", *cleanup_paths], check=False)
 
         if proc.returncode != 0:
             self.logger.error(f"Agent exited with code {proc.returncode}")
@@ -895,6 +1103,7 @@ class AgentRunner:
             session_id=session_id,
             message_path=container_message_path,
         )
+        agent_cmd = self._wrap_with_pidfile(agent_cmd)
 
         docker_exec_cmd = [
             "docker",
@@ -940,8 +1149,12 @@ class AgentRunner:
             # Update session_id from output (agent may have created a new session)
             self._update_session_id_from_output()
 
-            # Cleanup
-            self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_message_path], check=False)
+            # Cleanup message file + this invocation's pidfile (the payload is done)
+            cleanup_paths = [container_message_path]
+            if self._invocation_pidfile:
+                cleanup_paths.append(self._invocation_pidfile)
+                self._invocation_pidfile = None
+            self._run_command(["docker", "exec", self.container_name, "rm", "-f", *cleanup_paths], check=False)
 
             if result.returncode != 0:
                 self.logger.error(f"Resume failed with code {result.returncode}")
@@ -974,7 +1187,10 @@ class AgentRunner:
             self._last_model_unavailable = False
             self._last_model_hint = None
             self._last_invalid_session = False
-            self._last_fatal_error = None
+            # subprocess.run killed only the host-side docker exec client; the
+            # resumed agent is still running in the container. Same kill-and-
+            # verify contract as the streaming path (#19).
+            self._handle_invocation_timeout("resume timeout")
             self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_message_path], check=False)
             self._append_session_history(
@@ -983,6 +1199,7 @@ class AgentRunner:
                     "session_id": session_id,
                     "reason": "timeout",
                     "timeout_ms": effective_timeout_ms,
+                    "invocation_verified_dead": self._last_fatal_error is None,
                 }
             )
             return False
