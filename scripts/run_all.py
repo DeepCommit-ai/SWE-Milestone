@@ -219,6 +219,7 @@ def build_cmd(
     project_root: Path | None = None,
     build_failure_fail_closed: bool = False,
     runtime_policy: ResolvedRuntimePolicy | None = None,
+    skip_testbed_copy: bool = False,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
@@ -273,6 +274,8 @@ def build_cmd(
         cmd.append("--allow-partial-build-reports")
     if force:
         cmd.append("--force")
+    if skip_testbed_copy:
+        cmd.append("--skip-testbed-copy")
     return cmd, ("force" if force else "fresh")
 
 
@@ -303,6 +306,16 @@ def main():
         help="Bypass the quarantine coverage gate and launch even if a repo's "
              "anti-cheat policy is missing/incomplete. Scores from unprotected "
              "repos can be tainted by registry answer-fetch (see issue #12).",
+    )
+    parser.add_argument(
+        "--skip-testbed-copy", action="store_true",
+        help="Don't copy /testbed out of the container when the trial finishes. "
+             "Score-neutral: evaluation reads the per-milestone snapshots taken "
+             "during the run, and the published corpus never carries testbed/. "
+             "A Rust testbed is ~120GB per trial, so skipping it is the "
+             "difference between fitting a wide parallel launch on disk and not. "
+             "Forensics that need the agent's git history can still use the "
+             "container, which is kept unless --remove-container.",
     )
     args = parser.parse_args()
 
@@ -614,6 +627,7 @@ def main():
             reasoning_effort, agent_version, args.force,
             milestones, project_root, build_failure_fail_closed,
             runtime_policy=runtime_policy,
+            skip_testbed_copy=args.skip_testbed_copy,
         )
         # Fresh workers inherit env derived from the SAME resolved object that
         # selected their image. Resume workers inherit no live managed state and

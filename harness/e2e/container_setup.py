@@ -318,6 +318,39 @@ def inspect_docker_image_id(image_or_container: str, *, container: bool = False)
     return value
 
 
+def apt_install_script(packages: str) -> str:
+    """Shell that installs distro packages, resilient to an unreachable repo.
+
+    Two failure modes, both observed on real runs:
+
+    - The host blocks outbound port 80, so the Debian/Ubuntu archives have to be
+      reached over 443 (the sed rewrite below).
+    - A repo under ``sources.list.d`` is unreachable for the whole run. In this
+      benchmark that is normally a vendor repo (Azul JDK, NodeSource, ...) that
+      rides a CDN covered by a quarantine CIDR deny. ``apt-get update`` then
+      leaves the index baked into the image in place, and once upstream has
+      moved on the install dies with ``File has unexpected size`` — a stale-index
+      error, not a network error, so retrying the same command never helps.
+
+    Everything installed here (python3-minimal, iptables) comes from the distro
+    archive, so the fallback discards the stale lists and retries against
+    ``sources.list`` alone; vendor repos are irrelevant to these packages.
+    """
+    return f"""
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    sed -i -E 's@http://(archive\\.ubuntu\\.com|security\\.ubuntu\\.com|[a-z0-9.-]*\\.archive\\.ubuntu\\.com|deb\\.debian\\.org|security\\.debian\\.org)@https://\\1@g' "$f" 2>/dev/null || true
+done
+if apt-get update -qq && apt-get install -y -qq {packages}; then
+    exit 0
+fi
+rm -rf /var/lib/apt/lists/*
+apt-get -o Dir::Etc::SourceParts=/dev/null update -qq \\
+    && apt-get -o Dir::Etc::SourceParts=/dev/null install -y -qq {packages}
+exit $?
+"""
+
+
 class ContainerSetup:
     """Docker container initialization with fakeroot user and Claude credentials."""
 
@@ -1444,18 +1477,9 @@ test ! -w __GO_SHELL_ENV__
         logger.info("Python3 not found, attempting to install...")
 
         # Try apt-get (Debian/Ubuntu) - preserve stderr for debugging.
-        # Some hosts/datacenters block outbound port 80; rewrite Debian/Ubuntu
-        # apt sources to HTTPS so apt-get reaches the mirror via 443 instead.
-        install_script = """
+        install_script = f"""
 if command -v apt-get >/dev/null 2>&1; then
-    # Rewrite http://*.ubuntu.com / *.debian.org to https:// — port 443 is
-    # commonly reachable when 80 is blocked. Idempotent (sed -i in place).
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-        [ -f "$f" ] || continue
-        sed -i -E 's@http://(archive\\.ubuntu\\.com|security\\.ubuntu\\.com|[a-z0-9.-]*\\.archive\\.ubuntu\\.com|deb\\.debian\\.org|security\\.debian\\.org)@https://\\1@g' "$f" 2>/dev/null || true
-    done
-    apt-get update -qq && apt-get install -y -qq python3-minimal
-    exit $?
+{apt_install_script("python3-minimal")}
 elif command -v apk >/dev/null 2>&1; then
     apk add --no-cache python3
     exit $?
@@ -1888,13 +1912,7 @@ echo "Git history truncated successfully"
                 self.container_name,
                 "/bin/sh",
                 "-c",
-                (
-                    "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do "
-                    "[ -f \"$f\" ] || continue; "
-                    "sed -i -E 's@http://(archive\\.ubuntu\\.com|security\\.ubuntu\\.com|[a-z0-9.-]*\\.archive\\.ubuntu\\.com|deb\\.debian\\.org|security\\.debian\\.org)@https://\\1@g' \"$f\" 2>/dev/null || true; "
-                    "done; "
-                    "apt-get update -qq && apt-get install -y -qq iptables"
-                ),
+                apt_install_script("iptables"),
             ],
             capture_output=True,
             text=True,
