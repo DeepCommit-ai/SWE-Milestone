@@ -2883,13 +2883,18 @@ class PatchEvaluator:
             return False, "Compilation check timed out after 10 minutes"
 
         if result.returncode != 0:
-            output = result.stdout + result.stderr
+            # Keep the streams apart: concatenating them can weld the last
+            # stdout line onto the first stderr line and hide a diagnostic.
+            output = "\n".join(
+                part for part in (result.stdout, result.stderr) if part
+            )
 
-            # Check if this is just npm warnings (not actual errors)
-            # npm warnings should not cause compilation failure
-            if self._is_npm_warning_only(output):
-                print("✅ Compilation check passed (npm warnings only, no actual errors)")
-                return True, ""
+            # A nonzero exit is a build failure, full stop. There is no
+            # warning-text waiver: this gate used to treat "output has a
+            # warning and no line I recognize as an error" as success, which
+            # let a routine `npm WARN` from a chained frontend step waive real
+            # Go compiler errors (issue #21). Whether the output *looks*
+            # survivable is not evidence about whether the build ran.
 
             # Anchor diagnostics at a framework-aware fatal signature. Looking
             # for the substring "error" mistakes Go -v package progress such
@@ -2903,71 +2908,6 @@ class PatchEvaluator:
 
         print("✅ Compilation check passed")
         return True, ""
-
-    def _is_npm_warning_only(self, output: str) -> bool:
-        """Check if build output contains only npm warnings without real errors.
-
-        npm can exit with non-zero code for warnings (like peer dependency warnings)
-        but the build might still succeed. This method checks if the output contains
-        only warnings and not actual errors.
-
-        Args:
-            output: Combined stdout/stderr from build command
-
-        Returns:
-            True if output contains only warnings (no real errors)
-        """
-        lines = output.strip().split("\n")
-
-        # Patterns that indicate real errors (not just warnings)
-        error_patterns = [
-            "npm ERR!",  # npm actual error
-            "npm error",  # npm 7+ error format
-            ": error:",  # Go/TypeScript compiler error
-            "FAILED:",  # General failure
-            "Error:",  # General error (but not "error" in warning text)
-            "fatal error",  # Fatal errors
-            "compilation failed",  # Explicit compilation failure
-            "build failed",  # Explicit build failure
-            "cannot find module",  # Module not found
-            "syntax error",  # Syntax errors
-            "undefined:",  # Go undefined errors
-        ]
-
-        # Patterns that are just warnings (ok to ignore)
-        warning_patterns = [
-            "npm WARN",  # npm warning
-            "npm warn",  # npm 7+ warning format
-            "warning:",  # General warnings
-            "WARN ",  # General warn prefix
-        ]
-
-        has_real_error = False
-        has_warning = False
-
-        for line in lines:
-            line_lower = line.lower()
-
-            # Check for real errors
-            for pattern in error_patterns:
-                if pattern.lower() in line_lower:
-                    # Make sure it's not part of a warning message
-                    is_warning_line = any(wp.lower() in line_lower for wp in warning_patterns)
-                    if not is_warning_line:
-                        has_real_error = True
-                        break
-
-            # Check for warnings
-            for pattern in warning_patterns:
-                if pattern.lower() in line_lower:
-                    has_warning = True
-                    break
-
-            if has_real_error:
-                break
-
-        # Only treat as warning-only if we found warnings but no real errors
-        return has_warning and not has_real_error
 
     def _git_ls_tree(self, tag_name: str) -> Optional[Set[str]]:
         """List every file of a tag's tree inside the container (repo-relative).
@@ -6919,7 +6859,7 @@ Example:
         result.post_snapshot_script = meta.get("post_snapshot_script", "")
         result.post_snapshot_script_sha256 = meta.get("post_snapshot_script_sha256", "")
         result.post_snapshot_script_applied = meta.get("post_snapshot_script_applied", False)
-        guard = getattr(self, "_jest_ipc_guard", {}) or {}
+        guard = getattr(evaluator, "_jest_ipc_guard", {}) or {}
         result.jest_ipc_guard = guard.get("sha256", "") if guard.get("installed") else ""
         result.gt_test_graft_suffix = meta.get("gt_test_graft_suffix", "")
         result.gt_test_graft_removed_count = meta.get("gt_test_graft_removed_count", 0)
