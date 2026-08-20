@@ -44,6 +44,28 @@ from harness.test_runner.core.milestone_attempt import RunnerInfrastructureError
 logger = logging.getLogger("e2e.orchestrator")
 
 
+class SubmissionTagMoved(RuntimeError):
+    """An agent-impl tag moved between submission pickup and snapshot capture.
+
+    This is an EXPECTED race, not a failure: agents legitimately keep improving
+    a milestone after tagging it, and the debounce logic already anticipates
+    moves before pickup. Policy (#20): the stale capture is discarded and the
+    milestone re-enters debounce to wait for the new commit — the old commit is
+    never evaluated. Callers must catch this and recycle, never let it kill the
+    watcher thread.
+    """
+
+    def __init__(self, agent_tag: str, old_commit: str, new_commit: str, phase: str):
+        self.agent_tag = agent_tag
+        self.old_commit = old_commit
+        self.new_commit = new_commit
+        self.phase = phase  # "before-capture" | "during-capture"
+        super().__init__(
+            f"Submission tag moved {phase}: {agent_tag} "
+            f"was {old_commit or '?'}, now {new_commit or '?'}"
+        )
+
+
 def _is_transient_error(e: BaseException) -> bool:
     """Errors worth an evaluation retry: environment/infrastructure trouble,
     not deterministic evaluator bugs. InfrastructureFailureError (F-2a) is
@@ -1486,9 +1508,8 @@ class E2EOrchestrator:
             )
         current_tag_commit = self._get_tag_hash(agent_tag)
         if current_tag_commit != agent_tag_commit:
-            raise RuntimeError(
-                f"Submission tag moved during snapshot capture: {agent_tag} "
-                f"was {agent_tag_commit}, now {current_tag_commit or '?'}"
+            raise SubmissionTagMoved(
+                agent_tag, agent_tag_commit, current_tag_commit or "", "during-capture"
             )
 
         sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
@@ -1537,6 +1558,31 @@ class E2EOrchestrator:
                 f"lie outside the capture scope and will never reach the snapshot: {committed_out[:3]}"
             )
 
+    def _record_submission_discard(self, mid: str, moved: "SubmissionTagMoved") -> None:
+        """Persist the commit trail of a discarded capture (#20 audit).
+
+        Every observed commit of a submission tag must stay accountable: the
+        ones that get evaluated land in pending_evaluations/results, and the
+        ones abandoned because the tag moved mid-capture land here. Appends to
+        summary.json's top-level submission_history list (best-effort — the
+        audit trail must never break the recycle path).
+        """
+        entry = {
+            "milestone_id": mid,
+            "tag": moved.agent_tag,
+            "old_commit": moved.old_commit,
+            "new_commit": moved.new_commit,
+            "phase": moved.phase,
+            "action": "discarded_tag_moved",
+            "ts": time.time(),
+        }
+        try:
+            self._update_resume_state(
+                lambda summary: summary.setdefault("submission_history", []).append(entry)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist submission discard for {mid}: {e}")
+
     def _handle_submission(
         self,
         mid: str,
@@ -1564,8 +1610,9 @@ class E2EOrchestrator:
         agent_commit = expected_tag_hash or self._get_tag_hash(agent_tag)
         if not re.fullmatch(r"[0-9a-f]{40,64}", agent_commit):
             raise RuntimeError(f"Cannot resolve immutable commit for {agent_tag}")
-        if self._get_tag_hash(agent_tag) != agent_commit:
-            raise RuntimeError(f"Submission tag moved before capture: {agent_tag}")
+        current = self._get_tag_hash(agent_tag)
+        if current != agent_commit:
+            raise SubmissionTagMoved(agent_tag, agent_commit, current or "", "before-capture")
 
         # Mark as submitted immediately and update task queue
         # This removes the task from agent's view right away (silent mode)
@@ -1657,13 +1704,26 @@ class E2EOrchestrator:
 
         # Snapshot capture loss check (residue-prune spec §11.4-H): pipeline
         # loss is fail-closed; uncommitted/out-of-scope work remains diagnostic.
-        self._check_snapshot_capture_integrity(
-            agent_tag,
-            snapshot_file,
-            snapshot_paths,
-            manifest_overlay,
-            agent_commit,
-        )
+        try:
+            self._check_snapshot_capture_integrity(
+                agent_tag,
+                snapshot_file,
+                snapshot_paths,
+                manifest_overlay,
+                agent_commit,
+            )
+        except SubmissionTagMoved:
+            # The tag moved while the archive was being written (#20): this
+            # capture describes a commit the agent has already superseded.
+            # Remove the stale snapshot (and any sidecar) so nothing can
+            # mistake it for a valid capture, then let the caller recycle the
+            # milestone into debounce for the new commit. mark_submitted above
+            # is left in place: it is an idempotent set-add, the tag exists, and
+            # the task must not reappear in the agent's queue.
+            snapshot_file.unlink(missing_ok=True)
+            sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
+            sidecar.unlink(missing_ok=True)
+            raise
 
         # EARLY UNBLOCK MODE: If enabled, unlock dependent tasks immediately
         # after source extraction, without waiting for evaluation to complete.
