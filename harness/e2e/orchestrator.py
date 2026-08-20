@@ -1558,14 +1558,28 @@ class E2EOrchestrator:
                 f"lie outside the capture scope and will never reach the snapshot: {committed_out[:3]}"
             )
 
+    # Cap for the submission_history audit list in summary.json. Each discard
+    # rewrites the whole summary atomically, so an agent pathologically moving
+    # its tag during every capture must not grow the file without bound; the
+    # newest entries are the ones an audit needs.
+    _SUBMISSION_HISTORY_MAX = 500
+
     def _record_submission_discard(self, mid: str, moved: "SubmissionTagMoved") -> None:
         """Persist the commit trail of a discarded capture (#20 audit).
 
         Every observed commit of a submission tag must stay accountable: the
         ones that get evaluated land in pending_evaluations/results, and the
-        ones abandoned because the tag moved mid-capture land here. Appends to
-        summary.json's top-level submission_history list (best-effort — the
-        audit trail must never break the recycle path).
+        ones abandoned because the tag moved land here. Called BEFORE the stale
+        snapshot is deleted, so a crash between the two leaves an audited
+        orphan file rather than an unexplained disappearance.
+
+        The same atomic write drops the milestone's persisted pending_debounce
+        entry: it describes the OLD commit's observation window, and a crash
+        before the next scan re-primes it would otherwise resume with a stale
+        hash and an ancient first_seen — old enough for max_debounce_wait to
+        force-capture the new commit without a fresh debounce.
+
+        Best-effort — the audit trail must never break the recycle path.
         """
         entry = {
             "milestone_id": mid,
@@ -1576,10 +1590,20 @@ class E2EOrchestrator:
             "action": "discarded_tag_moved",
             "ts": time.time(),
         }
+
+        def _mutate(summary: dict) -> None:
+            history = summary.setdefault("submission_history", [])
+            history.append(entry)
+            if len(history) > self._SUBMISSION_HISTORY_MAX:
+                del history[: len(history) - self._SUBMISSION_HISTORY_MAX]
+            rs = summary.get("resume_state")
+            if isinstance(rs, dict):
+                pd = rs.get("pending_debounce")
+                if isinstance(pd, dict):
+                    pd.pop(mid, None)
+
         try:
-            self._update_resume_state(
-                lambda summary: summary.setdefault("submission_history", []).append(entry)
-            )
+            self._update_resume_state(_mutate)
         except Exception as e:
             logger.warning(f"Failed to persist submission discard for {mid}: {e}")
 
@@ -1612,7 +1636,9 @@ class E2EOrchestrator:
             raise RuntimeError(f"Cannot resolve immutable commit for {agent_tag}")
         current = self._get_tag_hash(agent_tag)
         if current != agent_commit:
-            raise SubmissionTagMoved(agent_tag, agent_commit, current or "", "before-capture")
+            moved = SubmissionTagMoved(agent_tag, agent_commit, current or "", "before-capture")
+            self._record_submission_discard(mid, moved)
+            raise moved
 
         # Mark as submitted immediately and update task queue
         # This removes the task from agent's view right away (silent mode)
@@ -1712,14 +1738,17 @@ class E2EOrchestrator:
                 manifest_overlay,
                 agent_commit,
             )
-        except SubmissionTagMoved:
+        except SubmissionTagMoved as moved:
             # The tag moved while the archive was being written (#20): this
             # capture describes a commit the agent has already superseded.
-            # Remove the stale snapshot (and any sidecar) so nothing can
-            # mistake it for a valid capture, then let the caller recycle the
+            # Record the audit entry FIRST (a crash between the two steps then
+            # leaves an audited orphan file, not an unexplained disappearance),
+            # then remove the stale snapshot (and any sidecar) so nothing can
+            # mistake it for a valid capture, and let the caller recycle the
             # milestone into debounce for the new commit. mark_submitted above
             # is left in place: it is an idempotent set-add, the tag exists, and
             # the task must not reappear in the agent's queue.
+            self._record_submission_discard(mid, moved)
             snapshot_file.unlink(missing_ok=True)
             sidecar = snapshot_file.parent / (snapshot_file.stem + ".integrity.json")
             sidecar.unlink(missing_ok=True)

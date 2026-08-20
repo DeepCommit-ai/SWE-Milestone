@@ -319,6 +319,10 @@ class E2ETrialRunner:
         self.watcher_stop_event = threading.Event()
         self.agent_runner = None
         self._trial_lock_file = None  # File handle for trial-level process lock
+        # #20: distinguishes a watcher thread that finished its loop from one
+        # that died — is_alive() alone cannot tell them apart.
+        self._watcher_exited_clean = False
+        self._watcher_dead_emitted = False
 
         # Event queue for watcher -> main loop communication
         # Event format: (event_type, milestone_id, dag_status, eval_status, error_msg)
@@ -524,18 +528,37 @@ class E2ETrialRunner:
         }
         self._save_resume_retry_state(state)
 
+    def _emit_watcher_dead(self, error_msg: str) -> None:
+        """Queue the watcher_dead event exactly once (#20).
+
+        Called from the escalation point INSIDE the loop (before the raise has
+        to travel through ThreadPoolExecutor.__exit__, whose implicit
+        shutdown(wait=True) can block on a long-running evaluation worker) and
+        from the thread-level handler as a catch-all for anything else.
+        """
+        if self._watcher_dead_emitted:
+            return
+        self._watcher_dead_emitted = True
+        try:
+            self.eval_event_queue.put(("watcher_dead", None, None, None, error_msg))
+        except Exception:
+            logger.error("Failed to enqueue watcher_dead event", exc_info=True)
+
     def start_watcher_thread(self):
         """Start watcher in background thread.
 
         Note: setup_environment() is now called synchronously in run() before this.
         This thread only monitors for agent tags and runs evaluations.
         """
+        self._watcher_exited_clean = False
+        self._watcher_dead_emitted = False
 
         def watcher_loop():
             try:
                 logger.info("Watcher thread started (monitoring for tags)")
                 # Run watcher loop (non-blocking version)
                 self._run_watcher_loop()
+                self._watcher_exited_clean = True
             except Exception as e:
                 logger.error(f"Watcher thread died: {e}", exc_info=True)
                 # #20: the main loop must never keep waiting on a dead watcher.
@@ -545,10 +568,7 @@ class E2ETrialRunner:
                 # unscored. Surface the death so the main loop aborts loudly;
                 # --resume-trial restarts the watcher and re-primes pending
                 # debounce/evaluations from resume_state.
-                try:
-                    self.eval_event_queue.put(("watcher_dead", None, None, None, str(e)))
-                except Exception:
-                    logger.error("Failed to enqueue watcher_dead event", exc_info=True)
+                self._emit_watcher_dead(str(e))
 
         self.watcher_thread = threading.Thread(target=watcher_loop, daemon=True)
         self.watcher_thread.start()
@@ -623,23 +643,33 @@ class E2ETrialRunner:
 
                 return True
 
-            def submit_with_boundary(mid: str, tag: str, attempt: int) -> tuple[bool, bool]:
+            def submit_with_boundary(mid: str, tag: str, attempt: int, expected_hash: str) -> tuple[bool, bool]:
                 """Run _handle_submission behind the #20 exception boundary.
+
+                expected_hash is the commit this caller OBSERVED (debounce-
+                stable hash, or the scan hash on the retry path). Passing it is
+                what arms the before-capture freshness check: without it the
+                handler resolves the tag itself and compares that value against
+                a second read of the same tag, so a move between debounce and
+                pickup was undetectable — the handler captured the NEW commit
+                while the caller recorded the OLD hash as evaluated.
 
                 Returns (success, tag_moved). No exception may escape into the
                 watcher loop: before this boundary existed, a tag moving during
                 snapshot capture killed the watcher thread permanently while
                 the agent kept tagging milestones nobody evaluated (issue #20).
 
-                Policy for a moved tag: the stale capture was already discarded
-                by the orchestrator; the OLD commit is never evaluated. The
-                caller just recycles the milestone so the next scan re-enters
-                debounce for the new commit. A move is an expected race with a
-                healthy agent, so it does NOT count toward submission_failures.
+                Policy for a moved tag: the orchestrator already discarded the
+                stale capture and recorded the audit entry; the OLD commit is
+                never evaluated. The caller just recycles the milestone so the
+                next scan re-enters debounce for the new commit. A move is an
+                expected race with a healthy agent, so it does NOT count toward
+                submission_failures.
                 """
                 try:
                     ok = self.orchestrator._handle_submission(
-                        mid, tag, executor, pending_futures, attempt=attempt
+                        mid, tag, executor, pending_futures, attempt=attempt,
+                        expected_tag_hash=expected_hash,
                     )
                     return ok, False
                 except SubmissionTagMoved as moved:
@@ -652,7 +682,6 @@ class E2ETrialRunner:
                         f"capture discarded, waiting for the new commit to stabilize"
                         + (f" — {discards} consecutive discarded captures" if discards >= 3 else "")
                     )
-                    self.orchestrator._record_submission_discard(mid, moved)
                     return False, True
                 except Exception:
                     logger.error(f"{mid}: submission failed with unexpected error", exc_info=True)
@@ -690,17 +719,16 @@ class E2ETrialRunner:
                         except Exception:
                             tag_hash = ""
 
-                    first_seen_ts = payload.get("first_seen_ts", payload.get("first_seen"))
-                    last_updated_ts = payload.get("last_updated_ts", payload.get("last_updated"))
-                    if not isinstance(first_seen_ts, (int, float)):
-                        first_seen_ts = priming_now
-                    if not isinstance(last_updated_ts, (int, float)):
-                        last_updated_ts = priming_now
-
-                    # Clamp to "now" to avoid negative durations if clocks differ
-                    first_seen_ts = min(float(first_seen_ts), priming_now)
-                    last_updated_ts = min(float(last_updated_ts), priming_now)
-                    last_updated_ts = max(last_updated_ts, first_seen_ts)
+                    # Resume restarts BOTH debounce clocks at priming time. The
+                    # persisted timestamps describe a dead process's observation
+                    # window: keeping the old first_seen let max_debounce_wait
+                    # force-capture a commit that had only been stable for
+                    # seconds — e.g. a crash mid-recycle (#20) resumes with the
+                    # stale hash, the first iteration flips it to the new one,
+                    # and the ancient first_seen immediately triggers the forced
+                    # path. Restarting costs at most one extra debounce window.
+                    first_seen_ts = priming_now
+                    last_updated_ts = priming_now
 
                     with self._state_lock:
                         pending_debounce[mid] = DebounceState(
@@ -962,7 +990,7 @@ class E2ETrialRunner:
                                 del pending_debounce[mid]
                                 self.running_evaluations.add((mid, 0))
                             logger.info(f"✓ {mid}: Debounce complete ({debounce_seconds}s stable), starting evaluation...")
-                            success, tag_moved = submit_with_boundary(mid, state.tag, 0)
+                            success, tag_moved = submit_with_boundary(mid, state.tag, 0, current_hash)
                             if success:
                                 evaluated_hashes[mid] = current_hash
                                 retry_counts[mid] = 0
@@ -997,7 +1025,7 @@ class E2ETrialRunner:
                             logger.warning(
                                 f"⚠️ {mid}: Max debounce wait ({max_debounce_wait}s) exceeded, forcing evaluation..."
                             )
-                            success, tag_moved = submit_with_boundary(mid, state.tag, 0)
+                            success, tag_moved = submit_with_boundary(mid, state.tag, 0, current_hash)
                             if success:
                                 evaluated_hashes[mid] = current_hash
                                 retry_counts[mid] = 0
@@ -1094,10 +1122,11 @@ class E2ETrialRunner:
                             )
                             with self._state_lock:
                                 self.running_evaluations.add((mid, attempt))
-                            success, tag_moved = submit_with_boundary(mid, tag, attempt)
+                            success, tag_moved = submit_with_boundary(mid, tag, attempt, current_hash)
                             if success:
                                 evaluated_hashes[mid] = current_hash
                                 tag_move_discards.pop(mid, None)
+                                submission_failures.pop(mid, None)
                             elif tag_moved:
                                 # Expected race (#20): revert the retry count without
                                 # charging a failure; the next scan sees the newer
@@ -1106,13 +1135,28 @@ class E2ETrialRunner:
                                     self.running_evaluations.discard((mid, attempt))
                                 retry_counts[mid] = current_retry_count
                             else:
-                                # Submission failed, clean up tracking and revert retry count
+                                # Submission failed, clean up tracking and revert retry count.
+                                # The failure DOES consume the shared submission budget:
+                                # without this, a persistently failing retry archive
+                                # relaunched every scan (~2s) forever, reaching neither
+                                # the retry limit nor watcher_dead (#20 review).
                                 with self._state_lock:
                                     self.running_evaluations.discard((mid, attempt))
                                 retry_counts[mid] = current_retry_count  # Revert retry count
-                                logger.warning(f"⚠️ {mid}: Retry submission failed, cleaned up running_evaluations")
+                                submission_failures[mid] = submission_failures.get(mid, 0) + 1
+                                if submission_failures[mid] >= max_retries:
+                                    evaluated_hashes[mid] = current_hash
+                                    logger.error(
+                                        f"⛔ {mid}: Max submission failures ({max_retries}) reached "
+                                        f"on retry, giving up on this hash"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ {mid}: Retry submission failed "
+                                        f"({submission_failures[mid]}/{max_retries}), cleaned up running_evaluations"
+                                    )
 
-                except Exception:
+                except Exception as loop_exc:
                     consecutive_loop_errors += 1
                     logger.error(
                         f"Watcher iteration failed ({consecutive_loop_errors}/{WATCHER_MAX_CONSECUTIVE_ERRORS}); "
@@ -1120,6 +1164,13 @@ class E2ETrialRunner:
                         exc_info=True,
                     )
                     if consecutive_loop_errors >= WATCHER_MAX_CONSECUTIVE_ERRORS:
+                        # Emit BEFORE raising: the raise still has to travel
+                        # through the executor's shutdown(wait=True), which can
+                        # block for as long as a running evaluation takes — the
+                        # main loop must learn about the death now, not then.
+                        self._emit_watcher_dead(
+                            f"{consecutive_loop_errors} consecutive iteration failures; last: {loop_exc}"
+                        )
                         raise
                 else:
                     consecutive_loop_errors = 0
@@ -1290,6 +1341,19 @@ class E2ETrialRunner:
         # - pending_debounce: tags waiting for hash to stabilize
         # - running_evaluations: evaluations in progress (important for early unlock mode!)
         while True:
+            # #20 liveness backstop: the event can arrive after this method's
+            # initial drain, and the state checks below can return (new_tasks /
+            # agent_incomplete) with the death still queued — burning recovery
+            # rounds on a dead watcher. A thread that exited without setting
+            # _watcher_exited_clean is dead regardless of event delivery.
+            if (
+                self.watcher_thread is not None
+                and not self.watcher_thread.is_alive()
+                and not self._watcher_exited_clean
+            ):
+                self._drain_pending_events()  # consume the queued event, if any
+                return "watcher_dead"
+
             with self._state_lock:
                 has_pending = bool(dag.submitted_milestones or self.pending_debounce or self.running_evaluations)
 
@@ -1855,7 +1919,11 @@ class E2ETrialRunner:
         # Stop watcher
         self.watcher_stop_event.set()
 
-        if dag.is_done():
+        # #20: a dead watcher means in-flight evaluation results were never
+        # processed into the summary, so a "done" DAG (early-unblock marks
+        # milestones complete before their evaluations land) must NOT be
+        # reported as a successful trial — resume reconciles the results.
+        if dag.is_done() and not watcher_died:
             _set_last_run_summary("all_done")
             logger.info("=" * 70)
             logger.info("E2E Trial COMPLETED")
