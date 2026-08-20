@@ -187,9 +187,45 @@ show **no digest changes at all**, proving the release touched no environment.
 benchmark versions and never bumps one. Only the release commit is tagged. Do
 not read "harness has no tag for vX.Y.Z" as a version inconsistency.
 
+### Hotfix: folding a small fix into the current version
+
+The rules above optimise for a large, anonymous audience re-deriving results
+from a version label. This benchmark's audience is small and mostly us, so
+there is a deliberate escape hatch:
+
+> **A maintainer may fold a small fix into the *current* version instead of
+> cutting a new one** — move the version tag forward over it, in both repos, and
+> keep the same `BENCHMARK_VERSION`. Prefer this when the alternative is a
+> version number nobody needed.
+
+This is the one sanctioned exception to Immutability #1 below, and it is
+deliberately narrow — it moves a tag that has already been published, so:
+
+- **Only the current version.** Never move a tag that an older version already
+  superseded; those are closed.
+- **Images stay put.** Folding keeps `BENCHMARK_VERSION` unchanged, so the
+  `:vX.Y.Z` image tags and their digest manifest are untouched. If a fix
+  requires new image bytes it is not a hotfix — cut a patch and follow
+  [image-patching.md](image-patching.md).
+- **Record it.** A fix folded this way is invisible in the version number, so
+  the release notes for that version get a line saying what moved and why. For
+  a spec change, `docs/spec-debt.md` still applies — folding does not remove
+  the obligation, it only skips the version bump.
+- **Say it out loud when it matters.** Anyone who ran against the pre-fold tag
+  has results the current tag no longer reproduces. That is the cost being
+  accepted. Where those results are published, label them with what they
+  actually ran (a commit SHA, not just the tag).
+
+What this buys: no version churn for a one-line spec repair, no 115-image retag
+for something that never touched an image. What it costs: within a version, the
+tag alone stops being a unique content identity — the commit SHA is. The trial
+metadata already records that SHA (`data_version.commit`), so a fold never makes
+an individual trial unattributable, only the *label* less precise.
+
 ## Immutability
 
-1. Published version tags are read-only: never overwrite, never delete.
+1. Published version tags are read-only: never overwrite, never delete —
+   except for the maintainer hotfix fold described above.
 2. **Retag, never rebuild.** Builds are not reproducible; unchanged images
    keep their old digest under the new tag (a free pointer op — pushing a
    retag uploads 0 bytes).
