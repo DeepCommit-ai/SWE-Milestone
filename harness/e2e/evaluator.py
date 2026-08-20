@@ -1397,6 +1397,9 @@ class EvaluationResult:
     # Set when test output shows the environment (docker/testcontainers/...)
     # broke the run — these failures are not the agent's.
     infrastructure_failure: str = ""
+    # Worker-side IPC guard identity (path + sha256), so a promoted score
+    # records whether the run could report suites whose results carry cycles.
+    jest_ipc_guard: str = ""
     # Hard validity gate: zero executed tests cannot be graded when the
     # milestone classification contains required tests.
     infra_invalid_reason: str = ""
@@ -1539,6 +1542,7 @@ class EvaluationResult:
         result["evaluation_environment"] = {
             "post_snapshot_script": self.post_snapshot_script,
             "post_snapshot_script_sha256": self.post_snapshot_script_sha256,
+            "jest_ipc_guard": self.jest_ipc_guard,
             "post_snapshot_script_applied": self.post_snapshot_script_applied,
             "gt_test_graft_suffix": self.gt_test_graft_suffix,
             "gt_test_graft_removed_count": self.gt_test_graft_removed_count,
@@ -2412,6 +2416,10 @@ class PatchEvaluator:
         self._manifest_overlay: Optional[ManifestOverlay] = None
         self._go_manifest_inventory: Optional[FrozenSet[str]] = None
         self._go_exec_env: Dict[str, str] = {}
+        # Env applied to every in-container exec regardless of ecosystem.
+        # Kept separate from _go_exec_env, which is rebuilt/cleared per run.
+        self._extra_exec_env: Dict[str, str] = {}
+        self._jest_ipc_guard: Dict[str, Any] = {"installed": False}
         self._go_test_import_owners: Dict[str, Set[str]] = {}
         self._baseline_required_test_counts = {
             "fail_to_pass": 0,
@@ -2694,6 +2702,7 @@ class PatchEvaluator:
 
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         try:
+            self._install_jest_ipc_guard()
             self._verify_evaluator_go_toolchain()
             self._verify_evaluator_cache_policy()
         except Exception:
@@ -2706,6 +2715,82 @@ class PatchEvaluator:
             )
             raise
         print(f"Started container: {self.container_name} (image: {self.docker_image}, cpus: {self.docker_cpus})")
+
+    JEST_IPC_GUARD_PATH = "/opt/swe-milestone/jest_ipc_guard.js"
+
+    def _install_jest_ipc_guard(self) -> None:
+        """Install the worker-side IPC guard for jest-based repos.
+
+        jest-runner configures its worker pool with ``serialization: 'json'``,
+        so a result carrying a cycle makes the *worker's own* ``process.send``
+        throw. jest retries four times and reports the suite as failed-to-run
+        with zero assertions — its tests are silently absent from the report
+        and score as non-achievements even though they ran. Measured on
+        element-web: 390 of 595 published cells carry that signature.
+
+        The guard is a ``node --require`` preload, so it runs inside every
+        worker before jest does; it rewrites only payloads that genuinely
+        cannot be serialized. A main-process load is a no-op (no
+        ``process.send``), and a clean run is byte-identical with and without
+        it. Nothing here judges a test — it only lets a finished result reach
+        the parent.
+
+        Skipped without node. Never fatal: a container that cannot take the
+        guard still evaluates exactly as before.
+        """
+        asset = Path(__file__).resolve().parent / "assets" / "jest_ipc_guard.js"
+        if not asset.exists():
+            return
+        probe = subprocess.run(
+            ["docker", "exec", self.container_name, "sh", "-c", "command -v node"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0 or not probe.stdout.strip():
+            return  # not a node ecosystem
+        mk = subprocess.run(
+            ["docker", "exec", self.container_name, "mkdir", "-p",
+             str(Path(self.JEST_IPC_GUARD_PATH).parent)],
+            capture_output=True, text=True,
+        )
+        cp = subprocess.run(
+            ["docker", "cp", str(asset),
+             f"{self.container_name}:{self.JEST_IPC_GUARD_PATH}"],
+            capture_output=True, text=True,
+        )
+        if mk.returncode != 0 or cp.returncode != 0:
+            print("⚠️  jest IPC guard not installed "
+                  f"({(cp.stderr or mk.stderr or '').strip()[:120]}); "
+                  "evaluation continues unguarded")
+            return
+        # Append, never replace: images set their own NODE_OPTIONS (element
+        # pins --max-old-space-size=4096) and clobbering it would trade this
+        # bug for a real OOM.
+        existing = subprocess.run(
+            ["docker", "exec", self.container_name, "printenv", "NODE_OPTIONS"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        require = f"--require={self.JEST_IPC_GUARD_PATH}"
+        self._extra_exec_env["NODE_OPTIONS"] = (
+            f"{existing} {require}".strip() if existing else require
+        )
+        self._jest_ipc_guard = {
+            "installed": True,
+            "path": self.JEST_IPC_GUARD_PATH,
+            "sha256": hashlib.sha256(asset.read_bytes()).hexdigest(),
+            "node_options": self._extra_exec_env["NODE_OPTIONS"],
+        }
+        print(f"🛡️  jest IPC guard installed ({self.JEST_IPC_GUARD_PATH})")
+
+    def _exec_env(self) -> Dict[str, str]:
+        """Env for in-container execs: ecosystem-neutral first, Go last.
+
+        Read defensively: tests build evaluators that bypass ``__init__``, and
+        a missing attribute must degrade to "no extra env", never raise.
+        """
+        return {
+            **getattr(self, "_extra_exec_env", {}),
+            **getattr(self, "_go_exec_env", {}),
+        }
 
     def _checkout_to_tag(self, tag_suffix: str, clean: bool = True) -> Tuple[bool, str]:
         """Checkout to a specific milestone tag in the container.
@@ -2785,7 +2870,7 @@ class PatchEvaluator:
         print(f"🔨 Checking compilation with: {build_command[:60]}...")
         env_args = [
             item
-            for key, value in getattr(self, "_go_exec_env", {}).items()
+            for key, value in self._exec_env().items()
             for item in ("-e", f"{key}={value}")
         ]
         compile_cmd = [
@@ -6019,7 +6104,7 @@ fi
                 except subprocess.TimeoutExpired:
                     return -1, "", f"Command timed out after {timeout} seconds"
 
-        runner = _ExecRunner(self.container_name, self._go_exec_env)
+        runner = _ExecRunner(self.container_name, self._exec_env())
         build_failure_diagnostics: List[str] = []
         pre_ok, pre_error = self._verify_go_evaluation_state(
             "compilation pre-test gate"
@@ -6834,6 +6919,8 @@ Example:
         result.post_snapshot_script = meta.get("post_snapshot_script", "")
         result.post_snapshot_script_sha256 = meta.get("post_snapshot_script_sha256", "")
         result.post_snapshot_script_applied = meta.get("post_snapshot_script_applied", False)
+        guard = getattr(self, "_jest_ipc_guard", {}) or {}
+        result.jest_ipc_guard = guard.get("sha256", "") if guard.get("installed") else ""
         result.gt_test_graft_suffix = meta.get("gt_test_graft_suffix", "")
         result.gt_test_graft_removed_count = meta.get("gt_test_graft_removed_count", 0)
         result.gt_test_graft_restored_count = meta.get("gt_test_graft_restored_count", 0)
