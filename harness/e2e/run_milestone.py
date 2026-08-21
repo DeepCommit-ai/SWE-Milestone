@@ -595,6 +595,18 @@ class MilestoneRunner:
                 # Wait before retry (unless it's the last attempt)
                 if attempt < max_retries:
                     wait_seconds = retry_delay
+                    if self.agent_runner._last_fatal_error:
+                        # #19: a timed-out invocation whose in-container kill
+                        # could not be verified is still running. Retrying
+                        # would launch a second agent against the same
+                        # /testbed — the exact concurrency the kill-and-verify
+                        # contract exists to prevent. No retry.
+                        logger.error(
+                            "⛔ Fatal: %s — aborting retries.",
+                            self.agent_runner._last_fatal_error,
+                        )
+                        last_error = self.agent_runner._last_fatal_error
+                        break
                     if self.agent_runner._last_model_unavailable:
                         hint = self.agent_runner._last_model_hint or (
                             f"Repeated 500 errors observed for model '{self.model}'. "
