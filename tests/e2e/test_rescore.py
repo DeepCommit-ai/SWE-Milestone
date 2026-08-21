@@ -1,7 +1,12 @@
-"""Re-tally tool (issue #24): replay selection, envelope patching, idempotence."""
+"""Re-tally tool (issue #24): replay selection, eras, envelope patching, locks,
+input pinning, idempotence."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from harness.e2e.evaluator import (
     SCORING_ID_POLICY_IDENTITY,
@@ -10,7 +15,7 @@ from harness.e2e.evaluator import (
     EvaluationResult,
     tally_scoring,
 )
-from harness.e2e.rescore import rescore_cell, run_campaign
+from harness.e2e.rescore import ERA_AGNOSTIC, rescore_cell, run_campaign
 from harness.utils.test_id_normalizer import TestIdNormalizer
 
 PY_A = "sklearn/tests/test_pipeline.py::test_routing_passed_metadata_not_supported[decision_function]"
@@ -18,6 +23,7 @@ PY_B = (
     "sklearn/semi_supervised/tests/test_self_training.py"
     "::test_routing_passed_metadata_not_supported[decision_function]"
 )
+PY_C = "sklearn/tests/test_other.py::test_unrelated"
 
 
 def _payload(passed=(), failed=()):
@@ -75,10 +81,13 @@ def _stored_envelope(payload, baseline, policy, **extra):
     return env
 
 
-def _make_world(tmp_path, payload, baseline, stored_policy=SCORING_ID_POLICY_LEGACY, pid="123", extra=None):
+def _make_world(tmp_path, payload, baseline, stored_policy=SCORING_ID_POLICY_LEGACY, pid="123",
+                extra=None, filter_list=None):
     data_root = tmp_path / "data" / "repo_x"
     (data_root / "test_results" / "M1").mkdir(parents=True)
     (data_root / "test_results" / "M1" / "M1_classification.json").write_text(json.dumps(baseline))
+    if filter_list is not None:
+        (data_root / "test_results" / "M1" / "M1_filter_list.json").write_text(json.dumps(filter_list))
     (data_root / "dockerfiles" / "M1").mkdir(parents=True)
     (data_root / "dockerfiles" / "M1" / "test_config.json").write_text(
         json.dumps([{"name": "default", "test_cmd": "python -m pytest", "framework": "pytest"}])
@@ -88,82 +97,119 @@ def _make_world(tmp_path, payload, baseline, stored_policy=SCORING_ID_POLICY_LEG
     art.mkdir(parents=True)
     (art / "eval_summary.json").write_text(json.dumps(payload))
     (art / "eval.json").write_text(
-        json.dumps({"tests": [{"nodeid": n} for n in payload["results"]["passed"]]})
+        json.dumps({"tests": [{"nodeid": n} for n in payload["results"]["passed"]]
+                    + [{"nodeid": n["nodeid"]} for n in payload["results"]["failed"]]})
     )
     env = _stored_envelope(payload, baseline, stored_policy, **(extra or {}))
     (cell / "evaluation_result.json").write_text(json.dumps(env, indent=2))
     return data_root, cell
 
 
-def _run(cell, data_root, mirror):
+def _run(cell, data_root, mirror, **kw):
     return rescore_cell(
         cell,
         data_root=data_root,
         repo_config={},
         repo_config_sha256="",
         mirror_dir=mirror,
-        scratch=mirror.parent / "scratch" if mirror else cell.parent.parent / "scratch",
+        scratch=(mirror.parent if mirror else cell.parent.parent) / "scratch",
+        **kw,
     )
 
 
 BASELINE = {"stable_classification": {"pass_to_pass": [PY_A], "fail_to_fail": [PY_B]}}
+# A universe with a collision whose outcomes disagree, so the two legacy
+# scorers give different stored results (era is decidable).
+COLLIDING = _payload(passed=[PY_A], failed=[PY_B])
 
 
 def test_replayable_cell_flips_false_positive_regression(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     stored = json.loads((cell / "evaluation_result.json").read_text())
     assert stored["resolved"] is False  # legacy fail-close charged PY_A
 
     rec = _run(cell, data_root, tmp_path / "out")
     assert rec.status == "replayable"
     assert rec.era == "fail-close"
+    assert rec.frozen is False
     assert rec.selected_payload == "artifacts/123/eval_summary.json"
     assert rec.delta["p2p_failure"] == {"before": 1, "after": 0}
     assert rec.delta["resolved"] == {"before": False, "after": True}
     assert rec.changed_ids["p2p_failure"]["lost"] == [PY_A]
     assert rec.invariant_failures == []
+    assert rec.mirrored is True
+    assert rec.inputs["test_config_sha256"]
 
-    mirrored = json.loads((tmp_path / "out" / "repo_x" / "trial_1" / "M1" / "evaluation_result.json").read_text())
+    out_cell = tmp_path / "out" / "repo_x" / "trial_1" / "M1"
+    mirrored = json.loads((out_cell / "evaluation_result.json").read_text())
     assert mirrored["resolved"] is True
     assert mirrored["tests_status"]["PASS_TO_PASS"]["failure"] == []
+    assert mirrored["tests_status"]["NONE_TO_PASS"]["missing"] == 0
     assert mirrored["extra_diagnostic"] == "keep me"
     assert mirrored["scoring_identity"]["policy"] == SCORING_ID_POLICY_IDENTITY
     assert mirrored["scoring_identity"]["payload_path"] == "artifacts/123/eval_summary.json"
     assert mirrored["scoring_identity"]["retally"]["replay_era"] == "fail-close"
+    assert mirrored["scoring_identity"]["match_trace"]["pass_to_pass"] == {"exact": 1}
     for key in stored:
         if key in ("resolved", "tests_status", "test_summary"):
             continue
         assert mirrored[key] == stored[key], key
-    manifest = json.loads((tmp_path / "out" / "repo_x" / "trial_1" / "M1" / "rescore_manifest.json").read_text())
+    assert (out_cell / "artifacts" / "123" / "eval_summary.json").exists()
+    manifest = json.loads((out_cell / "rescore_manifest.json").read_text())
     assert manifest["payload_sha256"] == rec.selected_sha256
-    assert manifest["classification_sha256"]
+    assert manifest["classification_sha256"] and manifest["test_config_sha256"]
+    assert manifest["replay_policies_reproducing"] == [SCORING_ID_POLICY_LEGACY]
+    notes = (out_cell / "PROMOTION_NOTES.md").read_text()
+    assert "summary.json" in notes and "feedback_report.md" in notes and "artifacts.tar.gz" in notes
 
 
-def test_retally_is_idempotent(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+def test_retally_is_repeatable_and_then_a_verified_noop(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     _run(cell, data_root, tmp_path / "out1")
     _run(cell, data_root, tmp_path / "out2")
     a = (tmp_path / "out1" / "repo_x" / "trial_1" / "M1" / "evaluation_result.json").read_bytes()
     b = (tmp_path / "out2" / "repo_x" / "trial_1" / "M1" / "evaluation_result.json").read_bytes()
     assert a == b
 
+    # Re-score the corrected output itself (as a promoted cell would look).
+    promoted = tmp_path / "log" / "repo_x" / "e2e_trial" / "trial_1" / "evaluation" / "M1"
+    shutil.copy(tmp_path / "out1" / "repo_x" / "trial_1" / "M1" / "evaluation_result.json",
+                promoted / "evaluation_result.json")
+    rec = _run(promoted, data_root, tmp_path / "out3")
+    assert rec.status == "already-identity"
+    assert rec.delta == {}
+    assert not (tmp_path / "out3" / "repo_x").exists()
 
-def test_pass_wins_era_is_detected(tmp_path):
-    # Stored under the pre-2026-07-15 last-write aggregation: the namesake pass
-    # overwrote the failure, so the stored cell looks resolved.
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE, stored_policy=SCORING_ID_POLICY_LEGACY_PASSWINS)
-    rec = _run(cell, data_root, None)
+
+def test_era_agnostic_cell_is_not_frozen(tmp_path):
+    # No disagreeing collision: both legacy scorers reproduce the stored result.
+    payload = _payload(passed=[PY_C], failed=[PY_B])
+    data_root, cell = _make_world(tmp_path, payload, {"stable_classification": {"pass_to_pass": [PY_A, PY_C]}})
+    rec = _run(cell, data_root, tmp_path / "out")
+    assert rec.status == "replayable"
+    assert rec.era == ERA_AGNOSTIC
+    assert rec.frozen is False
+    # PY_A never ran; legacy credited it via namesake PY_B's failure... as a
+    # regression, identity counts it missing.
+    assert rec.delta["p2p_failure"] == {"before": 1, "after": 0}
+    assert rec.delta["p2p_missing"] == {"before": 0, "after": 1}
+
+
+def test_pass_wins_era_is_detected_and_frozen_by_default(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE, stored_policy=SCORING_ID_POLICY_LEGACY_PASSWINS)
+    rec = _run(cell, data_root, tmp_path / "out")
     assert rec.status == "replayable"
     assert rec.era == "pass-wins"
-    assert rec.delta == {}  # identity agrees with the lucky old value
+    assert rec.frozen is True
+    assert rec.mirrored is False
+    assert rec.delta == {}  # identity agrees with the lucky old value here
+    assert not (tmp_path / "out" / "repo_x").exists()
+    rec2 = _run(cell, data_root, tmp_path / "out2", include_pass_wins=True)
+    assert rec2.frozen is False and rec2.mirrored is True
 
 
 def test_no_payload_is_non_replayable(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     for p in (cell / "artifacts").rglob("*"):
         if p.is_file():
             p.unlink()
@@ -172,9 +218,19 @@ def test_no_payload_is_non_replayable(tmp_path):
     assert rec.reason == "no-payload"
 
 
+def test_unreadable_candidate_is_non_replayable(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    broken = cell / "artifacts" / "999"
+    broken.mkdir()
+    (broken / "eval_summary.json").write_text("{not json")
+    rec = _run(cell, data_root, None)
+    assert rec.status == "non-replayable"
+    assert rec.reason == "unreadable-candidate"
+    assert rec.candidates_unreadable == 1
+
+
 def test_stored_result_that_no_candidate_reproduces_is_non_replayable(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     env = json.loads((cell / "evaluation_result.json").read_text())
     env["tests_status"]["PASS_TO_PASS"]["missing"] = 99
     (cell / "evaluation_result.json").write_text(json.dumps(env))
@@ -185,21 +241,38 @@ def test_stored_result_that_no_candidate_reproduces_is_non_replayable(tmp_path):
 
 
 def test_two_reproducing_candidates_are_ambiguous(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     second = cell / "artifacts" / "456"
     second.mkdir()
-    (second / "eval_summary.json").write_text(json.dumps(payload))
+    (second / "eval_summary.json").write_text(json.dumps(COLLIDING))
     rec = _run(cell, data_root, None)
     assert rec.status == "non-replayable"
     assert rec.reason == "ambiguous-candidates"
     assert rec.candidates == 2
 
 
+def test_same_path_different_bytes_in_tarball_is_a_distinct_candidate(tmp_path):
+    import tarfile
+
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    # Tarball carries a *different* payload under the same relative path.
+    other = _payload(passed=[PY_A, PY_C], failed=[PY_B])
+    stage = tmp_path / "stage" / "artifacts" / "123"
+    stage.mkdir(parents=True)
+    (stage / "eval_summary.json").write_text(json.dumps(other))
+    with tarfile.open(cell / "artifacts.tar.gz", "w:gz") as tf:
+        tf.add(stage, arcname="artifacts/123")
+    rec = _run(cell, data_root, None)
+    assert rec.candidates == 2
+    # Only the on-disk copy reproduces the stored result, so the cell is still
+    # uniquely replayable — but the divergent tar copy was seen, not shadowed.
+    assert rec.status == "replayable"
+    assert rec.selected_payload == "artifacts/123/eval_summary.json"
+
+
 def test_resolution_locks_in_envelope_are_preserved(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
     data_root, cell = _make_world(
-        tmp_path, payload, BASELINE, extra={"infrastructure_failure": "docker daemon died"}
+        tmp_path, COLLIDING, BASELINE, extra={"infrastructure_failure": "docker daemon died"}
     )
     rec = _run(cell, data_root, tmp_path / "out")
     assert rec.status == "replayable"
@@ -210,9 +283,72 @@ def test_resolution_locks_in_envelope_are_preserved(tmp_path):
     assert mirrored["infrastructure_failure"] == "docker daemon died"
 
 
+def test_filtered_result_keeps_locks_and_n2p_missing(tmp_path):
+    baseline = {"stable_classification": {"pass_to_pass": [PY_A, PY_C], "none_to_pass": [PY_B]}}
+    payload = _payload(passed=[PY_A])  # PY_C never ran; PY_B never ran
+    filter_list = {"invalid_pass_to_pass": [PY_C], "invalid_fail_to_pass": [], "invalid_none_to_pass": []}
+    data_root, cell = _make_world(
+        tmp_path, payload, baseline, extra={"infrastructure_failure": "docker daemon died"},
+        filter_list=filter_list,
+    )
+    rec = _run(cell, data_root, tmp_path / "out")
+    assert rec.status == "replayable" and rec.filtered_regenerated is True
+    out_cell = tmp_path / "out" / "repo_x" / "trial_1" / "M1"
+    filtered = json.loads((out_cell / "evaluation_result_filtered.json").read_text())
+    # Filtering removed the only P2P problem, but the infrastructure lock must
+    # still hold, and the N2P test that never ran stays counted as missing.
+    assert filtered["resolved"] is False
+    assert filtered["scoring_identity"]["filtered_locks_reapplied"] is True
+    assert filtered["tests_status"]["NONE_TO_PASS"]["missing"] == 1
+    assert filtered["test_summary"]["none_to_pass_missing"] == 1
+
+
+def test_filtered_result_needs_the_selected_eval_json(tmp_path):
+    baseline = {"stable_classification": {"pass_to_pass": [PY_A, PY_C]}}
+    filter_list = {"invalid_pass_to_pass": [PY_C], "invalid_fail_to_pass": [], "invalid_none_to_pass": []}
+    data_root, cell = _make_world(tmp_path, _payload(passed=[PY_A]), baseline, filter_list=filter_list)
+    (cell / "artifacts" / "123" / "eval.json").unlink()
+    rec = _run(cell, data_root, tmp_path / "out")
+    assert rec.status == "replayable" and rec.mirrored is True
+    assert rec.filtered_regenerated is False
+    assert rec.filtered_reason == "selected-eval.json-unavailable"
+    assert any("filtered" in s for s in rec.manifest["stale_after_retally"])
+
+
+def test_repo_config_drift_is_non_replayable(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    env = json.loads((cell / "evaluation_result.json").read_text())
+    env["evaluation_environment"]["repo_config_sha256"] = "deadbeef"
+    env["evaluation_environment"]["repo_config_binding_mode"] = "bound"
+    (cell / "evaluation_result.json").write_text(json.dumps(env))
+    rec = rescore_cell(cell, data_root=data_root, repo_config={}, repo_config_sha256="cafebabe",
+                       mirror_dir=None, scratch=tmp_path / "scratch")
+    assert rec.status == "non-replayable"
+    assert rec.reason == "repo-config-drift"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_classification_drift_against_trial_data_commit_is_non_replayable(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    subprocess.run(["git", "init", "-q"], cwd=data_root, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], cwd=data_root, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "pin"], cwd=data_root, check=True)
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=data_root, capture_output=True, text=True, check=True).stdout.strip()
+    trial_dir = cell.parent.parent
+    (trial_dir / "trial_metadata.json").write_text(json.dumps({"data_version": {"commit": commit}}))
+    rec = _run(cell, data_root, None)
+    assert rec.status == "replayable"
+    assert rec.inputs["classification_pin"]["status"] == "match"
+    # Now the classification on disk changes after the trial's pinned commit.
+    cls = data_root / "test_results" / "M1" / "M1_classification.json"
+    cls.write_text(json.dumps({"stable_classification": {"pass_to_pass": [PY_A, PY_C], "fail_to_fail": [PY_B]}}))
+    rec2 = _run(cell, data_root, None)
+    assert rec2.status == "non-replayable"
+    assert rec2.reason == "classification-drift"
+
+
 def test_retry_directory_uses_base_milestone_classification(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     retry = cell.parent / "M1-retry1"
     cell.rename(retry)
     rec = _run(retry, data_root, None)
@@ -221,10 +357,10 @@ def test_retry_directory_uses_base_milestone_classification(tmp_path):
 
 
 def test_campaign_writes_records_and_summary(tmp_path):
-    payload = _payload(passed=[PY_A], failed=[PY_B])
-    data_root, cell = _make_world(tmp_path, payload, BASELINE)
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     summary = run_campaign(data_root=data_root, cells=[cell], out_dir=tmp_path / "campaign", mirror=False)
     assert summary["cells"] == 1 and summary["replayable"] == 1
+    assert summary["era"]["fail-close"] == 1
     assert summary["resolved_false_to_true"] == ["trial_1/M1"]
     assert summary["delta_totals"]["p2p_failure"] == -1
     assert (tmp_path / "campaign" / "records.jsonl").exists()

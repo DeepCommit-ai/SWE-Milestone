@@ -29,18 +29,40 @@ Consequences for this spec:
    blockers 1 and 2 from the critical path; blocker 3 (re-tally provenance) remains and is
    addressed by replay selection (7.1).
 2. **Scorer revision is part of provenance**: "the old scorer" is not one scorer (pass-wins era
-   vs fail-close era). Replay selection must pin the scorer revision that produced a cell, and
-   cells from a superseded aggregation era are **frozen, not re-scored** unless explicitly
-   decided otherwise.
-3. **Side-effect check added to acceptance**: with prefixes restored, `_absent_suites_from_missing_ids()`
-   can start firing for pytest/jest/cargo where it previously saw no package; the impact run must
-   report any change in `absent_suites` / `partial_test_universe` and treat it as a blocker to
-   promotion until explained.
+   vs fail-close era). The re-tally tool replays both: `legacy-prefix-drop` (the scorer on main
+   before the fix) and `legacy-prefix-drop-passwins` (the scorer before 0a779f0: prefix-dropping
+   key for every framework including Java, last-write aggregation, no module-less fallback). A
+   cell reproducible only under pass-wins is labelled `pass-wins` and **frozen by default** (report
+   only, no mirror output; `--include-pass-wins` overrides); reproducible under both is
+   `era-agnostic` (no aggregation-sensitive collision, safe to re-tally); only under the current
+   legacy key is `fail-close`. Era is thus derived from which scorer reproduces the stored
+   projection, not guessed from outcomes.
+3. **Absent-suite inference is unaffected** by restored prefixes: `_absent_suites_from_missing_ids()`
+   is Ginkgo-only and the Ginkgo key is unchanged. (An earlier draft of this section claimed a
+   possible side effect; the review disproved it.) The re-tally preserves the stored
+   `absent_suites` / `partial_test_universe` and only compares `absent_suites` when the stored
+   envelope recorded the field.
 4. **Publication policy proposal**: correct the 3 current-board misjudgments through the
    documented promotion procedure; freeze pass-wins-era cells; record the full 427-cell delta and
    schedule the remaining corrections together with v1.0.2's grading-semantics change set, so
    #24 lands **before** any v1.0.2 re-evaluation (#23/element) — the fix is a prerequisite, not a
    follow-up.
+
+5. **What the re-tally tool does and does not regenerate** (implementation review, 2026-08-21):
+   `mirror` mode writes `evaluation_result.json`, `evaluation_result_filtered.json` (only when the
+   selected artifact's `eval.json` is available; locks re-applied after filtering, N2P missing
+   re-derived), a copy of the selected artifact directory, `rescore_manifest.json` (payload,
+   classification, test-config, repo-config and filter-list hashes; replay policies; era; scorer
+   revision) and `PROMOTION_NOTES.md`. It does **not** regenerate the trial `summary.json` /
+   `summary_filtered.json`, `feedback_report.md` or `artifacts.tar.gz`; those are listed as stale
+   and must be handled at promotion (docs/re-evaluation.md). Inputs drift (stored repo-config
+   binding ≠ current config; classification ≠ the one at the trial's recorded data commit) makes
+   a cell non-replayable. Re-running on an already corrected cell is a verified no-op.
+6. **Known residuals not addressed on this branch**: Ginkgo package-aware key (F1a), two-sided
+   fail-closed bridge for Ginkgo and Java (F2), Go absent-suite canonicalisation (F4), mixed-mode
+   payloads scored under one framework (navidrome Ginkgo+Vitest: the Vitest ids still take the
+   Ginkgo prefix-dropping key), Cargo cross-crate identical raw ids (parser-level), and the
+   classifier's overwrite of duplicate raw observations (dataset-build side of the contract).
 
 ## 0.1 v2 text below (still authoritative for design details not superseded above)
 

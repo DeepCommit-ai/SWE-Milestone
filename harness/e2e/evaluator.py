@@ -1006,7 +1006,13 @@ def build_nodeid_map(test_ids: List[str], go_module: Optional[str] = None) -> Di
 # replayed byte-for-byte during re-tally selection; they must never be used to
 # score a new cell.
 SCORING_ID_POLICY_IDENTITY = "identity-v2"
+# The scorer on main before this fix: prefix-dropping key for every non-Java
+# framework, Java keeps its module and folds hashcodes, conservative
+# (fail-close) aggregation, guarded Java module-less fallback.
 SCORING_ID_POLICY_LEGACY = "legacy-prefix-drop"
+# The scorer before 0a779f0 (2026-07-15): prefix-dropping key for every
+# framework including Java, last-write ("pass-wins") aggregation, no Java
+# module-less fallback. Replay selection only.
 SCORING_ID_POLICY_LEGACY_PASSWINS = "legacy-prefix-drop-passwins"
 SCORING_ID_POLICY_DEFAULT = SCORING_ID_POLICY_IDENTITY
 SCORING_ID_POLICIES = (
@@ -1040,6 +1046,10 @@ def normalize_scoring_nodeid(
     """
     if policy not in SCORING_ID_POLICIES:
         raise ValueError(f"unknown scoring identity policy: {policy!r}")
+    if policy == SCORING_ID_POLICY_LEGACY_PASSWINS:
+        # Faithful to the scorer before 0a779f0 (2026-07-15): every framework,
+        # Java included, went through the prefix-dropping Ginkgo normalizer.
+        return normalize_ginkgo_nodeid(nodeid, go_module)
     if framework in ("maven", "gradle"):
         return normalize_java_hashcode(nodeid)
     if policy != SCORING_ID_POLICY_IDENTITY or framework in _PREFIX_DROP_FRAMEWORKS:
@@ -1133,7 +1143,7 @@ def _build_scoring_indexes(
             exact[canonical] = outcome
         raw_by_canonical.setdefault(canonical, []).append((nodeid, outcome))
 
-        if framework in ("maven", "gradle"):
+        if framework in ("maven", "gradle") and not passwins:
             moduleless = _java_moduleless_nodeid(canonical)
             java_moduleless_groups.setdefault(moduleless, []).append((canonical, outcome))
 
@@ -1148,12 +1158,12 @@ def _build_scoring_indexes(
         raw_ids = sorted({raw for raw, _ in observations})
         if len(raw_ids) < 2:
             continue
-        if framework in ("maven", "gradle"):
+        if policy != SCORING_ID_POLICY_IDENTITY:
+            kind, approved = f"legacy:{policy}", False
+        elif framework in ("maven", "gradle"):
             kind, approved = "java-hashcode-instances", True
         elif framework in _PREFIX_DROP_FRAMEWORKS:
             kind, approved = "ginkgo-prefix-drop-residual", False
-        elif policy != SCORING_ID_POLICY_IDENTITY:
-            kind, approved = "legacy-prefix-drop", False
         else:
             kind, approved = "unexpected-lossy-key", False
         idx.collisions.append(
@@ -1231,11 +1241,43 @@ def _lookup_scoring_outcome(
     go_module: Optional[str] = None,
 ) -> str:
     """Resolve an outcome, allowing only unambiguous identity fallbacks."""
+    return _lookup_scoring_match(
+        test_id,
+        framework=framework,
+        outcomes=outcomes,
+        normalized_groups=normalized_groups,
+        java_moduleless_groups=java_moduleless_groups,
+        normalizer=normalizer,
+        policy=policy,
+        go_module=go_module,
+    )[0]
+
+
+def _lookup_scoring_match(
+    test_id: str,
+    *,
+    framework: Optional[str],
+    outcomes: Dict[str, str],
+    normalized_groups: Dict[str, List[Tuple[str, str]]],
+    java_moduleless_groups: Dict[str, List[Tuple[str, str]]],
+    normalizer: Optional[TestIdNormalizer] = None,
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+    go_module: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve (outcome, match_kind) for an expected test ID.
+
+    match_kind is one of ``exact`` (canonical key hit), ``java-moduleless``
+    (guarded module-less bridge), ``fuzzy`` (TestIdNormalizer group, e.g. Go
+    random subtests) or ``unknown`` (never observed). Recorded per category so a
+    re-tally can show how every expected ID was matched.
+    """
     canonical = normalize_scoring_nodeid(test_id, framework, go_module, policy)
     if canonical in outcomes:
-        return outcomes[canonical]
+        return outcomes[canonical], "exact"
 
-    if framework in ("maven", "gradle"):
+    # The module-less bridge did not exist before 0a779f0; the pass-wins replay
+    # policy must not use it.
+    if framework in ("maven", "gradle") and policy != SCORING_ID_POLICY_LEGACY_PASSWINS:
         matches = java_moduleless_groups.get(_java_moduleless_nodeid(canonical), [])
         matched_ids = {matched_id for matched_id, _ in matches}
         if len(matched_ids) == 1:
@@ -1244,18 +1286,18 @@ def _lookup_scoring_outcome(
             # explicitly name different modules, they are different tests even
             # when class/method text happens to match.
             if _java_nodeid_has_module(canonical) != _java_nodeid_has_module(runtime_id):
-                return _aggregate_test_outcomes([outcome for _, outcome in matches])
+                return _aggregate_test_outcomes([outcome for _, outcome in matches]), "java-moduleless"
         # More than one module owns this class/method.  Returning unknown is
         # fail-closed: never credit module A with module B's result.
         if matches:
-            return "unknown"
+            return "unknown", "unknown"
 
     if normalizer:
         matches = normalized_groups.get(normalizer.normalize(test_id), [])
         if matches:
-            return _aggregate_test_outcomes([outcome for _, outcome in matches])
+            return _aggregate_test_outcomes([outcome for _, outcome in matches]), "fuzzy"
 
-    return "unknown"
+    return "unknown", "unknown"
 
 
 def _partition_none_to_pass(
@@ -1419,6 +1461,9 @@ class ScoringTally:
     strict_resolved: bool
     identity_collisions: List[Dict[str, Any]]
     identity_untrusted: bool
+    # How every expected ID was matched, per category:
+    # {"fail_to_pass": {"exact": n, "fuzzy": n, "java-moduleless": n, "unknown": n}, ...}
+    match_trace: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 def tally_scoring(
@@ -1454,8 +1499,13 @@ def tally_scoring(
         policy=policy,
     )
 
+    match_trace: Dict[str, Dict[str, int]] = {
+        "fail_to_pass": {}, "pass_to_pass": {}, "none_to_pass": {}
+    }
+    current_category = [""]
+
     def lookup_outcome(test_id: str) -> str:
-        return _lookup_scoring_outcome(
+        outcome, kind = _lookup_scoring_match(
             test_id,
             framework=framework,
             outcomes=indexes.exact,
@@ -1465,6 +1515,11 @@ def tally_scoring(
             policy=policy,
             go_module=go_module,
         )
+        cat = current_category[0]
+        if cat:
+            bucket = match_trace[cat]
+            bucket[kind] = bucket.get(kind, 0) + 1
+        return outcome
 
     # Extract and deduplicate test IDs by normalization
     # This handles fuzz/parameterized tests with random IDs (e.g., TestMap/xxx)
@@ -1485,6 +1540,7 @@ def tally_scoring(
     none_to_pass_ids = _dedupe_by_normalization(none_to_pass_ids_raw, normalizer)
 
     # Check which fail_to_pass tests now pass (stable tests only)
+    current_category[0] = "fail_to_pass"
     fail_to_pass_success: List[str] = []
     fail_to_pass_failure: List[str] = []
     for test_id in fail_to_pass_ids:
@@ -1495,6 +1551,7 @@ def tally_scoring(
             fail_to_pass_failure.append(test_id)
 
     # Check for pass_to_pass failures (regressions) - stable tests only
+    current_category[0] = "pass_to_pass"
     pass_to_pass_failure: List[str] = []
     pass_to_pass_success_count = 0
     pass_to_pass_missing = 0
@@ -1509,9 +1566,11 @@ def tally_scoring(
             pass_to_pass_missing += 1
 
     # Check which none_to_pass tests now pass (stable tests only)
+    current_category[0] = "none_to_pass"
     none_to_pass_success, none_to_pass_failure, none_to_pass_missing = (
         _partition_none_to_pass(none_to_pass_ids, lookup_outcome)
     )
+    current_category[0] = ""
 
     # Which suites owed results and reported nothing at all. Recorded, not
     # scored: the cause is ambiguous (build death vs ID drift).
@@ -1574,6 +1633,7 @@ def tally_scoring(
         strict_resolved=strict_resolved,
         identity_collisions=list(indexes.collisions),
         identity_untrusted=indexes.untrusted,
+        match_trace=match_trace,
     )
 
 
@@ -1879,6 +1939,10 @@ class EvaluationResult:
     def __post_init__(self) -> None:
         """Classify zero-test results at the result boundary."""
         self.classify_zero_test_result()
+        # An unexpected scoring-identity collision is a validity failure: the
+        # tally cannot be trusted, so the verdict can never be resolved.
+        if self.identity_collision_untrusted:
+            self.resolved = False
 
     def _has_build_failure_evidence(self) -> bool:
         return bool(
@@ -2075,9 +2139,11 @@ class EvaluationResult:
                 "error": self.go_module_closure_error,
             },
         }
+        # The dataclass fields are authoritative; the dict may carry extra
+        # provenance but must not contradict them.
         result["scoring_identity"] = dict(self.scoring_identity or {})
-        result["scoring_identity"].setdefault("policy", self.scoring_id_policy)
-        result["scoring_identity"].setdefault("untrusted", self.identity_collision_untrusted)
+        result["scoring_identity"]["policy"] = self.scoring_id_policy or result["scoring_identity"].get("policy", "")
+        result["scoring_identity"]["untrusted"] = bool(self.identity_collision_untrusted)
         result["infrastructure_failure"] = self.infrastructure_failure
         result["scored_failure_reason"] = self.scored_failure_reason
         result["infra_invalid"] = bool(
@@ -6628,6 +6694,11 @@ fi
             self.repo_config, self.workspace_root, self.milestone_id, _baseline_ids
         )
         test_id_normalizer = TestIdNormalizer(framework=test_framework, enable_normalization=True)
+        if test_framework is None:
+            # Identity keying is safe for an unresolved framework, but the
+            # dataset should name one (docs/adding-a-repo.md, item 1).
+            print("⚠️  test framework unresolved for this milestone; scoring with identity keys "
+                  "(configuration defect: set framework in the milestone test_config)")
 
         payload_source: Optional[Path] = None
 
@@ -6774,6 +6845,7 @@ fi
             "collision_count": len(tally.identity_collisions),
             "collisions": tally.identity_collisions,
             "untrusted": tally.identity_untrusted,
+            "match_trace": tally.match_trace,
         }
 
         # Compatibility mode may still score completed packages, but a

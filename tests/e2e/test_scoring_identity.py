@@ -285,8 +285,44 @@ def test_legacy_replay_collisions_never_mark_untrusted():
     idx = _build_scoring_indexes(
         _payload(passed=[PY_A], failed=[PY_B]), framework="pytest", policy=SCORING_ID_POLICY_LEGACY
     )
-    assert [c["kind"] for c in idx.collisions] == ["legacy-prefix-drop"]
+    assert [c["kind"] for c in idx.collisions] == [f"legacy:{SCORING_ID_POLICY_LEGACY}"]
     assert idx.untrusted is False
+
+
+def test_passwins_policy_reproduces_pre_0a779f0_java_behaviour():
+    # Before 0a779f0 Java ids also went through the prefix-dropping normalizer
+    # and there was no module-less fallback: two modules' same class::method
+    # shared one slot, last observation winning.
+    a = "module-a::org.example.SharedTest::sameName"
+    b = "module-b::org.example.SharedTest::sameName"
+    pw = SCORING_ID_POLICY_LEGACY_PASSWINS
+    assert normalize_scoring_nodeid(a, "maven", policy=pw) == normalize_scoring_nodeid(b, "maven", policy=pw)
+    assert normalize_scoring_nodeid(a, "maven") != normalize_scoring_nodeid(b, "maven")
+    idx = _build_scoring_indexes(
+        {"results": {"failed": [{"nodeid": a}], "passed": [b]}, "summary": {"total": 2}},
+        framework="maven",
+        policy=pw,
+    )
+    key = normalize_scoring_nodeid(a, "maven", policy=pw)
+    assert idx.exact[key] == "passed"  # last write wins
+    assert idx.java_moduleless_groups == {}
+    # Module-less lookup must not bridge under the pass-wins replay either.
+    outcome = _lookup_scoring_outcome(
+        "module-c::org.example.SharedTest::sameName",
+        framework="maven",
+        outcomes=idx.exact,
+        normalized_groups=idx.normalized_groups,
+        java_moduleless_groups=idx.java_moduleless_groups,
+        policy=pw,
+    )
+    assert outcome == "passed"  # prefix dropped: same slot under that scorer
+
+
+def test_tally_records_match_trace():
+    payload = _payload(passed=[PY_A])
+    t = _tally(payload, {"pass_to_pass": [PY_A, PY_B], "fail_to_pass": [CARGO_A]}, "pytest")
+    assert t.match_trace["pass_to_pass"] == {"exact": 1, "unknown": 1}
+    assert t.match_trace["fail_to_pass"] == {"unknown": 1}
 
 
 def test_unexpected_lossy_key_marks_scoring_untrusted(monkeypatch):
@@ -461,12 +497,24 @@ def test_result_carries_scoring_identity_and_roundtrips():
 
 
 def test_identity_untrusted_locks_resolution():
-    r = _result(identity_collision_untrusted=True)
+    r = _result(identity_collision_untrusted=True, resolved=True)
+    assert r.resolved is False  # forced at construction, not only in compare_results
     assert r.scoring_untrusted is True
     assert r.resolution_locked_false is True
     d = r.to_dict()
     assert d["scoring_identity"]["untrusted"] is True
     assert EvaluationResult.from_result_dict(d).identity_collision_untrusted is True
+
+
+def test_to_dict_fields_are_authoritative_over_the_provenance_dict():
+    r = _result(
+        scoring_id_policy=SCORING_ID_POLICY_IDENTITY,
+        scoring_identity={"policy": "stale", "untrusted": True, "payload_sha256": "abc"},
+    )
+    d = r.to_dict()
+    assert d["scoring_identity"]["policy"] == SCORING_ID_POLICY_IDENTITY
+    assert d["scoring_identity"]["untrusted"] is False
+    assert d["scoring_identity"]["payload_sha256"] == "abc"
 
 
 def test_legacy_result_without_scoring_identity_still_loads():

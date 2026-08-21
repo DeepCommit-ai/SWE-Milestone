@@ -4,8 +4,10 @@ The evaluator scores a cell by matching the baseline classification's test IDs
 against the runtime report's test IDs. The matching key is the test's
 **identity**: two IDs that map to the same key share one outcome. Since the
 fix for issue #24 the key is the raw ID for every framework except two
-documented exceptions (Maven/Gradle fold JVM hashcodes; Ginkgo bridges the Go
-module prefix). That only works if the dataset keeps one promise:
+documented exceptions (Maven/Gradle fold JVM hashcodes; Ginkgo still uses the
+legacy prefix-dropping key, which drops *any* prefix before `::` — a
+package-aware key is a tracked follow-up). That only works if the dataset keeps
+one promise:
 
 > **One parser, one ID dialect, both sides.** The IDs in
 > `test_results/<MID>/<MID>_classification.json` and the IDs the evaluator's
