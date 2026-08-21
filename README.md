@@ -13,7 +13,6 @@
   <a href="https://github.com/DeepCommit-ai/DeepCommit"><img src="https://img.shields.io/badge/Data%20Pipeline-DeepCommit-blue?logo=github&logoColor=white" alt="DeepCommit Data Pipeline" /></a>
   <a href="https://hub.docker.com/u/hyd2apse"><img src="https://img.shields.io/badge/Docker-hyd2apse-2496ED?logo=docker&logoColor=white" alt="DockerHub" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-%3E%3D3.10-blue.svg" alt="Python 3.10+" /></a>
 </p>
 
 ---
