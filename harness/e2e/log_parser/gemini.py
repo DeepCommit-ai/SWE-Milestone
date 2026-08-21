@@ -15,7 +15,7 @@ _UUID_RE = re.compile(
 )
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
+from harness.e2e.log_parser.models import NativeUsageUnit, SessionInfo, ToolCallRecord, TrialStats
 from harness.e2e.pricing import has_tiered_pricing as _has_tiered_pricing_shared
 from harness.e2e.pricing import resolve_pricing as _resolve_pricing_shared
 
