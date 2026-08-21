@@ -495,9 +495,13 @@ def rescore_cell(
     if (rec.stored_resolved is not None) and bool(rec.stored_resolved) != new_resolved:
         delta["resolved"] = {"before": bool(rec.stored_resolved), "after": new_resolved}
     rec.delta = delta
-    rec.absent_suites_changed = sorted(new_t.absent_suites) != sorted(
-        (envelope.get("build_failure_policy") or {}).get("absent_suites") or []
-    )
+    # Only comparable when the stored scorer already recorded absent_suites;
+    # older envelopes lack the key entirely (issue #22 added it), and that is
+    # not a change in what the identity key does.
+    stored_policy = envelope.get("build_failure_policy") or {}
+    rec.absent_suites_changed = "absent_suites" in stored_policy and sorted(
+        new_t.absent_suites
+    ) != sorted(stored_policy.get("absent_suites") or [])
     rec.status = "replayable"
     rec.reason = lock_reason
 
