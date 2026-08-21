@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Any, Tuple, Optional, Set, FrozenSet
+from typing import Callable, Dict, Iterable, List, Any, Tuple, Optional, Set, FrozenSet
 from dataclasses import dataclass, field
 
 import yaml
@@ -1136,6 +1136,69 @@ def _lookup_scoring_outcome(
     return "unknown"
 
 
+def _partition_none_to_pass(
+    none_to_pass_ids: List[Optional[str]],
+    lookup_outcome: Callable[[str], str],
+) -> Tuple[List[str], List[str], int]:
+    """Split N2P ids into (success, failure, missing_count).
+
+    ``missing`` counts ids the report never mentioned. They stay in the
+    failure list — a new test that never ran is not achieved, exactly as
+    before — so this is a record, not a scoring change. It exists because
+    PASS_TO_PASS could already distinguish "absent" from "ran and failed"
+    and NONE_TO_PASS could not, which hid lost test universes (issue #22).
+    """
+    success: List[str] = []
+    failure: List[str] = []
+    missing = 0
+    for test_id in none_to_pass_ids:
+        if not test_id:
+            continue
+        outcome = lookup_outcome(test_id)
+        if outcome == "passed":
+            success.append(test_id)
+            continue
+        if outcome == "unknown":
+            missing += 1
+        failure.append(test_id)
+    return success, failure, missing
+
+
+def _absent_suites_from_missing_ids(
+    *,
+    missing_ids: List[str],
+    observed_nodeids: Iterable[str],
+    framework: Optional[str],
+) -> List[str]:
+    """Names of suites that owe results but contributed nothing to the report.
+
+    A Ginkgo package that fails to compile at *package initialisation* is not
+    merely a failed suite: it produces no entry at all, so nothing downstream
+    can tell it apart from a package that simply has no tests. Comparing the
+    packages named by unmatched ids against the packages that actually
+    reported recovers that signal.
+
+    Scoped to the ``package::hierarchy`` id dialect, where the suite identity
+    is carried by the id itself. Cause is deliberately not asserted (build
+    death and ID drift look the same here), so callers must treat this as
+    metadata rather than proof of a build failure.
+    """
+    if framework != "ginkgo":
+        return []
+
+    def package_of(nodeid: str) -> str:
+        return nodeid.split("::", 1)[0] if "::" in nodeid else ""
+
+    reported = {package_of(n) for n in observed_nodeids}
+    reported.discard("")
+    absent = {
+        pkg
+        for pkg in (package_of(m) for m in missing_ids)
+        if pkg and pkg not in reported
+    }
+    return sorted(absent)
+
+
 def _find_free_port() -> int:
     """Ask the OS for a free TCP port. Host-network evaluations get a unique
     webServer port per run via SWE_MILESTONE_EVAL_PORT (fixed ports would make
@@ -1317,6 +1380,13 @@ class EvaluationResult:
     build_failure_fail_closed: bool = False
     partial_test_universe: bool = False
     build_failure_diagnostics: List[str] = field(default_factory=list)
+    # Record-only observability (issue #22): N2P ids the report never
+    # mentioned, and suites that owed results but contributed nothing.
+    # Neither participates in scoring; both let an analyst separate a
+    # lost test universe from a genuine failure without re-reading raw
+    # reports.
+    none_to_pass_missing: int = 0
+    absent_suites: List[str] = field(default_factory=list)
     residue_prune_enabled: bool = False
     residue_prune_extensions: List[str] = field(default_factory=list)
     residue_prune_keep_list: List[str] = field(default_factory=list)
@@ -1477,7 +1547,11 @@ class EvaluationResult:
             "resolved": self.resolved,
             "tests_status": {
                 "FAIL_TO_PASS": {"success": self.fail_to_pass_success, "failure": self.fail_to_pass_failure},
-                "NONE_TO_PASS": {"success": self.none_to_pass_success, "failure": self.none_to_pass_failure},
+                "NONE_TO_PASS": {
+                    "success": self.none_to_pass_success,
+                    "failure": self.none_to_pass_failure,
+                    "missing": self.none_to_pass_missing,
+                },
                 "PASS_TO_PASS": {
                     "success_count": self.pass_to_pass_success_count,
                     "failure": self.pass_to_pass_failure,
@@ -1498,6 +1572,7 @@ class EvaluationResult:
                 "pass_to_pass_achieved": self.pass_to_pass_success_count,
                 "pass_to_pass_failed": len(self.pass_to_pass_failure),
                 "pass_to_pass_missing": self.pass_to_pass_missing,
+                "none_to_pass_missing": self.none_to_pass_missing,
             },
         }
         result["base_tag"] = self.base_tag
@@ -1508,6 +1583,7 @@ class EvaluationResult:
             "fail_closed": self.build_failure_fail_closed,
             "partial_test_universe": self.partial_test_universe,
             "diagnostics": self.build_failure_diagnostics,
+            "absent_suites": self.absent_suites,
         }
         result["residue_prune"] = {
             "enabled": self.residue_prune_enabled,
@@ -1646,6 +1722,7 @@ class EvaluationResult:
             pass_to_pass_missing=int(p2p.get("missing") or 0),
             none_to_pass_success=list(n2p.get("success") or []),
             none_to_pass_failure=list(n2p.get("failure") or []),
+            none_to_pass_missing=int(n2p.get("missing") or 0),
             total_tests=int(summary["total"]),
             passed_tests=int(summary["passed"]),
             failed_tests=int(summary["failed"]),
@@ -1663,6 +1740,7 @@ class EvaluationResult:
             build_failure_fail_closed=bool(policy.get("fail_closed") or False),
             partial_test_universe=bool(policy.get("partial_test_universe") or False),
             build_failure_diagnostics=list(policy.get("diagnostics") or []),
+            absent_suites=list(policy.get("absent_suites") or []),
             residue_prune_enabled=bool(residue.get("enabled") or False),
             residue_prune_extensions=list(residue.get("extensions") or []),
             residue_prune_keep_list=list(residue.get("keep_list") or []),
@@ -6283,20 +6361,47 @@ fi
         # Check which none_to_pass tests now pass (stable tests only)
         # Use lookup_outcome for normalized matching (handles fuzz tests)
         # Must be done BEFORE resolved calculation
-        none_to_pass_success = []
-        none_to_pass_failure = []
-        for test_id in none_to_pass_ids:
-            if not test_id:
-                continue
-            current_outcome = lookup_outcome(test_id)
-            if current_outcome == "passed":
-                none_to_pass_success.append(test_id)
-            else:
-                none_to_pass_failure.append(test_id)
+        none_to_pass_success, none_to_pass_failure, none_to_pass_missing = (
+            _partition_none_to_pass(none_to_pass_ids, lookup_outcome)
+        )
 
         if none_to_pass_ids:
             print(
                 f"📋 New tests (NONE_TO_PASS): {len(none_to_pass_success)} passed, {len(none_to_pass_failure)} failed"
+            )
+            if none_to_pass_missing:
+                print(
+                    f"⚠️  NONE_TO_PASS Missing: {none_to_pass_missing} of those "
+                    "'failures' never appeared in the report (counted as "
+                    "not-achieved, as before)"
+                )
+
+        # Which suites owed results and reported nothing at all. Recorded, not
+        # scored: the cause is ambiguous (build death vs ID drift), so it must
+        # not silently re-grade the cell — but without it a suite that died at
+        # package initialisation is indistinguishable from one with no tests.
+        missing_p2p_ids = [
+            test_id
+            for test_id in pass_to_pass_ids
+            if lookup_outcome(test_id) == "unknown"
+        ]
+        missing_n2p_ids = [
+            test_id
+            for test_id in none_to_pass_ids
+            if test_id and lookup_outcome(test_id) == "unknown"
+        ]
+        absent_suites = _absent_suites_from_missing_ids(
+            missing_ids=missing_p2p_ids + missing_n2p_ids,
+            observed_nodeids=test_outcomes.keys(),
+            framework=test_framework,
+        )
+        if absent_suites:
+            self._eval_meta["partial_test_universe"] = True
+            preview = ", ".join(absent_suites[:5])
+            more = "" if len(absent_suites) <= 5 else f" (+{len(absent_suites) - 5} more)"
+            print(
+                f"🚨 {len(absent_suites)} expected suite(s) produced no report "
+                f"entry at all: {preview}{more}"
             )
 
         # Determine if milestone resolved (based on stable tests only)
@@ -6354,6 +6459,8 @@ fi
             pass_to_pass_missing=pass_to_pass_missing,
             none_to_pass_success=none_to_pass_success,
             none_to_pass_failure=none_to_pass_failure,
+            none_to_pass_missing=none_to_pass_missing,
+            absent_suites=absent_suites,
             total_tests=summary.get("total", 0),
             passed_tests=summary.get("passed", 0),
             failed_tests=summary.get("failed", 0),

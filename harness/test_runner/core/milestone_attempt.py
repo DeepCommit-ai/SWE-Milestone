@@ -426,6 +426,45 @@ def _primary_build_failure_signature(
     return terminal_signature
 
 
+def _scan_ginkgo_report_for_compile_dead_suites(
+    path: Path,
+    *,
+    max_chars: int = 3000,
+) -> Optional[Tuple[str, str]]:
+    """Ginkgo counterpart of the line-oriented masked-build-failure scan.
+
+    A Ginkgo suite that failed before running any spec (typically a compile
+    error) reports ``SuiteSucceeded: false`` with empty ``SpecReports`` and
+    carries the compiler output in ``SpecialSuiteFailureReasons`` — fields the
+    spec-level parser ignores, so the suite otherwise contributes zero tests
+    and zero errors (issue #22). Exactly that shape is a masked build failure;
+    a suite whose specs ran and failed is an ordinary test result and is left
+    alone.
+    """
+    try:
+        data = json.loads(path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+    suites = data if isinstance(data, list) else [data]
+    reasons: List[str] = []
+    for suite in suites:
+        if not isinstance(suite, dict) or suite.get("SuiteSucceeded", True):
+            continue
+        if suite.get("SpecReports"):
+            continue
+        suite_reasons = suite.get("SpecialSuiteFailureReasons") or []
+        if not suite_reasons:
+            continue
+        reasons.append("\n".join(str(r) for r in suite_reasons))
+    if not reasons:
+        return None
+    first_line = next(
+        (line.strip() for line in reasons[0].splitlines() if line.strip()),
+        "ginkgo suite failed before running any spec",
+    )
+    return first_line[:500], "\n\n".join(reasons)[:max_chars]
+
+
 def _scan_report_for_masked_build_failure_details(
     path: Path,
     framework: str,
@@ -442,6 +481,8 @@ def _scan_report_for_masked_build_failure_details(
     context beginning at the exact build/setup signature that caused the
     fail-closed verdict.
     """
+    if framework == "ginkgo":
+        return _scan_ginkgo_report_for_compile_dead_suites(path, max_chars=max_chars)
     if framework not in _MASKED_BUILD_FAILURE_PATTERNS:
         return None
     from collections import deque
