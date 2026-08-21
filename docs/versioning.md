@@ -124,6 +124,15 @@ ordinary minor release, bundled with the dubbo prune-config and nushell SRS
 work that landed in the same window. The back-application property made the
 *work* cheap; it had no bearing on the version number.
 
+Fold record for `v1.0.1` (2026-08-21): the code tag moved forward from
+`659590b` to `2455532`, folding in PRs #28-#31 (issues #19/#20 runner
+reliability: timeout orphan kill and watcher tag-race recovery; #21 npm-waiver
+removal; #22 Ginkgo observability). Scoring behavior is unchanged — the waiver
+was never consulted on the published navidrome path, the Ginkgo fix replayed
+over 60 published reports with zero score changes, and the runner fixes do not
+touch evaluation — so the same version label keeps reproducing the same
+numbers. `BENCHMARK_VERSION` and the `:v1.0.1` image digests are untouched.
+
 Patch releases (`vX.Y.Z`) — repairing published images, rc-tag campaigns,
 and the promotion runbook that reuses steps 3-5 below with carried-over
 name sets — are specified in **[image-patching.md](image-patching.md)**.
