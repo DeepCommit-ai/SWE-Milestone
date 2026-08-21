@@ -160,6 +160,8 @@ def test_wait_loop_harvests_late_completion(monkeypatch):
     runner.pending_debounce = {}
     runner.eval_event_queue = queue_module.Queue()
     runner._drain_pending_events = lambda: None
+    runner.watcher_thread = None  # liveness backstop (#20) short-circuits on None
+    runner._watcher_exited_clean = False
     runner._process_queue_event = lambda event: None
 
     def _late_completion():
@@ -194,5 +196,7 @@ def test_wait_loop_times_out_when_nothing_in_flight():
     runner.pending_debounce = {}
     runner.eval_event_queue = queue_module.Queue()
     runner._drain_pending_events = lambda: None
+    runner.watcher_thread = None  # liveness backstop (#20) short-circuits on None
+    runner._watcher_exited_clean = False
 
     assert runner._wait_for_evaluations() == "timeout"
