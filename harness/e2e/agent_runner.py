@@ -32,61 +32,94 @@ PROMPT_DIR = Path(__file__).parent / "prompt"
 # Kill an invocation's in-container process tree and verify it died (#19).
 #
 # Killing the host-side `docker exec` client (proc.kill / subprocess timeout)
-# only severs the stream; the payload keeps running inside the container. Each
-# invocation therefore records its payload shell's PID in a pidfile, and this
-# script — run via a fresh `docker exec` — walks /proc for that PID's
-# descendant tree, TERMs it, waits out a grace period, escalates to KILL, and
-# reports what (if anything) survived.
+# only severs the stream; the payload keeps running inside the container.
+#
+# Selector design (review-hardened): the AUTHORITATIVE selector is the unique
+# EVOCLAW_INVOCATION_ID marker every invocation exports into its environment —
+# environments are inherited, so daemonized descendants (whose PPid became 1
+# when their intermediate shell exited) and children forked during the TERM
+# window still carry it, and both classes escape any parent-walk. A pidfile-
+# rooted /proc BFS remains as a SUPPLEMENT for the rare child that scrubs its
+# own environment. A live tree whose pidfile was lost (agent cleaned /tmp,
+# ENOSPC truncated the write) is therefore still found and killed: the pidfile
+# is an optimization, never the authority.
 #
 # POSIX sh only: agent images span several distro bases, so no bash/pkill/
-# setsid assumptions — /proc + kill + sed are the common denominator.
-# $1 = pidfile path, $2 = TERM grace period in seconds (default 8).
+# setsid assumptions — /proc + kill + sed/tr/grep are the common denominator.
+# $1 = pidfile path, $2 = invocation id (env marker value), $3 = TERM grace
+# period in seconds (default 8).
 _KILL_INVOCATION_SCRIPT = r"""
 PIDFILE="$1"
-GRACE="${2:-8}"
-[ -f "$PIDFILE" ] || { echo "RESULT:NO_PIDFILE"; exit 0; }
-ROOT="$(cat "$PIDFILE" 2>/dev/null)"
-case "$ROOT" in
-    ''|*[!0-9]*) rm -f "$PIDFILE"; echo "RESULT:BAD_PIDFILE"; exit 0 ;;
-esac
-if [ ! -d "/proc/$ROOT" ]; then
-    rm -f "$PIDFILE"
-    echo "RESULT:ALREADY_DEAD"
-    exit 0
-fi
+INVID="$2"
+GRACE="${3:-8}"
+[ -n "$INVID" ] || { echo "RESULT:NO_INVID"; exit 1; }
 
 # A process only counts as alive if it can still execute: zombies (Z) keep a
 # /proc entry until reaped, and a detached invocation's orphans get adopted by
 # a container PID 1 that never reaps — [ -d /proc/PID ] alone would report
 # permanently-dead processes as survivors.
 is_alive() {
-    st="$(sed -n 's/^State:[[:space:]]*//p' "/proc/$1/status" 2>/dev/null | cut -c1)"
-    [ -n "$st" ] && [ "$st" != "Z" ] && [ "$st" != "X" ]
+    ia_st="$(sed -n 's/^State:[[:space:]]*//p' "/proc/$1/status" 2>/dev/null | cut -c1)"
+    [ -n "$ia_st" ] && [ "$ia_st" != "Z" ] && [ "$ia_st" != "X" ]
 }
 
-# Iterative BFS over /proc for ROOT's descendants. /proc/PID/status has a
-# "PPid:<tab><pid>" line; comm-with-spaces makes /proc/PID/stat unsafe to
-# field-split, so status is the one to read.
-TARGETS="$ROOT"
-frontier="$ROOT"
-while [ -n "$frontier" ]; do
-    next=""
-    for st in /proc/[0-9]*/status; do
-        [ -f "$st" ] || continue
-        p="${st#/proc/}"; p="${p%/status}"
-        pp="$(sed -n 's/^PPid:[[:space:]]*//p' "$st" 2>/dev/null)"
-        [ -n "$pp" ] || continue
-        for f in $frontier; do
-            if [ "$pp" = "$f" ]; then
-                case " $TARGETS " in
-                    *" $p "*) ;;
-                    *) TARGETS="$TARGETS $p"; next="$next $p" ;;
-                esac
-            fi
-        done
+# Authoritative selector: every process whose environment carries this
+# invocation's marker. Zombies read as an empty environ, so they are
+# naturally excluded.
+env_matches() {
+    for em_e in /proc/[0-9]*/environ; do
+        [ -r "$em_e" ] || continue
+        em_p="${em_e#/proc/}"; em_p="${em_p%/environ}"
+        if tr '\0' '\n' <"$em_e" 2>/dev/null | grep -qx "EVOCLAW_INVOCATION_ID=$INVID"; then
+            printf '%s\n' "$em_p"
+        fi
     done
-    frontier="$next"
+}
+
+# Supplementary selector: iterative BFS over /proc for the pidfile PID's
+# descendants. /proc/PID/status has a "PPid:<tab><pid>" line; comm-with-spaces
+# makes /proc/PID/stat unsafe to field-split, so status is the one to read.
+BFS_LIST=""
+if [ -f "$PIDFILE" ]; then
+    ROOT="$(cat "$PIDFILE" 2>/dev/null)"
+    case "$ROOT" in
+        ''|*[!0-9]*) ROOT="" ;;
+    esac
+    if [ -n "$ROOT" ] && [ -d "/proc/$ROOT" ]; then
+        BFS_LIST="$ROOT"
+        frontier="$ROOT"
+        while [ -n "$frontier" ]; do
+            next=""
+            for st in /proc/[0-9]*/status; do
+                [ -f "$st" ] || continue
+                p="${st#/proc/}"; p="${p%/status}"
+                pp="$(sed -n 's/^PPid:[[:space:]]*//p' "$st" 2>/dev/null)"
+                [ -n "$pp" ] || continue
+                for f in $frontier; do
+                    if [ "$pp" = "$f" ]; then
+                        case " $BFS_LIST " in
+                            *" $p "*) ;;
+                            *) BFS_LIST="$BFS_LIST $p"; next="$next $p" ;;
+                        esac
+                    fi
+                done
+            done
+            frontier="$next"
+        done
+    fi
+fi
+
+# Union of both selectors.
+TARGETS=""
+for p in $(env_matches) $BFS_LIST; do
+    case " $TARGETS " in *" $p "*) ;; *) TARGETS="$TARGETS $p" ;; esac
 done
+
+if [ -z "$TARGETS" ]; then
+    rm -f "$PIDFILE"
+    echo "RESULT:ALREADY_DEAD"
+    exit 0
+fi
 
 kill -TERM $TARGETS 2>/dev/null
 
@@ -100,6 +133,12 @@ while [ "$i" -lt "$GRACE" ]; do
     i=$((i+1))
 done
 
+# TERM-window forks and freshly daemonized children still carry the marker:
+# re-scan before escalating so KILL covers them too.
+for p in $(env_matches); do
+    case " $TARGETS " in *" $p "*) ;; *) TARGETS="$TARGETS $p"; alive="$alive $p" ;; esac
+done
+
 if [ -n "$alive" ]; then
     kill -KILL $TARGETS 2>/dev/null
     sleep 1
@@ -107,8 +146,17 @@ fi
 
 rm -f "$PIDFILE"
 
+# Final verification: anything alive from the target list OR a fresh marker
+# scan is a survivor. The scan catches the last-moment fork; the list catches
+# an env-scrubbed child.
 survivors=""
 for p in $TARGETS; do is_alive "$p" && survivors="$survivors $p"; done
+for p in $(env_matches); do
+    case " $survivors " in
+        *" $p "*) ;;
+        *) is_alive "$p" && survivors="$survivors $p" ;;
+    esac
+done
 if [ -z "$survivors" ]; then
     echo "RESULT:KILLED"
     exit 0
@@ -185,7 +233,9 @@ class AgentRunner:
         self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
         self._last_invalid_session = False  # Set when resume session ID is invalid
         self._last_fatal_error: Optional[str] = None  # Set on fatal config errors (no retry)
-        # Container path of the current invocation's pidfile (see _wrap_with_pidfile).
+        # Identity of the current invocation (see _wrap_with_pidfile): the env
+        # marker value and the container path of its pidfile.
+        self._invocation_id: Optional[str] = None
         self._invocation_pidfile: Optional[str] = None
 
     def _get_exec_env_vars(self) -> list[str]:
@@ -640,17 +690,43 @@ class AgentRunner:
         return result
 
     def _wrap_with_pidfile(self, agent_cmd: str) -> str:
-        """Prefix agent_cmd so the payload shell records its own PID (#19).
+        """Prefix agent_cmd so the invocation is identifiable for a later kill (#19).
+
+        Two identities are planted:
+        - EVOCLAW_INVOCATION_ID, exported so every descendant inherits it —
+          the kill script's authoritative selector. It survives daemonization
+          (PPid reparenting to 1) and is carried by children forked during the
+          TERM grace window, both of which a parent-walk misses.
+        - a pidfile holding $$ (the payload shell's PID), the root for the
+          supplementary /proc BFS that covers env-scrubbing children.
 
         The prefix turns the `sh -c` payload into a compound command, so the
-        shell stays alive as the ancestor of everything the agent spawns; $$
-        names that shell, and _kill_container_invocation walks its descendant
-        tree. An `exec` prefix would be wrong here: agent commands can be
-        compound (env-var prefixes, `&&` chains, redirections), and `exec`
-        would silently drop everything after the first command.
+        shell stays alive as the ancestor of everything the agent spawns. An
+        `exec` prefix would be wrong here: agent commands can be compound
+        (env-var prefixes, `&&` chains, redirections), and `exec` would
+        silently drop everything after the first command.
         """
-        self._invocation_pidfile = f"/tmp/evoclaw_invocation_{uuid.uuid4().hex[:12]}.pid"
-        return f'echo $$ >"{self._invocation_pidfile}"; {agent_cmd}'
+        self._invocation_id = uuid.uuid4().hex[:12]
+        self._invocation_pidfile = f"/tmp/evoclaw_invocation_{self._invocation_id}.pid"
+        return (
+            f"EVOCLAW_INVOCATION_ID={self._invocation_id}; export EVOCLAW_INVOCATION_ID; "
+            f'echo $$ >"{self._invocation_pidfile}"; {agent_cmd}'
+        )
+
+    def _invocation_cleanup_paths(self, *extra: str) -> list:
+        """Consume the invocation identity and return container paths to rm.
+
+        Used on completion paths (success or plain failure, not timeout): the
+        payload is done, so the pidfile is garbage and the identity must not
+        leak into the next invocation. The kill path consumes the identity
+        itself instead.
+        """
+        paths = list(extra)
+        if self._invocation_pidfile:
+            paths.append(self._invocation_pidfile)
+        self._invocation_pidfile = None
+        self._invocation_id = None
+        return paths
 
     def _handle_invocation_timeout(self, context: str) -> None:
         """Shared post-timeout contract for every invocation path (#19).
@@ -675,27 +751,36 @@ class AgentRunner:
         )
 
     def _kill_container_invocation(self, context: str, grace_seconds: int = 8) -> bool:
-        """Kill the current invocation's in-container process tree; verify it died.
+        """Kill the current invocation's in-container processes; verify death.
 
         Called after a harness-side timeout: the host-side docker exec client
         is already dead, but the payload keeps running in the container and
         would race any recovery invocation on /testbed, submission tags and
         the session JSONL (#19).
 
-        Returns True when the tree is confirmed gone (or never existed).
-        Returns False when survivors remain or their death cannot be verified
-        while the container is running — the caller must then treat the
-        invocation as fatal instead of launching a concurrent one.
+        Returns True when every marked process is confirmed gone (or none
+        existed). Returns False when survivors remain or their death cannot be
+        verified while the container is running — the caller must then treat
+        the invocation as fatal instead of launching a concurrent one.
         """
         pidfile = self._invocation_pidfile
-        if not pidfile:
+        invocation_id = self._invocation_id
+        if not pidfile or not invocation_id:
             return True
         self._invocation_pidfile = None
+        self._invocation_id = None
 
+        # Run the kill as the SAME user the payload runs as (fakeroot), not
+        # root: reading another uid's /proc/PID/environ needs CAP_SYS_PTRACE,
+        # which docker drops by default, so a root-side scan is silently
+        # blind to fakeroot processes ([ -r ] still says readable; the open
+        # fails on the kernel's ptrace access check). Same-uid needs no
+        # capability — and fakeroot physically cannot signal the container's
+        # root-owned evaluator services, which tightens the blast radius.
         kill_cmd = [
-            "docker", "exec", self.container_name,
+            "docker", "exec", "--user", "fakeroot", self.container_name,
             "/bin/sh", "-c", _KILL_INVOCATION_SCRIPT,
-            "kill_invocation", pidfile, str(grace_seconds),
+            "kill_invocation", pidfile, invocation_id, str(grace_seconds),
         ]
         try:
             result = subprocess.run(
@@ -709,7 +794,7 @@ class AgentRunner:
         stdout = result.stdout or ""
         marker = next((ln for ln in stdout.splitlines() if ln.startswith("RESULT:")), None)
 
-        if marker in ("RESULT:KILLED", "RESULT:ALREADY_DEAD", "RESULT:NO_PIDFILE", "RESULT:BAD_PIDFILE"):
+        if marker in ("RESULT:KILLED", "RESULT:ALREADY_DEAD"):
             self.logger.info(f"In-container invocation cleanup ({context}): {marker.removeprefix('RESULT:')}")
             return True
         if marker and marker.startswith("RESULT:SURVIVORS"):
@@ -722,11 +807,17 @@ class AgentRunner:
         # No marker: the docker exec itself failed. If the container is gone,
         # so is every process in it — that counts as dead. If the container is
         # still running (or its state can't be read), death is unverified:
-        # fail closed rather than allow a concurrent invocation.
-        inspect = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
-            capture_output=True, text=True,
-        )
+        # fail closed rather than allow a concurrent invocation. The inspect
+        # gets its own timeout: this path runs precisely when the daemon is
+        # misbehaving, and an unbounded call here would hang the whole trial.
+        try:
+            inspect = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"docker inspect timed out after failed kill ({context}); cannot verify death")
+            return False
         if inspect.returncode == 0 and inspect.stdout.strip() == "false":
             self.logger.warning(f"Container stopped during invocation kill ({context}); treating tree as dead")
             return True
@@ -771,6 +862,11 @@ class AgentRunner:
         # Ensure log directory exists
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Fresh invocation, fresh fatal state: the flag is (re)set by this
+        # run's own timeout handling; the broad except below must never be
+        # able to erase a fatal verdict that handling just produced.
+        self._last_fatal_error = None
 
         # Generate or use provided session ID
         self.session_id = session_id or str(uuid.uuid4())
@@ -855,7 +951,11 @@ class AgentRunner:
             self._last_model_unavailable = False
             self._last_model_hint = None
             self._last_invalid_session = False
-            self._last_fatal_error = None
+            # _last_fatal_error is deliberately NOT reset here: a timeout
+            # handler may have set it just before an unrelated exception
+            # (e.g. session-id extraction on a huge stdout) landed us here,
+            # and erasing it would let recovery launch a concurrent agent.
+            # run() resets it at entry instead.
             self._append_session_history({"event": "agent_exec_end", "session_id": self.session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
             return False, self.session_id
@@ -963,7 +1063,11 @@ class AgentRunner:
                     ["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False
                 )
                 return False
-            self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
+            self._run_command(
+                ["docker", "exec", self.container_name, "rm", "-f",
+                 *self._invocation_cleanup_paths(container_prompt_path)],
+                check=False,
+            )
             return result.returncode == 0
 
         stdout_file = open(self.log_dir / "agent_stdout.txt", "a", encoding="utf-8")
@@ -1027,12 +1131,12 @@ class AgentRunner:
             stdout_file.close()
             stderr_file.close()
 
-        # Cleanup prompt file + this invocation's pidfile (the payload is done)
-        cleanup_paths = [container_prompt_path]
-        if self._invocation_pidfile:
-            cleanup_paths.append(self._invocation_pidfile)
-            self._invocation_pidfile = None
-        self._run_command(["docker", "exec", self.container_name, "rm", "-f", *cleanup_paths], check=False)
+        # Cleanup prompt file + this invocation's identity (the payload is done)
+        self._run_command(
+            ["docker", "exec", self.container_name, "rm", "-f",
+             *self._invocation_cleanup_paths(container_prompt_path)],
+            check=False,
+        )
 
         if proc.returncode != 0:
             self.logger.error(f"Agent exited with code {proc.returncode}")
@@ -1149,12 +1253,12 @@ class AgentRunner:
             # Update session_id from output (agent may have created a new session)
             self._update_session_id_from_output()
 
-            # Cleanup message file + this invocation's pidfile (the payload is done)
-            cleanup_paths = [container_message_path]
-            if self._invocation_pidfile:
-                cleanup_paths.append(self._invocation_pidfile)
-                self._invocation_pidfile = None
-            self._run_command(["docker", "exec", self.container_name, "rm", "-f", *cleanup_paths], check=False)
+            # Cleanup message file + this invocation's identity (the payload is done)
+            self._run_command(
+                ["docker", "exec", self.container_name, "rm", "-f",
+                 *self._invocation_cleanup_paths(container_message_path)],
+                check=False,
+            )
 
             if result.returncode != 0:
                 self.logger.error(f"Resume failed with code {result.returncode}")
