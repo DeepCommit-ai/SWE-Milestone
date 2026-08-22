@@ -56,4 +56,4 @@ The dataset-build side (DeepCommit-Env `test_runner/core/classifier.py`) should
 fail or flag duplicate raw IDs instead of overwriting them, so both ends of the
 contract are gated.
 
-Background and the full fix design: `docs/scoring-id-identity-fix.md`.
+Background and the full fix design: `docs/maintainers/scoring-id-identity-fix.md`.

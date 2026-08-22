@@ -38,7 +38,7 @@ results lack:
    ``PROMOTION_NOTES.md`` listing what the mirror does *not* regenerate
    (trial ``summary.json`` / ``summary_filtered.json``, ``feedback_report.md``,
    ``artifacts.tar.gz``, stale filtered results) under the campaign directory,
-   for a later human-approved promotion (docs/re-evaluation.md). Nothing is
+   for a later human-approved promotion (docs/maintainers/re-evaluation.md). Nothing is
    ever written into the source cell. Re-running on an already corrected cell
    is a verified no-op (``already-identity``).
 """
@@ -766,7 +766,7 @@ def rescore_cell(
     (out_cell / "evaluation_result.json").write_text(json.dumps(patched, indent=2) + "\n")
 
     # Copy the selected artifact directory so the promoted cell's artifacts
-    # agree with its result (docs/re-evaluation.md, promotion rule 2). A
+    # agree with its result (docs/maintainers/re-evaluation.md, promotion rule 2). A
     # payload that only survives inside artifacts.tar.gz is extracted from it.
     artifacts_note = _copy_selected_artifacts(cell_dir, selected, out_cell)
 

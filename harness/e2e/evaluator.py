@@ -6696,7 +6696,7 @@ fi
         test_id_normalizer = TestIdNormalizer(framework=test_framework, enable_normalization=True)
         if test_framework is None:
             # Identity keying is safe for an unresolved framework, but the
-            # dataset should name one (docs/adding-a-repo.md, item 1).
+            # dataset should name one (docs/maintainers/adding-a-repo.md, item 1).
             print("⚠️  test framework unresolved for this milestone; scoring with identity keys "
                   "(configuration defect: set framework in the milestone test_config)")
 

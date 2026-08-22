@@ -10,7 +10,7 @@ Examples:
       --out /data2/gangda/SWE-Milestone-data/reeval/issue24/scikit_gpt56 --mode report
 
   # Also write corrected outputs under --out/mirror/<repo>/<trial>/<MID>/ for a
-  # later human-approved promotion (docs/re-evaluation.md):
+  # later human-approved promotion (docs/maintainers/re-evaluation.md):
   ... --mode mirror
 
 See harness/e2e/rescore.py for the replay-selection procedure and invariants.

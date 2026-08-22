@@ -55,7 +55,7 @@ Consequences for this spec:
    classification, test-config, repo-config and filter-list hashes; replay policies; era; scorer
    revision) and `PROMOTION_NOTES.md`. It does **not** regenerate the trial `summary.json` /
    `summary_filtered.json`, `feedback_report.md` or `artifacts.tar.gz`; those are listed as stale
-   and must be handled at promotion (docs/re-evaluation.md). Inputs drift (stored repo-config
+   and must be handled at promotion (docs/maintainers/re-evaluation.md). Inputs drift (stored repo-config
    binding ≠ current config; classification ≠ the one at the trial's recorded data commit) makes
    a cell non-replayable. Re-running on an already corrected cell is a verified no-op.
 6. **Known residuals not addressed on this branch**: Ginkgo package-aware key (F1a), two-sided
@@ -329,7 +329,7 @@ prevalence by category and namesake outcome; per-cell list.
      and by `harness/e2e/rescore.py`; `evaluation_result.json` carries a `scoring_identity`
      provenance block (policy, payload path + sha256, classification sha256, collisions).
      Tests: `tests/e2e/test_scoring_identity.py`, `tests/e2e/test_rescore.py`.
-   - PR-2 (new-repo contract): `scripts/check_test_id_identity.py` + `docs/adding-a-repo.md` —
+   - PR-2 (new-repo contract): `scripts/check_test_id_identity.py` + `docs/maintainers/adding-a-repo.md` —
      framework must resolve; no duplicate raw IDs; identity key injective over every universe
      (Ginkgo merges reported as the bridge residual); optional expected ∪ runtime check; meant
      to run on repo onboarding and every dataset rebuild, with the dataset-build side
@@ -337,7 +337,7 @@ prevalence by category and namesake outcome; per-cell list.
 1. Ginkgo module mapping (F1a) and the two-sided bridge (F2) → follow-up issue, not this branch.
 2. (superseded by 0)
 3. Impact run → `SCORE_DELTA_issue24.md`; review.
-4. Human-approved promotion per `docs/re-evaluation.md` (append-only backup; promote result
+4. Human-approved promotion per `docs/maintainers/re-evaluation.md` (append-only backup; promote result
    **and** artifacts; sync summaries; record the flip).
 5. Versioning: harness-only, zero image/data bytes → fold under the current version
    (`docs/versioning.md` "Hotfix"); release-notes line. Publish corrected cells (log corpus);
