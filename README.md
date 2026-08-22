@@ -137,6 +137,8 @@ python scripts/run_all.py --config trial_config.yaml
 ```
 
 > **See [docs/running-trials.md](docs/running-trials.md) for the day-to-day operational runbook (launch, monitor, recover from stuck repos)**, and [docs/advanced.md](docs/advanced.md) for single-repo / single-milestone debugging, result collection, `e2e_config.yaml`, and lock internals.
+>
+> The full docs index is [docs/README.md](docs/README.md); documents for maintaining the benchmark itself (re-evaluation, image patching, dataset contracts) live under [docs/maintainers/](docs/maintainers/README.md).
 
 **3. Monitor** — check progress in another terminal:
 

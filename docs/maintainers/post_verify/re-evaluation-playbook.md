@@ -2,7 +2,7 @@
 
 Run this before, during, and after any re-evaluation campaign (re-scoring
 frozen agent artifacts after a data/image/eval-code repair, no agent re-run).
-The protocol (rules, promotion) lives in `docs/re-evaluation.md`; this file is
+The protocol (rules, promotion) lives in `docs/maintainers/re-evaluation.md`; this file is
 the **operational checklist and silent-failure catalog** — what actually goes
 wrong in the field.
 
@@ -106,13 +106,13 @@ done `4e09cae`).
 `monitor.sh --data-root <log>/reeval --detail <repo>` reads the mirror tree
 directly; diff against the primary root for per-milestone deltas (aggregates
 are meaningless pre-promotion — only re-evaluated cells have data). Promotion
-is the explicit, human-approved 4-step in `docs/re-evaluation.md` (append-only
+is the explicit, human-approved 4-step in `docs/maintainers/re-evaluation.md` (append-only
 backup → copy outputs → **sync summary.json** → SCORE_DELTA). Primary record
 is never written before that.
 
 ## Cross-references
 
-- `docs/re-evaluation.md` — protocol, promotion procedure, monitor preview.
+- `docs/maintainers/re-evaluation.md` — protocol, promotion procedure, monitor preview.
 - `infra-failure-audit.md` — the signature-cluster method these sweeps use;
   its `INFRA_FAILURE_PATTERNS` is where confirmed signatures get promoted.
 - `prune-config-authoring.md` — prune semantics behind fe-style out-of-scope

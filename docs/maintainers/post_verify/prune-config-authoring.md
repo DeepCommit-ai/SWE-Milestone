@@ -1,6 +1,6 @@
 # Post-Verify — Prune Config Authoring & Audit
 
-Residue prune ([spec](../superpowers/specs/residue-prune-spec.md)) is
+Residue prune ([spec](../../superpowers/specs/residue-prune-spec.md)) is
 **default-off**. A dataset must
 set `residue_prune: true` explicitly in its repository config after its
 src/test partition and prune facts pass the acceptance gate below. An absent

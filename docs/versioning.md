@@ -135,7 +135,7 @@ numbers. `BENCHMARK_VERSION` and the `:v1.0.1` image digests are untouched.
 
 Patch releases (`vX.Y.Z`) — repairing published images, rc-tag campaigns,
 and the promotion runbook that reuses steps 3-5 below with carried-over
-name sets — are specified in **[image-patching.md](image-patching.md)**.
+name sets — are specified in **[image-patching.md](maintainers/image-patching.md)**.
 Their core invariant: the released image is digest-identical to what the
 re-evaluation campaign scored ("evaluate-then-christen").
 
@@ -215,7 +215,7 @@ deliberately narrow — it moves a tag that has already been published, so:
 - **Images stay put.** Folding keeps `BENCHMARK_VERSION` unchanged, so the
   `:vX.Y.Z` image tags and their digest manifest are untouched. If a fix
   requires new image bytes it is not a hotfix — cut a patch and follow
-  [image-patching.md](image-patching.md).
+  [image-patching.md](maintainers/image-patching.md).
 - **Record it.** A fix folded this way is invisible in the version number, so
   the release notes for that version get a line saying what moved and why. For
   a spec change, `docs/spec-debt.md` still applies — folding does not remove
