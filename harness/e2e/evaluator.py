@@ -995,21 +995,66 @@ def build_nodeid_map(test_ids: List[str], go_module: Optional[str] = None) -> Di
     return result
 
 
+# Scoring-identity policies (issue #24).
+#
+# The scoring key is the test's identity: two expected IDs that map to the same
+# key share one outcome slot. ``identity-v2`` keeps the raw ID for every
+# framework whose baseline and runtime reports already use one format (pytest,
+# jest, cargo, go_test, vitest, playwright, ...). Only Maven/Gradle hashcode
+# folding and the Ginkgo module-prefix bridge remain as deliberate, documented
+# exceptions. The legacy policies exist solely so stored results can be
+# replayed byte-for-byte during re-tally selection; they must never be used to
+# score a new cell.
+SCORING_ID_POLICY_IDENTITY = "identity-v2"
+# The scorer on main before this fix: prefix-dropping key for every non-Java
+# framework, Java keeps its module and folds hashcodes, conservative
+# (fail-close) aggregation, guarded Java module-less fallback.
+SCORING_ID_POLICY_LEGACY = "legacy-prefix-drop"
+# The scorer before 0a779f0 (2026-07-15): prefix-dropping key for every
+# framework including Java, last-write ("pass-wins") aggregation, no Java
+# module-less fallback. Replay selection only.
+SCORING_ID_POLICY_LEGACY_PASSWINS = "legacy-prefix-drop-passwins"
+SCORING_ID_POLICY_DEFAULT = SCORING_ID_POLICY_IDENTITY
+SCORING_ID_POLICIES = (
+    SCORING_ID_POLICY_IDENTITY,
+    SCORING_ID_POLICY_LEGACY,
+    SCORING_ID_POLICY_LEGACY_PASSWINS,
+)
+# Frameworks whose baseline and runtime IDs genuinely differ in representation
+# (Ginkgo: module-qualified baseline vs module-relative runtime package). They
+# keep the prefix-dropping bridge under every policy until a pinned module
+# mapping makes a package-aware key possible (tracked separately from #24).
+_PREFIX_DROP_FRAMEWORKS = frozenset({"ginkgo"})
+
+
 def normalize_scoring_nodeid(
     nodeid: str,
     framework: Optional[str],
     go_module: Optional[str] = None,
+    policy: str = SCORING_ID_POLICY_DEFAULT,
 ) -> str:
-    """Normalize a test ID without discarding identity-bearing prefixes.
+    """Canonical scoring key for a test ID.
 
-    Maven and Gradle Surefire IDs use ``module::class::method``.  The module
-    prefix is part of the test identity: different reactor modules can contain
-    the same class and method names.  Other frameworks retain the historical
-    Ginkgo/path normalization behavior.
+    Maven and Gradle Surefire IDs use ``module::class::method``; the module
+    prefix is part of the test identity (different reactor modules can contain
+    the same class and method names), so only JVM hashcodes are folded. Ginkgo
+    keeps the historical prefix-dropping bridge (see ``_PREFIX_DROP_FRAMEWORKS``).
+    Every other framework's ID is already identical on both sides, so under the
+    default policy it is returned unchanged: a file or module path is just as
+    identity-bearing as a Maven module, and dropping it made same-named tests in
+    different files share one outcome (issue #24).
     """
+    if policy not in SCORING_ID_POLICIES:
+        raise ValueError(f"unknown scoring identity policy: {policy!r}")
+    if policy == SCORING_ID_POLICY_LEGACY_PASSWINS:
+        # Faithful to the scorer before 0a779f0 (2026-07-15): every framework,
+        # Java included, went through the prefix-dropping Ginkgo normalizer.
+        return normalize_ginkgo_nodeid(nodeid, go_module)
     if framework in ("maven", "gradle"):
         return normalize_java_hashcode(nodeid)
-    return normalize_ginkgo_nodeid(nodeid, go_module)
+    if policy != SCORING_ID_POLICY_IDENTITY or framework in _PREFIX_DROP_FRAMEWORKS:
+        return normalize_ginkgo_nodeid(nodeid, go_module)
+    return nodeid
 
 
 def _java_moduleless_nodeid(nodeid: str) -> str:
@@ -1042,33 +1087,63 @@ def _aggregate_test_outcomes(outcomes: List[str]) -> str:
     return "skipped"
 
 
-def _build_scoring_test_outcomes(
+@dataclass
+class ScoringIndexes:
+    """Runtime outcome indexes keyed by the scoring identity policy.
+
+    ``collisions`` lists every canonical key that more than one *distinct* raw
+    nodeid mapped to. Under ``identity-v2`` this cannot happen for frameworks
+    whose key is the raw ID, so any entry there is either an approved
+    equivalence (Maven hashcode instances), the documented Ginkgo residual, or
+    evidence that a lossy key crept back in — in which case ``untrusted`` is
+    set and the cell must not be scored as-is.
+    """
+
+    exact: Dict[str, str] = field(default_factory=dict)
+    normalized_groups: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+    java_moduleless_groups: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+    raw_by_canonical: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+    collisions: List[Dict[str, Any]] = field(default_factory=list)
+    untrusted: bool = False
+    policy: str = SCORING_ID_POLICY_DEFAULT
+    framework: Optional[str] = None
+
+
+def _build_scoring_indexes(
     summary_payload: Dict[str, Any],
     *,
     framework: Optional[str],
     go_module: Optional[str] = None,
     normalizer: Optional[TestIdNormalizer] = None,
-) -> Tuple[
-    Dict[str, str],
-    Dict[str, List[Tuple[str, str]]],
-    Dict[str, List[Tuple[str, str]]],
-]:
-    """Build exact, fuzz-normalized, and guarded Java fallback indexes."""
-    exact: Dict[str, str] = {}
-    normalized_groups: Dict[str, List[Tuple[str, str]]] = {}
-    java_moduleless_groups: Dict[str, List[Tuple[str, str]]] = {}
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+) -> ScoringIndexes:
+    """Build exact, fuzz-normalized, and guarded Java fallback indexes, plus the
+    identity-collision record for the chosen policy."""
+    idx = ScoringIndexes(policy=policy, framework=framework)
+    exact = idx.exact
+    normalized_groups = idx.normalized_groups
+    java_moduleless_groups = idx.java_moduleless_groups
+    raw_by_canonical = idx.raw_by_canonical
     summary_results = summary_payload.get("results", {})
     if not isinstance(summary_results, dict):
-        return exact, normalized_groups, java_moduleless_groups
+        return idx
+
+    passwins = policy == SCORING_ID_POLICY_LEGACY_PASSWINS
 
     def add_outcome(nodeid: str, outcome: str) -> None:
-        canonical = normalize_scoring_nodeid(nodeid, framework, go_module)
+        canonical = normalize_scoring_nodeid(nodeid, framework, go_module, policy)
         if canonical in exact:
-            exact[canonical] = _aggregate_test_outcomes([exact[canonical], outcome])
+            if passwins:
+                # Pre-2026-07-15 scorers overwrote the slot; the last observation
+                # added (``passed`` is added last) won. Replay-selection only.
+                exact[canonical] = outcome
+            else:
+                exact[canonical] = _aggregate_test_outcomes([exact[canonical], outcome])
         else:
             exact[canonical] = outcome
+        raw_by_canonical.setdefault(canonical, []).append((nodeid, outcome))
 
-        if framework in ("maven", "gradle"):
+        if framework in ("maven", "gradle") and not passwins:
             moduleless = _java_moduleless_nodeid(canonical)
             java_moduleless_groups.setdefault(moduleless, []).append((canonical, outcome))
 
@@ -1076,6 +1151,40 @@ def _build_scoring_test_outcomes(
             fuzz_normalized = normalizer.normalize(nodeid)
             normalized_groups.setdefault(fuzz_normalized, []).append((nodeid, outcome))
 
+    _add_payload_outcomes(summary_results, add_outcome)
+
+    for canonical in sorted(raw_by_canonical):
+        observations = raw_by_canonical[canonical]
+        raw_ids = sorted({raw for raw, _ in observations})
+        if len(raw_ids) < 2:
+            continue
+        if policy != SCORING_ID_POLICY_IDENTITY:
+            kind, approved = f"legacy:{policy}", False
+        elif framework in ("maven", "gradle"):
+            kind, approved = "java-hashcode-instances", True
+        elif framework in _PREFIX_DROP_FRAMEWORKS:
+            kind, approved = "ginkgo-prefix-drop-residual", False
+        else:
+            kind, approved = "unexpected-lossy-key", False
+        idx.collisions.append(
+            {
+                "canonical": canonical,
+                "raw_ids": raw_ids,
+                "outcomes": sorted(f"{raw}={outcome}" for raw, outcome in observations),
+                "kind": kind,
+                "approved": approved,
+            }
+        )
+        if kind == "unexpected-lossy-key":
+            idx.untrusted = True
+    return idx
+
+
+def _add_payload_outcomes(
+    summary_results: Dict[str, Any], add_outcome: Callable[[str, str], None]
+) -> None:
+    """Feed every observation of a standardized report to ``add_outcome`` in the
+    scorer's canonical order (failed, error, xpassed, xfailed, skipped, passed)."""
     for item in summary_results.get("failed", []):
         if isinstance(item, dict) and item.get("nodeid"):
             add_outcome(item["nodeid"], "failed")
@@ -1096,7 +1205,28 @@ def _build_scoring_test_outcomes(
     for test_id in summary_results.get("passed", []) or []:
         add_outcome(test_id, "passed")
 
-    return exact, normalized_groups, java_moduleless_groups
+
+def _build_scoring_test_outcomes(
+    summary_payload: Dict[str, Any],
+    *,
+    framework: Optional[str],
+    go_module: Optional[str] = None,
+    normalizer: Optional[TestIdNormalizer] = None,
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+) -> Tuple[
+    Dict[str, str],
+    Dict[str, List[Tuple[str, str]]],
+    Dict[str, List[Tuple[str, str]]],
+]:
+    """Compatibility view of ``_build_scoring_indexes`` (exact, fuzz, java)."""
+    idx = _build_scoring_indexes(
+        summary_payload,
+        framework=framework,
+        go_module=go_module,
+        normalizer=normalizer,
+        policy=policy,
+    )
+    return idx.exact, idx.normalized_groups, idx.java_moduleless_groups
 
 
 def _lookup_scoring_outcome(
@@ -1107,13 +1237,47 @@ def _lookup_scoring_outcome(
     normalized_groups: Dict[str, List[Tuple[str, str]]],
     java_moduleless_groups: Dict[str, List[Tuple[str, str]]],
     normalizer: Optional[TestIdNormalizer] = None,
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+    go_module: Optional[str] = None,
 ) -> str:
     """Resolve an outcome, allowing only unambiguous identity fallbacks."""
-    canonical = normalize_scoring_nodeid(test_id, framework)
-    if canonical in outcomes:
-        return outcomes[canonical]
+    return _lookup_scoring_match(
+        test_id,
+        framework=framework,
+        outcomes=outcomes,
+        normalized_groups=normalized_groups,
+        java_moduleless_groups=java_moduleless_groups,
+        normalizer=normalizer,
+        policy=policy,
+        go_module=go_module,
+    )[0]
 
-    if framework in ("maven", "gradle"):
+
+def _lookup_scoring_match(
+    test_id: str,
+    *,
+    framework: Optional[str],
+    outcomes: Dict[str, str],
+    normalized_groups: Dict[str, List[Tuple[str, str]]],
+    java_moduleless_groups: Dict[str, List[Tuple[str, str]]],
+    normalizer: Optional[TestIdNormalizer] = None,
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+    go_module: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Resolve (outcome, match_kind) for an expected test ID.
+
+    match_kind is one of ``exact`` (canonical key hit), ``java-moduleless``
+    (guarded module-less bridge), ``fuzzy`` (TestIdNormalizer group, e.g. Go
+    random subtests) or ``unknown`` (never observed). Recorded per category so a
+    re-tally can show how every expected ID was matched.
+    """
+    canonical = normalize_scoring_nodeid(test_id, framework, go_module, policy)
+    if canonical in outcomes:
+        return outcomes[canonical], "exact"
+
+    # The module-less bridge did not exist before 0a779f0; the pass-wins replay
+    # policy must not use it.
+    if framework in ("maven", "gradle") and policy != SCORING_ID_POLICY_LEGACY_PASSWINS:
         matches = java_moduleless_groups.get(_java_moduleless_nodeid(canonical), [])
         matched_ids = {matched_id for matched_id, _ in matches}
         if len(matched_ids) == 1:
@@ -1122,18 +1286,18 @@ def _lookup_scoring_outcome(
             # explicitly name different modules, they are different tests even
             # when class/method text happens to match.
             if _java_nodeid_has_module(canonical) != _java_nodeid_has_module(runtime_id):
-                return _aggregate_test_outcomes([outcome for _, outcome in matches])
+                return _aggregate_test_outcomes([outcome for _, outcome in matches]), "java-moduleless"
         # More than one module owns this class/method.  Returning unknown is
         # fail-closed: never credit module A with module B's result.
         if matches:
-            return "unknown"
+            return "unknown", "unknown"
 
     if normalizer:
         matches = normalized_groups.get(normalizer.normalize(test_id), [])
         if matches:
-            return _aggregate_test_outcomes([outcome for _, outcome in matches])
+            return _aggregate_test_outcomes([outcome for _, outcome in matches]), "fuzzy"
 
-    return "unknown"
+    return "unknown", "unknown"
 
 
 def _partition_none_to_pass(
@@ -1199,6 +1363,280 @@ def _absent_suites_from_missing_ids(
     return sorted(absent)
 
 
+def _sha256_file(path: Optional[Path]) -> str:
+    """Hex digest of a file's bytes, or "" when the path is unset/unreadable."""
+    if not path:
+        return ""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _extract_test_ids(items: List[Any]) -> List[str]:
+    """Classification entries may be bare IDs or dicts carrying test_id/nodeid."""
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            test_id = item.get("test_id") or item.get("nodeid")
+            if test_id:
+                ids.append(test_id)
+        else:
+            ids.append(item)
+    return ids
+
+
+def _dedupe_by_normalization(
+    test_ids: List[str], normalizer: Optional[TestIdNormalizer] = None
+) -> List[str]:
+    """Deduplicate test IDs by their fuzz-normalized form.
+
+    For fuzz/parameterized tests with random IDs (e.g., TestMap/JBzrWpYM,
+    TestMap/bYuXm9Hl), this groups them into a single logical test (TestMap).
+    Without a normalizer the list is returned unchanged.
+    """
+    if not normalizer:
+        return test_ids
+
+    seen: Set[str] = set()
+    result: List[str] = []
+    for test_id in test_ids:
+        if not test_id:
+            continue
+        normalized = normalizer.normalize(test_id)
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)  # Use normalized ID
+    return result
+
+
+def select_classification(baseline_classification: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Pick the classification view used for resolved judgment.
+
+    ``stable_classification`` (flaky tests excluded) wins, then the full
+    ``classification``, else the document itself (legacy layout). Returns the
+    view and which key it came from so callers can log the choice.
+    """
+    if "stable_classification" in baseline_classification:
+        return baseline_classification["stable_classification"], "stable_classification"
+    if "classification" in baseline_classification:
+        return baseline_classification["classification"], "classification"
+    return baseline_classification, "root"
+
+
+@dataclass
+class ScoringTally:
+    """Result of the pure scoring tally (issue #24).
+
+    Everything the evaluator derives from (runtime payload × classification)
+    before the evaluator-state gates (Go compile contract, residue prune,
+    infrastructure) are applied. ``strict_resolved`` is the category-only
+    verdict; callers AND it with their own locks.
+    """
+
+    policy: str
+    framework: Optional[str]
+    fail_to_pass_ids: List[str]
+    pass_to_pass_ids: List[str]
+    none_to_pass_ids: List[str]
+    fail_to_pass_ids_raw_count: int
+    pass_to_pass_ids_raw_count: int
+    none_to_pass_ids_raw_count: int
+    fail_to_pass_success: List[str]
+    fail_to_pass_failure: List[str]
+    pass_to_pass_failure: List[str]
+    pass_to_pass_success_count: int
+    pass_to_pass_missing: int
+    none_to_pass_success: List[str]
+    none_to_pass_failure: List[str]
+    none_to_pass_missing: int
+    missing_p2p_ids: List[str]
+    missing_n2p_ids: List[str]
+    absent_suites: List[str]
+    total_tests: int
+    passed_tests: int
+    failed_tests: int
+    error_tests: int
+    skipped_tests: int
+    strict_resolved: bool
+    identity_collisions: List[Dict[str, Any]]
+    identity_untrusted: bool
+    # How every expected ID was matched, per category:
+    # {"fail_to_pass": {"exact": n, "fuzzy": n, "java-moduleless": n, "unknown": n}, ...}
+    match_trace: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+
+def tally_scoring(
+    summary_payload: Dict[str, Any],
+    baseline_classification: Dict[str, Any],
+    *,
+    framework: Optional[str],
+    normalizer: Optional[TestIdNormalizer],
+    policy: str = SCORING_ID_POLICY_DEFAULT,
+    go_module: Optional[str] = None,
+    classification_to_use: Optional[Dict[str, Any]] = None,
+) -> ScoringTally:
+    """Canonicalise, index, look up, partition and count — nothing else.
+
+    Pure: depends only on its arguments, so production scoring and the re-tally
+    tool (which replays stored payloads under a pinned ``policy``) run the very
+    same code. Behaviour under ``SCORING_ID_POLICY_LEGACY`` reproduces the
+    pre-#24 scorer; ``SCORING_ID_POLICY_LEGACY_PASSWINS`` additionally
+    reproduces the pre-2026-07-15 last-write aggregation for replay selection.
+    """
+    if classification_to_use is None:
+        classification_to_use, _ = select_classification(baseline_classification)
+
+    summary = summary_payload.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+
+    indexes = _build_scoring_indexes(
+        summary_payload,
+        framework=framework,
+        go_module=go_module,
+        normalizer=normalizer,
+        policy=policy,
+    )
+
+    match_trace: Dict[str, Dict[str, int]] = {
+        "fail_to_pass": {}, "pass_to_pass": {}, "none_to_pass": {}
+    }
+    current_category = [""]
+
+    def lookup_outcome(test_id: str) -> str:
+        outcome, kind = _lookup_scoring_match(
+            test_id,
+            framework=framework,
+            outcomes=indexes.exact,
+            normalized_groups=indexes.normalized_groups,
+            java_moduleless_groups=indexes.java_moduleless_groups,
+            normalizer=normalizer,
+            policy=policy,
+            go_module=go_module,
+        )
+        cat = current_category[0]
+        if cat:
+            bucket = match_trace[cat]
+            bucket[kind] = bucket.get(kind, 0) + 1
+        return outcome
+
+    # Extract and deduplicate test IDs by normalization
+    # This handles fuzz/parameterized tests with random IDs (e.g., TestMap/xxx)
+    # by grouping them into single logical tests
+    fail_to_pass_ids_raw = _extract_test_ids(classification_to_use.get("fail_to_pass", []))
+    pass_to_pass_ids_raw = _extract_test_ids(classification_to_use.get("pass_to_pass", []))
+    none_to_pass_ids_raw = _extract_test_ids(classification_to_use.get("none_to_pass", []))
+    if not none_to_pass_ids_raw:
+        none_to_pass_ids_raw = [
+            t.get("test_id")
+            for t in baseline_classification.get("new_tests", [])
+            if isinstance(t, dict) and t.get("end_outcome") == "passed"
+        ]
+
+    # Deduplicate by normalization (e.g., 9 TestMap/* → 1 TestMap)
+    fail_to_pass_ids = _dedupe_by_normalization(fail_to_pass_ids_raw, normalizer)
+    pass_to_pass_ids = _dedupe_by_normalization(pass_to_pass_ids_raw, normalizer)
+    none_to_pass_ids = _dedupe_by_normalization(none_to_pass_ids_raw, normalizer)
+
+    # Check which fail_to_pass tests now pass (stable tests only)
+    current_category[0] = "fail_to_pass"
+    fail_to_pass_success: List[str] = []
+    fail_to_pass_failure: List[str] = []
+    for test_id in fail_to_pass_ids:
+        current_outcome = lookup_outcome(test_id)
+        if current_outcome == "passed":
+            fail_to_pass_success.append(test_id)
+        else:
+            fail_to_pass_failure.append(test_id)
+
+    # Check for pass_to_pass failures (regressions) - stable tests only
+    current_category[0] = "pass_to_pass"
+    pass_to_pass_failure: List[str] = []
+    pass_to_pass_success_count = 0
+    pass_to_pass_missing = 0
+    for test_id in pass_to_pass_ids:
+        current_outcome = lookup_outcome(test_id)
+        if current_outcome in ("failed", "error"):
+            pass_to_pass_failure.append(test_id)
+        elif current_outcome == "passed":
+            pass_to_pass_success_count += 1
+        else:
+            # Test not found in results (skipped module or ID mismatch)
+            pass_to_pass_missing += 1
+
+    # Check which none_to_pass tests now pass (stable tests only)
+    current_category[0] = "none_to_pass"
+    none_to_pass_success, none_to_pass_failure, none_to_pass_missing = (
+        _partition_none_to_pass(none_to_pass_ids, lookup_outcome)
+    )
+    current_category[0] = ""
+
+    # Which suites owed results and reported nothing at all. Recorded, not
+    # scored: the cause is ambiguous (build death vs ID drift).
+    missing_p2p_ids = [
+        test_id for test_id in pass_to_pass_ids if lookup_outcome(test_id) == "unknown"
+    ]
+    missing_n2p_ids = [
+        test_id
+        for test_id in none_to_pass_ids
+        if test_id and lookup_outcome(test_id) == "unknown"
+    ]
+    absent_suites = _absent_suites_from_missing_ids(
+        missing_ids=missing_p2p_ids + missing_n2p_ids,
+        observed_nodeids=indexes.exact.keys(),
+        framework=framework,
+    )
+
+    # Category-only resolution: all F2P pass, no P2P regression, every P2P
+    # observed, all N2P pass. Zero executed tests with required tests is never
+    # resolved (the tests should have run).
+    total_tests = summary.get("total", 0)
+    has_required_tests = (
+        len(fail_to_pass_ids) > 0 or len(pass_to_pass_ids) > 0 or len(none_to_pass_ids) > 0
+    )
+    if total_tests == 0 and has_required_tests:
+        strict_resolved = False
+    else:
+        strict_resolved = (
+            len(fail_to_pass_success) == len(fail_to_pass_ids)
+            and len(pass_to_pass_failure) == 0
+            and pass_to_pass_missing == 0
+            and len(none_to_pass_success) == len(none_to_pass_ids)
+        )
+
+    return ScoringTally(
+        policy=policy,
+        framework=framework,
+        fail_to_pass_ids=fail_to_pass_ids,
+        pass_to_pass_ids=pass_to_pass_ids,
+        none_to_pass_ids=none_to_pass_ids,
+        fail_to_pass_ids_raw_count=len(fail_to_pass_ids_raw),
+        pass_to_pass_ids_raw_count=len(pass_to_pass_ids_raw),
+        none_to_pass_ids_raw_count=len(none_to_pass_ids_raw),
+        fail_to_pass_success=fail_to_pass_success,
+        fail_to_pass_failure=fail_to_pass_failure,
+        pass_to_pass_failure=pass_to_pass_failure,
+        pass_to_pass_success_count=pass_to_pass_success_count,
+        pass_to_pass_missing=pass_to_pass_missing,
+        none_to_pass_success=none_to_pass_success,
+        none_to_pass_failure=none_to_pass_failure,
+        none_to_pass_missing=none_to_pass_missing,
+        missing_p2p_ids=missing_p2p_ids,
+        missing_n2p_ids=missing_n2p_ids,
+        absent_suites=absent_suites,
+        total_tests=total_tests,
+        passed_tests=summary.get("passed", 0),
+        failed_tests=summary.get("failed", 0),
+        error_tests=summary.get("error", 0),
+        skipped_tests=summary.get("skipped", 0),
+        strict_resolved=strict_resolved,
+        identity_collisions=list(indexes.collisions),
+        identity_untrusted=indexes.untrusted,
+        match_trace=match_trace,
+    )
+
+
 def _find_free_port() -> int:
     """Ask the OS for a free TCP port. Host-network evaluations get a unique
     webServer port per run via SWE_MILESTONE_EVAL_PORT (fixed ports would make
@@ -1261,14 +1699,28 @@ def _infer_framework_from_test_config(workspace_root: Path, milestone_id: str) -
             modes = json.load(f)
     except Exception:
         return None
-    if not isinstance(modes, list):
+    if isinstance(modes, dict):
+        # Legacy object-form test_config (pre-mode-list milestones, e.g. dubbo
+        # M020): an explicit framework key is authoritative; otherwise infer
+        # from the command template and per-class commands below. Rejecting
+        # this shape outright left the milestone scored with framework=None.
+        explicit = modes.get("test_framework") or modes.get("framework")
+        if explicit:
+            return str(explicit)
+        command_texts = [str(modes.get("test_command_template", ""))]
+        for entry in modes.get("test_classes", []) or []:
+            if isinstance(entry, dict):
+                command_texts.append(str(entry.get("test_command", "")))
+        joined = "\n".join(command_texts).lower()
+    elif isinstance(modes, list):
+        for mode in modes:
+            if isinstance(mode, dict) and mode.get("framework"):
+                return mode["framework"]
+        joined = "\n".join(
+            str(m.get("test_cmd", "")) for m in modes if isinstance(m, dict)
+        ).lower()
+    else:
         return None
-    for mode in modes:
-        if isinstance(mode, dict) and mode.get("framework"):
-            return mode["framework"]
-    joined = "\n".join(
-        str(m.get("test_cmd", "")) for m in modes if isinstance(m, dict)
-    ).lower()
     # Order matters: match the specific tool before the generic 'test' word.
     if "cargo test" in joined:
         return "cargo"
@@ -1477,10 +1929,20 @@ class EvaluationResult:
     # infrastructure-invalid cell.  Keep the reason explicit in raw JSON so
     # every downstream collector preserves it in the denominator.
     scored_failure_reason: str = ""
+    # Scoring identity (issue #24): which key policy tallied this cell, the
+    # provenance of the payload it tallied, and any identity collisions. An
+    # unexpected collision (a lossy key crept back in) locks resolution False.
+    scoring_id_policy: str = ""
+    identity_collision_untrusted: bool = False
+    scoring_identity: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Classify zero-test results at the result boundary."""
         self.classify_zero_test_result()
+        # An unexpected scoring-identity collision is a validity failure: the
+        # tally cannot be trusted, so the verdict can never be resolved.
+        if self.identity_collision_untrusted:
+            self.resolved = False
 
     def _has_build_failure_evidence(self) -> bool:
         return bool(
@@ -1519,6 +1981,8 @@ class EvaluationResult:
         (F-2a). Any resolution recompute (orchestrator/run_milestone) MUST AND
         this in so it cannot flip resolved back to True (codex F1)."""
         if self.infrastructure_failure or self.infra_invalid_reason:
+            return True
+        if self.identity_collision_untrusted:
             return True
         return self.residue_prune_skipped_reason in FAIL_CLOSED_SKIP_REASONS
 
@@ -1675,6 +2139,11 @@ class EvaluationResult:
                 "error": self.go_module_closure_error,
             },
         }
+        # The dataclass fields are authoritative; the dict may carry extra
+        # provenance but must not contradict them.
+        result["scoring_identity"] = dict(self.scoring_identity or {})
+        result["scoring_identity"]["policy"] = self.scoring_id_policy or result["scoring_identity"].get("policy", "")
+        result["scoring_identity"]["untrusted"] = bool(self.identity_collision_untrusted)
         result["infrastructure_failure"] = self.infrastructure_failure
         result["scored_failure_reason"] = self.scored_failure_reason
         result["infra_invalid"] = bool(
@@ -1774,6 +2243,13 @@ class EvaluationResult:
             ),
             runtime_policy_sha256=str(environment.get("runtime_policy_sha256") or ""),
             runtime_policy_mode=str(environment.get("runtime_policy_mode") or ""),
+            scoring_id_policy=str(
+                (data.get("scoring_identity") or {}).get("policy") or ""
+            ),
+            identity_collision_untrusted=bool(
+                (data.get("scoring_identity") or {}).get("untrusted") or False
+            ),
+            scoring_identity=dict(data.get("scoring_identity") or {}),
         )
 
     def summary(self) -> str:
@@ -6218,152 +6694,83 @@ fi
             self.repo_config, self.workspace_root, self.milestone_id, _baseline_ids
         )
         test_id_normalizer = TestIdNormalizer(framework=test_framework, enable_normalization=True)
+        if test_framework is None:
+            # Identity keying is safe for an unresolved framework, but the
+            # dataset should name one (docs/maintainers/adding-a-repo.md, item 1).
+            print("⚠️  test framework unresolved for this milestone; scoring with identity keys "
+                  "(configuration defect: set framework in the milestone test_config)")
+
+        payload_source: Optional[Path] = None
 
         def load_summary_payload(results: Dict[str, Any]) -> Dict[str, Any]:
-            """Prefer eval_summary.json when available; fall back to provided results."""
+            """Prefer eval_summary.json when available; fall back to provided results.
+
+            Records which file the tallied payload came from so the result can
+            carry its provenance (issue #24 re-tally selection needs it)."""
+            nonlocal payload_source
+            merged_path = self.output_dir / "eval.json"
             if isinstance(results.get("results"), dict) and isinstance(results.get("summary"), dict):
+                payload_source = merged_path if merged_path.exists() else None
                 return results
 
             summary_path = self.output_dir / "eval_summary.json"
             if summary_path.exists():
                 try:
                     with open(summary_path) as f:
-                        return json.load(f)
+                        loaded = json.load(f)
+                    payload_source = summary_path
+                    return loaded
                 except Exception as e:
                     logger.warning(f"Failed to load eval summary from {summary_path}: {e}")
 
+            payload_source = merged_path if merged_path.exists() else None
             return results
 
-        def extract_test_ids(items: List[Any]) -> List[str]:
-            ids: List[str] = []
-            for item in items:
-                if isinstance(item, dict):
-                    test_id = item.get("test_id") or item.get("nodeid")
-                    if test_id:
-                        ids.append(test_id)
-                else:
-                    ids.append(item)
-            return ids
-
-        def dedupe_by_normalization(test_ids: List[str], normalizer: Optional[TestIdNormalizer] = None) -> List[str]:
-            """Deduplicate test IDs by their normalized form.
-
-            For fuzz/parameterized tests with random IDs (e.g., TestMap/JBzrWpYM,
-            TestMap/bYuXm9Hl), this groups them into a single logical test (TestMap).
-
-            Args:
-                test_ids: List of original test IDs
-                normalizer: TestIdNormalizer for fuzz test normalization
-
-            Returns:
-                List of unique normalized test IDs
-            """
-            if not normalizer:
-                return test_ids
-
-            seen: Set[str] = set()
-            result: List[str] = []
-            for test_id in test_ids:
-                if not test_id:
-                    continue
-                normalized = normalizer.normalize(test_id)
-                if normalized not in seen:
-                    seen.add(normalized)
-                    result.append(normalized)  # Use normalized ID
-            return result
-
         # Use stable_classification if available, otherwise fall back to classification
-        if "stable_classification" in baseline_classification:
-            classification_to_use = baseline_classification["stable_classification"]
+        classification_to_use, classification_source = select_classification(
+            baseline_classification
+        )
+        if classification_source == "stable_classification":
             print("📊 Using stable_classification for resolved judgment (excluding flaky tests)")
-        elif "classification" in baseline_classification:
-            classification_to_use = baseline_classification["classification"]
+        elif classification_source == "classification":
             print("⚠️  No stable_classification found, using full classification")
-        else:
-            classification_to_use = baseline_classification
 
         summary_payload = load_summary_payload(test_results)
         summary = summary_payload.get("summary", {})
         if not isinstance(summary, dict):
             summary = {}
 
-        # Build test outcomes with normalized nodeids
-        # Test results are already in /testbed format, so no go_module needed
-        # Pass normalizer for fuzz test matching
-        test_outcomes, normalized_groups, java_moduleless_groups = _build_scoring_test_outcomes(
+        # Core tally (issue #24): canonicalise, index, look up, partition, count.
+        # Shared with the re-tally tool so stored results replay through the
+        # very same code under a pinned identity policy.
+        tally = tally_scoring(
             summary_payload,
+            baseline_classification,
+            classification_to_use=classification_to_use,
             framework=test_framework,
             normalizer=test_id_normalizer,
+            policy=SCORING_ID_POLICY_DEFAULT,
         )
-
-        def lookup_outcome(test_id: str) -> str:
-            return _lookup_scoring_outcome(
-                test_id,
-                framework=test_framework,
-                outcomes=test_outcomes,
-                normalized_groups=normalized_groups,
-                java_moduleless_groups=java_moduleless_groups,
-                normalizer=test_id_normalizer,
-            )
-
-        # Extract and deduplicate test IDs by normalization
-        # This handles fuzz/parameterized tests with random IDs (e.g., TestMap/xxx)
-        # by grouping them into single logical tests
-        fail_to_pass_ids_raw = extract_test_ids(classification_to_use.get("fail_to_pass", []))
-        pass_to_pass_ids_raw = extract_test_ids(classification_to_use.get("pass_to_pass", []))
-        none_to_pass_ids_raw = extract_test_ids(classification_to_use.get("none_to_pass", []))
-        if not none_to_pass_ids_raw:
-            none_to_pass_ids_raw = [
-                t.get("test_id")
-                for t in baseline_classification.get("new_tests", [])
-                if isinstance(t, dict) and t.get("end_outcome") == "passed"
-            ]
-
-        # Deduplicate by normalization (e.g., 9 TestMap/* → 1 TestMap)
-        fail_to_pass_ids = dedupe_by_normalization(fail_to_pass_ids_raw, test_id_normalizer)
-        pass_to_pass_ids = dedupe_by_normalization(pass_to_pass_ids_raw, test_id_normalizer)
-        none_to_pass_ids = dedupe_by_normalization(none_to_pass_ids_raw, test_id_normalizer)
+        fail_to_pass_ids = tally.fail_to_pass_ids
+        pass_to_pass_ids = tally.pass_to_pass_ids
+        none_to_pass_ids = tally.none_to_pass_ids
+        fail_to_pass_success = tally.fail_to_pass_success
+        fail_to_pass_failure = tally.fail_to_pass_failure
+        pass_to_pass_failure = tally.pass_to_pass_failure
+        pass_to_pass_success_count = tally.pass_to_pass_success_count
+        pass_to_pass_missing = tally.pass_to_pass_missing
+        none_to_pass_success = tally.none_to_pass_success
+        none_to_pass_failure = tally.none_to_pass_failure
+        none_to_pass_missing = tally.none_to_pass_missing
+        absent_suites = tally.absent_suites
 
         # Log deduplication stats if any reduction occurred
-        if len(fail_to_pass_ids) < len(fail_to_pass_ids_raw):
-            print(f"📊 F2P deduped: {len(fail_to_pass_ids_raw)} → {len(fail_to_pass_ids)} tests")
-        if len(pass_to_pass_ids) < len(pass_to_pass_ids_raw):
-            print(f"📊 P2P deduped: {len(pass_to_pass_ids_raw)} → {len(pass_to_pass_ids)} tests")
-        if len(none_to_pass_ids) < len(none_to_pass_ids_raw):
-            print(f"📊 N2P deduped: {len(none_to_pass_ids_raw)} → {len(none_to_pass_ids)} tests")
-
-        # Check which fail_to_pass tests now pass (stable tests only)
-        # Use lookup_outcome for normalized matching (handles fuzz tests)
-        fail_to_pass_success = []
-        fail_to_pass_failure = []
-        for test_id in fail_to_pass_ids:
-            current_outcome = lookup_outcome(test_id)
-            if current_outcome == "passed":
-                fail_to_pass_success.append(test_id)
-            else:
-                fail_to_pass_failure.append(test_id)
-
-        # Check for pass_to_pass failures (regressions) - stable tests only
-        # Use lookup_outcome for normalized matching (handles fuzz tests)
-        pass_to_pass_failure = []
-        pass_to_pass_success_count = 0
-        pass_to_pass_missing = 0
-        for test_id in pass_to_pass_ids:
-            current_outcome = lookup_outcome(test_id)
-            if current_outcome in ("failed", "error"):
-                pass_to_pass_failure.append(test_id)
-            elif current_outcome == "passed":
-                pass_to_pass_success_count += 1
-            else:
-                # Test not found in results (skipped module or ID mismatch)
-                pass_to_pass_missing += 1
-
-        # Check which none_to_pass tests now pass (stable tests only)
-        # Use lookup_outcome for normalized matching (handles fuzz tests)
-        # Must be done BEFORE resolved calculation
-        none_to_pass_success, none_to_pass_failure, none_to_pass_missing = (
-            _partition_none_to_pass(none_to_pass_ids, lookup_outcome)
-        )
+        if len(fail_to_pass_ids) < tally.fail_to_pass_ids_raw_count:
+            print(f"📊 F2P deduped: {tally.fail_to_pass_ids_raw_count} → {len(fail_to_pass_ids)} tests")
+        if len(pass_to_pass_ids) < tally.pass_to_pass_ids_raw_count:
+            print(f"📊 P2P deduped: {tally.pass_to_pass_ids_raw_count} → {len(pass_to_pass_ids)} tests")
+        if len(none_to_pass_ids) < tally.none_to_pass_ids_raw_count:
+            print(f"📊 N2P deduped: {tally.none_to_pass_ids_raw_count} → {len(none_to_pass_ids)} tests")
 
         if none_to_pass_ids:
             print(
@@ -6380,21 +6787,6 @@ fi
         # scored: the cause is ambiguous (build death vs ID drift), so it must
         # not silently re-grade the cell — but without it a suite that died at
         # package initialisation is indistinguishable from one with no tests.
-        missing_p2p_ids = [
-            test_id
-            for test_id in pass_to_pass_ids
-            if lookup_outcome(test_id) == "unknown"
-        ]
-        missing_n2p_ids = [
-            test_id
-            for test_id in none_to_pass_ids
-            if test_id and lookup_outcome(test_id) == "unknown"
-        ]
-        absent_suites = _absent_suites_from_missing_ids(
-            missing_ids=missing_p2p_ids + missing_n2p_ids,
-            observed_nodeids=test_outcomes.keys(),
-            framework=test_framework,
-        )
         if absent_suites:
             self._eval_meta["partial_test_universe"] = True
             preview = ", ".join(absent_suites[:5])
@@ -6404,25 +6796,57 @@ fi
                 f"entry at all: {preview}{more}"
             )
 
-        # Determine if milestone resolved (based on stable tests only)
-        # All three test categories must pass:
-        # - FAIL_TO_PASS: All required tests must now pass
-        # - PASS_TO_PASS: No regressions AND all must run (tests that passed before must still pass)
-        # - NONE_TO_PASS: All new tests must pass
-        total_tests = summary.get("total", 0)
-        has_required_tests = len(fail_to_pass_ids) > 0 or len(pass_to_pass_ids) > 0 or len(none_to_pass_ids) > 0
-        if total_tests == 0 and has_required_tests:
-            resolved = False  # Tests didn't run but should have
-        else:
-            resolved = (
-                len(fail_to_pass_success) == len(fail_to_pass_ids)  # All F2P tests pass
-                and len(pass_to_pass_failure) == 0  # No regressions
-                and pass_to_pass_missing == 0  # All P2P tests must run
-                and len(none_to_pass_success) == len(none_to_pass_ids)  # All N2P tests pass
-            )
+        # Category-only resolution comes from the tally (all F2P pass, no P2P
+        # regression, every P2P observed, all N2P pass; zero executed tests with
+        # required tests is never resolved). The evaluator-state gates below can
+        # only lower it.
+        resolved = tally.strict_resolved
 
         if pass_to_pass_missing > 0:
             print(f"⚠️  PASS_TO_PASS Missing: {pass_to_pass_missing} tests not found (skipped modules or ID mismatch)")
+
+        if tally.identity_collisions:
+            unexpected = sum(
+                1 for c in tally.identity_collisions if c.get("kind") == "unexpected-lossy-key"
+            )
+            print(
+                f"🔎 scoring identity: {len(tally.identity_collisions)} canonical key(s) shared "
+                f"by distinct raw test IDs ({unexpected} unexpected)"
+            )
+        if tally.identity_untrusted:
+            print("🚫 resolved forced False: unexpected scoring-identity collision (lossy key)")
+            resolved = False
+
+        # Provenance of what was tallied (issue #24): the exact payload file and
+        # classification, so a later re-tally can prove it replays this cell.
+        cell_dir = (
+            self.output_dir.parent.parent
+            if self.output_dir.parent.name == "artifacts"
+            else None
+        )
+        payload_rel = ""
+        if payload_source is not None:
+            try:
+                payload_rel = (
+                    str(payload_source.relative_to(cell_dir)) if cell_dir else str(payload_source)
+                )
+            except ValueError:
+                payload_rel = str(payload_source)
+        classification_file = getattr(self, "baseline_classification", None)
+        scoring_identity = {
+            "policy": tally.policy,
+            "framework": test_framework,
+            "payload_path": payload_rel,
+            "payload_sha256": _sha256_file(payload_source),
+            "classification_file": Path(classification_file).name if classification_file else "",
+            "classification_sha256": _sha256_file(
+                Path(classification_file) if classification_file else None
+            ),
+            "collision_count": len(tally.identity_collisions),
+            "collisions": tally.identity_collisions,
+            "untrusted": tally.identity_untrusted,
+            "match_trace": tally.match_trace,
+        }
 
         # Compatibility mode may still score completed packages, but a
         # submission that failed the exact production compile gate can never
@@ -6471,6 +6895,9 @@ fi
             pass_to_pass_required=len(pass_to_pass_ids),
             none_to_pass_required=len(none_to_pass_ids),
             none_to_pass_achieved=len(none_to_pass_success),
+            scoring_id_policy=tally.policy,
+            identity_collision_untrusted=tally.identity_untrusted,
+            scoring_identity=scoring_identity,
             base_tag=self._eval_meta["base_tag"],
             fallback_triggered=self._eval_meta["fallback_triggered"],
             end_compile_error=self._eval_meta["end_compile_error"],
