@@ -297,8 +297,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("DRY RUN: nothing written (pass --execute)")
         return 0
     backup_dir = args.backup_root / args.campaign
-    if backup_dir.exists() and any(backup_dir.iterdir()):
-        print(f"refusing: {backup_dir} already holds a backup (append-only; use a new --campaign name)", file=sys.stderr)
+    # append-only per (campaign, repo): a campaign may span repos, but the same
+    # repo is promoted once per campaign name
+    if (backup_dir / args.repo).exists() and any((backup_dir / args.repo).iterdir()):
+        print(f"refusing: {backup_dir / args.repo} already holds a backup (append-only; use a new --campaign name)", file=sys.stderr)
         return 3
     backup_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
