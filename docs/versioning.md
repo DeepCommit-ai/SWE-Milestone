@@ -133,6 +133,16 @@ over 60 published reports with zero score changes, and the runner fixes do not
 touch evaluation — so the same version label keeps reproducing the same
 numbers. `BENCHMARK_VERSION` and the `:v1.0.1` image digests are untouched.
 
+Fold record for `v1.0.1` (2026-08-22): the code tag moved forward from
+`2455532` to `125009c`, folding in PR #36 (docs layout) and PR #34 (issue #24:
+the scoring key keeps each test's identity instead of dropping its path, plus
+the `rescore` re-tally tool and the dataset identity gate). Score-touching, so
+the published cells it changes were re-tallied from their own stored reports
+and promoted; the data-tree records under `reeval/issue24/` (SCORE_DELTA,
+SCORE_CHANGES_this_round) say which arms moved and by how much. Results
+produced before this fold cite their evaluator commit in
+`evaluation_environment.harness_revision`.
+
 Patch releases (`vX.Y.Z`) — repairing published images, rc-tag campaigns,
 and the promotion runbook that reuses steps 3-5 below with carried-over
 name sets — are specified in **[image-patching.md](maintainers/image-patching.md)**.
