@@ -117,14 +117,14 @@ AND p ∈ START 树                      # 溯源守卫(阶段一;阶段二撤�
 | 2026-07-10 | 门 1:Rust 不豁免,全语言统一 v2(V1-R LIVE=0);门 2:破坏面可枚举可控(V1-G) |
 | 2026-07-10 | **用户裁定**:契约缺口属实验设置而非剪枝风险,SRS 补全(4b)是既定方法论;剪枝产出的 CONTRACT-GAP 清单 = 4b 工作队列 |
 | 2026-07-10 | **用户认可**:边界毛刺用内置 keep-list 点名解决;保守分阶段(1a 记录先行 → 1b Go 两 range 止血 → 阶段二全量+4b) |
-| 2026-07-10 | **放置裁定**:本 spec 随评测器代码在本仓库维护(docs/residue-prune-spec.md);法医分析与数据 refine 方法论留在 DeepCommit docs/backlog |
+| 2026-07-10 | **放置裁定**:本 spec 随评测器代码在本仓库维护(docs/maintainers/residue-prune-spec.md);法医分析与数据 refine 方法论留在 DeepCommit docs/backlog |
 | 2026-07-10 | **keep-list 三分放置**:事实 = SWE-Milestone-data metadata.json `prune_keep_list`;机制 = 本仓库评测器;生成流程 = DeepCommit([#28](https://github.com/DeepCommit-ai/DeepCommit-Env/issues/28)),实现经验回填后落地 |
 | 2026-07-10 | **用户批准开始实现**:1a + 1b 两阶段;阶段二仍待 4b 契约批次 |
 | 2026-07-11 | **1a+1b 实现落地**(`106a9b0`),`harness/e2e/residue_prune.py` 纯逻辑 + evaluator/orchestrator/run_milestone 接线;A/B run1(12 cell)全部归因 |
 | 2026-07-11 | **对抗审查一轮**(claude 双 subagent 正确性/红队 + 我自查):F1 完整性门 fail-open(→改 fail-closed)、F2 过滤器漂移、F3 语言范围泄漏 + 6 小项,`c04907a` 修复 |
 | 2026-07-11 | **codex 独立复查**发现 claude 三方都漏的 **Critical**:orchestrator `_run_evaluation_once` 用阈值重算覆盖 fail-closed verdict(CLI 路径安全、真实 trial 路径失效)。连同 codex F2–F6(capture 侧 symlink 绕过、config-omission fail-open、witness 不完整、sidecar 未绑定、扩展未归一化)一并修复 → **`EvaluationResult.scoring_untrusted` 属性,所有 resolved 重算点必须 AND 之** |
 | 2026-07-11 | **§11 越界改动逐条裁决**(用户):11.1 A/B/C 全部保留,B 补加固(丢弃日志 debug→warning + 存量 tar 只读扫描);11.2 D/E 保留(re-evaluation 流程 = 现实漂移场景,witness 非未来假想);11.3 F/G 均追认;11.4-H 按双信号重写(porcelain 未提交 + prev-tag diff 范围外;采集容器无 START tag——setup 反泄漏删光,以 prev agent-impl tag 为最近基线)。spec 按用户裁定留在 process artifacts 区,不搬回 docs/ |
-| 2026-07-11 | **通用化(用户指示"扩展到所有 repo 所有语言,任何数据可复用")**:默认开语义(`resolve_prune_enablement`:有 src/test 分区即剪,legacy 无分区不剪不锁分)+ 全语言默认扩展;验证 run4(5 新 range:V3 GT-as-agent 5/5 全绿、V4 ON/OFF 10/10 逐 test CLEAN)+ run5(navidrome/go-zero 全语言 B/C 对照 16/16 SAME,案例 B 的 TS/JSX 通道修复实证,.lua 边界正确);config 生成 skill 落 `docs/post_verify/prune-config-authoring.md`(agent 智能生成 metadata 事实/代码只管谓词的分工)。**生效推迟**至 glm-5.2 批次结束(pending 清单:代码 commit + 数据 repo revert a383f21)。**附带发现**:跨镜像同名 tag 树不一致 → DeepCommit-Env#29,离线分析必须用 milestone 自己的镜像 |
+| 2026-07-11 | **通用化(用户指示"扩展到所有 repo 所有语言,任何数据可复用")**:默认开语义(`resolve_prune_enablement`:有 src/test 分区即剪,legacy 无分区不剪不锁分)+ 全语言默认扩展;验证 run4(5 新 range:V3 GT-as-agent 5/5 全绿、V4 ON/OFF 10/10 逐 test CLEAN)+ run5(navidrome/go-zero 全语言 B/C 对照 16/16 SAME,案例 B 的 TS/JSX 通道修复实证,.lua 边界正确);config 生成 skill 落 `docs/maintainers/post_verify/prune-config-authoring.md`(agent 智能生成 metadata 事实/代码只管谓词的分工)。**生效推迟**至 glm-5.2 批次结束(pending 清单:代码 commit + 数据 repo revert a383f21)。**附带发现**:跨镜像同名 tag 树不一致 → DeepCommit-Env#29,离线分析必须用 milestone 自己的镜像 |
 | 待定 | dbtest 宽限(倾向阶段一不做特判,记入 4b 批次);阶段二启动时间(随 4b 契约批次);sidecar tar-digest 硬绑定(codex F5 深化,follow-up);GT 自洽普查扩展(nushell core_dev.1 census + go-zero M004 自评失败,数据侧) |
 
 ## 10. 无安全门 + fail-closed 架构(对抗审查后确立,2026-07-11 用户裁定去门)
@@ -150,7 +150,7 @@ AND p ∈ START 树                      # 溯源守卫(阶段一;阶段二撤�
 
 ### 11.2 witness 机械(D/E)→ **保留**
 
-裁决依据:`docs/re-evaluation.md` 的重评流程(旧 tar × data-side repair 后的 metadata)**就是**"采集后漂移"的现实场景——witness 保证重评时不把"采集期被过滤的测试文件"误判为 agent 删除。非未来假想,保留 D(capture_filter sidecar + eval 侧重建)与 E(tag 绑定)。
+裁决依据:`docs/maintainers/re-evaluation.md` 的重评流程(旧 tar × data-side repair 后的 metadata)**就是**"采集后漂移"的现实场景——witness 保证重评时不把"采集期被过滤的测试文件"误判为 agent 删除。非未来假想,保留 D(capture_filter sidecar + eval 侧重建)与 E(tag 绑定)。
 
 ### 11.3 设计判断(F/G)→ **均追认**
 
