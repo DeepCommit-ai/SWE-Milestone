@@ -227,9 +227,10 @@ deliberately narrow — it moves a tag that has already been published, so:
   requires new image bytes it is not a hotfix — cut a patch and follow
   [image-patching.md](maintainers/image-patching.md).
 - **Record it.** A fix folded this way is invisible in the version number, so
-  the release notes for that version get a line saying what moved and why. For
-  a spec change, `docs/spec-debt.md` still applies — folding does not remove
-  the obligation, it only skips the version bump.
+  the release notes for that version get a line saying what moved and why.
+  Folding removes nothing else a bump would have required (the record, the
+  release-note line, labelling published results with the commit they ran);
+  it only skips the version number.
 - **Say it out loud when it matters.** Anyone who ran against the pre-fold tag
   has results the current tag no longer reproduces. That is the cost being
   accepted. Where those results are published, label them with what they

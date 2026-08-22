@@ -1824,7 +1824,7 @@ class EvaluationResult:
     none_to_pass_required: int
     none_to_pass_achieved: int
 
-    # Fail-loud eval metadata (docs/residue-prune-spec.md, phases 1a/1b)
+    # Fail-loud eval metadata (docs/maintainers/residue-prune-spec.md, phases 1a/1b)
     base_tag: str = ""  # full tag the eval tree was based on, e.g. milestone-M1-end
     fallback_triggered: bool = False  # END base failed -> graded on START base
     end_compile_error: str = ""  # first fatal context from the failed END-base build
@@ -6180,7 +6180,7 @@ fi
 
         print(f"Successfully extracted tar archive: {self.patch_file.name}")
 
-        # Residue prune (docs/residue-prune-spec.md): enforce source-file
+        # Residue prune (docs/maintainers/residue-prune-spec.md): enforce source-file
         # authority before env patches re-create excluded files.
         prune_ok, prune_error = self._maybe_prune_residue(base_suffix=base_suffix)
         if not prune_ok:

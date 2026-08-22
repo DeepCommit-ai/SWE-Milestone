@@ -1,4 +1,4 @@
-"""Tests for residue prune (docs/residue-prune-spec.md, phases 1a/1b).
+"""Tests for residue prune (docs/maintainers/residue-prune-spec.md, phases 1a/1b).
 
 Covers the pure decision layer:
 - v2 prunability predicate (code-source conjunction + never-delete classes)
