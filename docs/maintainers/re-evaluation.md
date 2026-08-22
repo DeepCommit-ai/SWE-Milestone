@@ -120,6 +120,19 @@ Run that playbook before launching and before believing any score.
 
 ## Promotion procedure (explicit, human-approved; per campaign)
 
+**Tooling (2026-08-22):** promotion is executed with `scripts/promote_cells.py`
+(dry-run by default, `--execute` writes). It performs the four steps below for
+every listed cell atomically: append-only backup, result + filtered (a stale
+filtered file is deleted when the source has none), artifacts + repacked
+`artifacts.tar.gz` when the source ships artifacts, provenance files, and the
+`summary.json` / `summary_filtered.json` key update (attempt kept, keys never
+created). Do not promote by hand: the 2026-07-16 promotion that copied results
+without artifacts is exactly what the tool and the release gate
+(`scripts/check_record_consistency.py`, step 0 of `release.sh`) now prevent.
+Cells are enumerated with `collect_results.authoritative_cells()` so a retry
+attempt that carries the board number is the one promoted and checked.
+
+
 Promotion = replacing evaluator *outputs* in the primary record after the
 mechanical comparison passed. Never enabled by default; each campaign is
 promoted once, by hand, after user sign-off.

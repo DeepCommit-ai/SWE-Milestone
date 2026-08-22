@@ -14,6 +14,7 @@ from harness.e2e.collect_results import (
     is_resolved,
     is_zero_test_build_failure,
     load_e2e_results,
+    authoritative_cells,
 )
 
 
@@ -355,3 +356,48 @@ def test_repo_summary_keeps_infra_invalid_in_all_graded_denominators(
     assert summary["score_reliable"] == 50.0
     assert summary["precision"] == 50.0
     assert summary["recall"] == 50.0
+
+
+def _cell(evaluation, name, resolved=False, with_result=True):
+    d = evaluation / name
+    d.mkdir(parents=True, exist_ok=True)
+    if with_result:
+        (d / "evaluation_result.json").write_text(json.dumps({
+            "milestone_id": name.split("-retry")[0], "resolved": resolved, "patch_successfully_applied": True,
+            "test_summary": {"total": 10, "passed": 9, "failed": 1, "error": 0,
+                             "fail_to_pass_required": 1, "fail_to_pass_achieved": 1,
+                             "none_to_pass_required": 0, "none_to_pass_achieved": 0,
+                             "pass_to_pass_required": 9, "pass_to_pass_achieved": 8, "pass_to_pass_missing": 0},
+        }))
+    return d
+
+
+def test_authoritative_cells_is_the_attempt_the_collector_serves(tmp_path):
+    trial = "trial_001"
+    evaluation = tmp_path / "e2e_trial" / trial / "evaluation"
+    evaluation.mkdir(parents=True)
+    # M1: base + two retries all with results; summary lists base and retry2 -> retry2 served
+    _cell(evaluation, "M1"); _cell(evaluation, "M1-retry1"); _cell(evaluation, "M1-retry2", resolved=True)
+    # M2: summary names retry2 (attempt 2) but only base and retry1 directories hold results
+    #     -> the newer summary-only attempt wins; no directory is served
+    _cell(evaluation, "M2"); _cell(evaluation, "M2-retry1"); _cell(evaluation, "M2-retry2", with_result=False)
+    # M3: no summary entry at all; highest attempt with a result is served
+    _cell(evaluation, "M3"); _cell(evaluation, "M3-retry1")
+    # M4: summary names the base directory with an explicit attempt 3 (unsuffixed dir) and a stale retry1 dir
+    _cell(evaluation, "M4"); _cell(evaluation, "M4-retry1")
+    (evaluation / "summary.json").write_text(json.dumps({"results": {
+        "M1": {"attempt": 0, "eval_status": "failed"}, "M1-retry2": {"attempt": 2, "eval_status": "failed"},
+        "M2": {"attempt": 0, "eval_status": "failed"}, "M2-retry2": {"attempt": 2, "eval_status": "error"},
+        "M4": {"attempt": 3, "eval_status": "failed"},
+    }}))
+    served = authoritative_cells(evaluation)
+    assert served == {
+        "M1": evaluation / "M1-retry2",
+        "M3": evaluation / "M3-retry1",
+        "M4": evaluation / "M4",
+    }
+    # and load_e2e_results agrees cell for cell
+    results, _ = load_e2e_results(tmp_path, trial)
+    assert results["M1"]["resolved"] is True and results["M1"]["_from_eval_result"]
+    assert "_from_eval_result" not in results["M2"]          # served from the summary only
+    assert results["M3"]["_from_eval_result"] and results["M4"]["_from_eval_result"]
