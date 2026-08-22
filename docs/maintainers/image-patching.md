@@ -3,8 +3,8 @@
 How to repair a published evaluation image, verify the repair, use it in a
 re-evaluation campaign, and promote it as a benchmark **patch release**
 (`vX.Y.Z`). This is the missing middle between `docs/versioning.md` (version
-identity, release mechanics) and `docs/re-evaluation.md` (re-scoring frozen
-agent artifacts). Detection of what needs patching: `docs/env-deps-verification.md`
+identity, release mechanics) and `docs/maintainers/re-evaluation.md` (re-scoring frozen
+agent artifacts). Detection of what needs patching: `docs/maintainers/env-deps-verification.md`
 + the `env-deps-audit` skill.
 
 One sentence: **patch = overlay on the published image, evaluated under an
@@ -38,7 +38,7 @@ evaluated.**
 | Overlay Dockerfile | `dockerfiles/<mid>/Dockerfile.<target-version>` in the **data repo** (e.g. `Dockerfile.v1.0.1`), committed on a patch branch `envfix-<target-version>` | `feature_enhancements/Dockerfile.v1.0`, `maintenance_ui_ux/Dockerfile.v1.0` |
 | Overlay contract | `ARG SOURCE_IMAGE` (defaults to the previous published version's image) + `ARG CLOSURE_IMAGE` (pinned base-offline) + `RUN --mount=type=bind,from=closure,…,readonly` offline install steps | `milestone_seed_599112e_1/Dockerfile` |
 | RC image tag (local only) | `swe-milestone/<repo_full>__<mid>:<target-version>-rc<N>` (e.g. `:v1.0.1-rc1`) | new |
-| Campaign record | `PATCHED_IMAGES.txt` (one milestone id per line) + rc tags **and their image IDs/digests** in the campaign's `EXPECTATION.md` | `docs/re-evaluation.md` |
+| Campaign record | `PATCHED_IMAGES.txt` (one milestone id per line) + rc tags **and their image IDs/digests** in the campaign's `EXPECTATION.md` | `docs/maintainers/re-evaluation.md` |
 | Released tag | `…:<target-version>` per `harness/e2e/image_version.py` naming (local + hub forms) | versioning.md |
 
 RC rules: rc tags are **campaign-scoped and floating** — never pushed to the
@@ -78,7 +78,7 @@ All three recorded in the campaign dir; any failure blocks the campaign.
    A declared baseline delta makes this a **baseline-changing patch** (§5).
 2. **Environment verification.** The repair target is present and resolvable
    in the rc image (env-deps probe catalog from the `env-deps-audit` skill /
-   `docs/env-deps-verification.md`), and `scripts/verify_env_deps.py
+   `docs/maintainers/env-deps-verification.md`), and `scripts/verify_env_deps.py
    --static` is clean for the repo.
 3. **No collateral drift.** `docker diff`-level sanity: the overlay touched
    only the intended stores (node_modules/site-packages/.m2/…), not
@@ -86,7 +86,7 @@ All three recorded in the campaign dir; any failure blocks the campaign.
 
 ## 4. Use in re-evaluation
 
-Per `docs/re-evaluation.md`, with one addition: the campaign's
+Per `docs/maintainers/re-evaluation.md`, with one addition: the campaign's
 `EXPECTATION.md` must pin, per patched milestone, the rc tag **and its
 image ID** — the validity of every replay cell is conditional on having run
 against exactly those bytes (the eval artifacts record
@@ -146,7 +146,7 @@ notes. CI's daily `verify_image_digests --hub` then monitors the new
 manifest like any other.
 
 After image promotion: **score promotion** for the campaign's cells follows
-`docs/re-evaluation.md` §Promotion (separate, human-approved, per campaign)
+`docs/maintainers/re-evaluation.md` §Promotion (separate, human-approved, per campaign)
 — scores were produced on rc bytes that are now, by digest identity, the
 released `vX.Y.Z` images, so promoted cells are labeled `vX.Y.Z` honestly.
 
@@ -157,10 +157,10 @@ detect (env-deps-audit)                    # what is broken, which cells
 → patch branch: overlay Dockerfiles       # data repo, envfix-vX.Y.Z
 → build rc images (offline)               # §2
 → gates: golden / env-probe / no-drift    # §3  — fail ⇒ fix overlay, rc+1
-→ re-eval campaign on rc tags             # §4, docs/re-evaluation.md
+→ re-eval campaign on rc tags             # §4, docs/maintainers/re-evaluation.md
 → USER reviews deltas                     # stop point
 → image promotion = patch release          # §6 (christening the rc bytes)
-→ score promotion                          # docs/re-evaluation.md §Promotion
+→ score promotion                          # docs/maintainers/re-evaluation.md §Promotion
 → publication                              # §9 — three independent chains
 ```
 

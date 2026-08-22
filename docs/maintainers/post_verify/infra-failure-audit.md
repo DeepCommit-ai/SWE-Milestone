@@ -43,7 +43,7 @@ arm's failures for a milestone, is an infrastructure suspect.
   top-level RuntimeError since the F-2b fix);
 - `scripts/monitor.sh <trial> --detail` (💥/error status clusters);
 - control probe: GT empty-overlay self-grade on the same image
-  (see docs/re-evaluation.md) — if GT fails the same way, the agent is
+  (see docs/maintainers/re-evaluation.md) — if GT fails the same way, the agent is
   innocent by construction.
 
 ## Re-evaluation trap (learned 2026-07-12)

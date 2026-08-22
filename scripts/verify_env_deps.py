@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static verification of SRS environment-dependency declarations.
 
-Implements the ``--static`` half of docs/env-deps-verification.md (design v3):
+Implements the ``--static`` half of docs/maintainers/env-deps-verification.md (design v3):
 for every milestone of a repo dataset, re-derive the environment expectation
 set from the SRS "Environment Dependency Changes" section with a strict
 grammar, reconcile it against the milestone's typed-exception file

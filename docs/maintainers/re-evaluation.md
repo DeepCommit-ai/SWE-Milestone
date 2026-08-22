@@ -115,7 +115,7 @@ the evaluator emit a **plausible but wrong score with no error raised** — it
 survives direction-only comparison. The operational checklist (image pin,
 `config/<repo>.yaml` reachability so `test_framework` normalization stays on,
 anchor probe, concurrency/network budget) and the catalog of incidents that
-each cost a full re-run live in **`docs/post_verify/re-evaluation-playbook.md`**.
+each cost a full re-run live in **`docs/maintainers/post_verify/re-evaluation-playbook.md`**.
 Run that playbook before launching and before believing any score.
 
 ## Promotion procedure (explicit, human-approved; per campaign)
