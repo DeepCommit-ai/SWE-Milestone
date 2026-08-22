@@ -4,7 +4,6 @@ input pinning, idempotence."""
 import json
 import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -240,15 +239,36 @@ def test_stored_result_that_no_candidate_reproduces_is_non_replayable(tmp_path):
     assert rec.manifest["nearest"]
 
 
-def test_two_reproducing_candidates_are_ambiguous(tmp_path):
+def test_two_reproducing_candidates_that_agree_under_identity_are_consistent(tmp_path):
     data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
     second = cell / "artifacts" / "456"
     second.mkdir()
-    (second / "eval_summary.json").write_text(json.dumps(COLLIDING))
+    # Same evidence written twice (different bytes: indentation), e.g. a
+    # re-run that produced an identical report. Immaterial ambiguity.
+    (second / "eval_summary.json").write_text(json.dumps(COLLIDING, indent=2))
+    rec = _run(cell, data_root, None)
+    assert rec.status == "replayable"
+    assert rec.candidates == 2
+    assert rec.ambiguous_consistent is True
+    assert len(rec.reproducing_shas) == 2
+    assert rec.selected_payload == "artifacts/123/eval_summary.json"  # first by path
+    assert rec.manifest["ambiguous_consistent"] is True
+
+
+def test_two_reproducing_candidates_that_disagree_under_identity_stay_ambiguous(tmp_path):
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    second = cell / "artifacts" / "456"
+    second.mkdir()
+    # Under the legacy prefix-drop key PY_A/PY_B merge and fail-close to
+    # failed either way, so both payloads reproduce the stored result; under
+    # the identity key they disagree on PY_A. Which one was scored is unknown.
+    swapped = _payload(passed=[PY_B], failed=[PY_A])
+    (second / "eval_summary.json").write_text(json.dumps(swapped))
     rec = _run(cell, data_root, None)
     assert rec.status == "non-replayable"
     assert rec.reason == "ambiguous-candidates"
     assert rec.candidates == 2
+    assert rec.ambiguous_consistent is False
 
 
 def test_same_path_different_bytes_in_tarball_is_a_distinct_candidate(tmp_path):
@@ -345,6 +365,56 @@ def test_classification_drift_against_trial_data_commit_is_non_replayable(tmp_pa
     rec2 = _run(cell, data_root, None)
     assert rec2.status == "non-replayable"
     assert rec2.reason == "classification-drift"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_classification_pin_resolves_when_git_root_is_above_data_root(tmp_path):
+    """Real layout: the data repository root is the parent of <data_root>
+    (``.../SWE-Milestone-data/<repo>``); ``git show`` must use a cwd-relative
+    path or the pin silently never resolves."""
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    git_root = data_root.parent
+    g = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q"], cwd=git_root, check=True)
+    subprocess.run(g + ["add", "-A"], cwd=git_root, check=True)
+    subprocess.run(g + ["commit", "-qm", "pin"], cwd=git_root, check=True)
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=git_root, capture_output=True, text=True, check=True).stdout.strip()
+    trial_dir = cell.parent.parent
+    (trial_dir / "trial_metadata.json").write_text(json.dumps({"data_version": {"commit": commit}}))
+    rec = _run(cell, data_root, None)
+    assert rec.status == "replayable"
+    assert rec.inputs["classification_pin"]["status"] == "match"
+    # drift after the pinned commit
+    cls = data_root / "test_results" / "M1" / "M1_classification.json"
+    cls.write_text(json.dumps({"stable_classification": {"pass_to_pass": [PY_A, PY_C], "fail_to_fail": [PY_B]}}))
+    rec2 = _run(cell, data_root, None)
+    assert (rec2.status, rec2.reason) == ("non-replayable", "classification-drift")
+    # a recorded commit that cannot be read is a broken pin, not "no pin"
+    (trial_dir / "trial_metadata.json").write_text(json.dumps({"data_version": {"commit": "0" * 40}}))
+    rec3 = _run(cell, data_root, None)
+    assert (rec3.status, rec3.reason) == ("non-replayable", "classification-pin-unresolvable")
+    assert rec3.inputs["classification_pin"]["status"] == "unresolvable"
+
+
+def test_mirror_extracts_artifacts_when_the_payload_only_survives_in_the_tarball(tmp_path):
+    import tarfile
+
+    data_root, cell = _make_world(tmp_path, COLLIDING, BASELINE)
+    stage = tmp_path / "stage" / "artifacts" / "123"
+    stage.mkdir(parents=True)
+    for name in ("eval_summary.json", "eval.json"):
+        shutil.copy(cell / "artifacts" / "123" / name, stage / name)
+    with tarfile.open(cell / "artifacts.tar.gz", "w:gz") as tf:
+        tf.add(stage, arcname="artifacts/123")
+    shutil.rmtree(cell / "artifacts")  # only the tarball remains
+    mirror = tmp_path / "mirror"
+    rec = _run(cell, data_root, mirror)
+    assert rec.status == "replayable" and rec.mirrored
+    out = mirror / "repo_x" / "trial_1" / "M1"
+    assert (out / "artifacts" / "123" / "eval_summary.json").exists()
+    assert (out / "artifacts" / "123" / "eval.json").exists()
+    assert "extracted from artifacts.tar.gz" in (out / "PROMOTION_NOTES.md").read_text()
+    assert rec.manifest["payload_source"] == "tarball"
 
 
 def test_retry_directory_uses_base_milestone_classification(tmp_path):

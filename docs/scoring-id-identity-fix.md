@@ -2,7 +2,7 @@
 
 Status: **v2 — revised after adversarial review (codex, 2026-08-21)** · Owner: harness/e2e ·
 Scope: `harness/e2e/evaluator.py` scoring path; re-tally of affected stored results.
-Review record: `reeval/issue24/codex_review_v1.md` (kept verbatim).
+Review record: `SWE-Milestone-data/reeval/issue24/codex_review_v1.md` (data tree, kept verbatim; not in this repository).
 
 ## 0. v3 addendum (2026-08-21) — scope narrowed after cross-agent evidence
 
@@ -87,10 +87,10 @@ missing P2P into success or regression). Issue #24 reports (a) on element-web an
 frameworks, and defines a **re-tally without re-execution** for affected cells, with a
 replay-selection procedure that makes historical re-tally trustworthy.
 
-## 2. Code pointers (current HEAD, verified by review)
+## 2. Code pointers (symbols; line numbers as of the review are not maintained)
 
 - `normalize_ginkgo_nodeid()` — `:943` (prefix drop `:968–972`, `" > "`→`" / "` `:974–975`).
-- `normalize_scoring_nodeid()` — `:998`; only `maven`/`gradle` escape to hashcode-only (`:1012`).
+- `normalize_scoring_nodeid()` in `harness/e2e/evaluator.py`; before the fix only `maven`/`gradle` escaped to hashcode-only.
 - `_aggregate_test_outcomes()` — `:1032`; precedence `error > failed > skipped > passed`.
 - `_build_scoring_test_outcomes()` — `:1045`; runtime outcomes keyed by canonical; collision
   merge `:1065–1069`. **Production calls it without `go_module`** (`:6293`).
@@ -354,7 +354,8 @@ prevalence by category and namesake outcome; per-cell list.
 
 ## 10. Acceptance criteria
 
-All Section 6 tests pass; existing suite green; invariants 7.4 hold on every replayable cell;
-`SCORE_DELTA_issue24.md` produced; scikit M11 nine cells and the #24 element pair behave as the
+Section 6 tests for the frameworks in scope (the Ginkgo/Java bridge cases are deferred, see §0)
+pass; existing suite green; invariants 7.4 hold on every replayable cell; `SCORE_DELTA_issue24.md`
+produced from the impact run (data tree); scikit M11 nine cells and the #24 element pair behave as the
 known positive controls; no cell outside the **old/new identity-difference set over expected ∪
 runtime IDs** changes; every changed cell carries a manifest.

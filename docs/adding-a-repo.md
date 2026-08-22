@@ -48,7 +48,7 @@ Run the check when the repo is added and on every dataset rebuild:
 ```bash
 python scripts/check_test_id_identity.py --data-root /data2/gangda/SWE-Milestone-data/<repo_key> --json report.json
 # optional: include one runtime report in the injectivity check
-python scripts/check_test_id_identity.py --data-root ... --runtime-payload <cell>/artifacts/<pid>/eval_summary.json
+python scripts/check_test_id_identity.py --data-root ... --runtime-payload <cell>/artifacts/<pid>/eval_summary.json --runtime-milestone <MID>
 ```
 
 Exit status 1 means a hard failure (items 1, 3, 4 for non-Ginkgo frameworks).

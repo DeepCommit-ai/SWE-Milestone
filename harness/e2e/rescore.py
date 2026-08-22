@@ -215,6 +215,8 @@ class CellRecord:
     collisions_new: int = 0
     untrusted_new: bool = False
     absent_suites_changed: bool = False
+    ambiguous_consistent: bool = False
+    reproducing_shas: List[str] = field(default_factory=list)
     filtered_regenerated: bool = False
     filtered_reason: str = ""
     mirrored: bool = False
@@ -345,15 +347,23 @@ def _classification_pin(
     if not commit:
         return pin
     pin["commit"] = commit
+    # ``<commit>:./<path>`` is resolved relative to the git work-tree cwd (the
+    # data root is normally a sub-directory of the data repository); a bare
+    # ``<commit>:<path>`` would be repo-root-relative and silently fail.
     try:
         proc = subprocess.run(
-            ["git", "-C", str(data_root), "show", f"{commit}:{classification_rel}"],
+            ["git", "-C", str(data_root), "show", f"{commit}:./{classification_rel}"],
             capture_output=True, timeout=30,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        pin["status"] = "unresolvable"
+        pin["error"] = exc.__class__.__name__
         return pin
     if proc.returncode != 0:
-        pin["status"] = "unavailable"
+        # A recorded commit that cannot be read is a broken pin, not "no pin":
+        # the caller treats it as non-replayable (fail closed).
+        pin["status"] = "unresolvable"
+        pin["error"] = proc.stderr.decode(errors="replace").strip()[:200]
         return pin
     pin["status"] = "match" if _sha256_bytes(proc.stdout) == current_sha else "mismatch"
     return pin
@@ -554,6 +564,9 @@ def rescore_cell(
     if pin["status"] == "mismatch":
         rec.status, rec.reason = "non-replayable", "classification-drift"
         return rec
+    if pin["status"] == "unresolvable":
+        rec.status, rec.reason = "non-replayable", "classification-pin-unresolvable"
+        return rec
 
     candidates, unreadable = _candidate_payloads(cell_dir, scratch / trial / milestone)
     rec.candidates = len(candidates)
@@ -584,9 +597,11 @@ def rescore_cell(
     stored_identity = envelope.get("scoring_identity") or {}
     if stored_identity.get("policy") == SCORING_ID_POLICY_IDENTITY:
         recorded_sha = str(stored_identity.get("payload_sha256") or "")
-        for cand in candidates:
-            if recorded_sha and cand.sha256 != recorded_sha:
-                continue
+        # Try the recorded digest first; a result tallied from an in-memory
+        # merged report records a digest no stored file has, so the other
+        # candidates are tried afterwards (the projection check is the proof).
+        ordered = sorted(candidates, key=lambda c: (0 if c.sha256 == recorded_sha else 1, c.relpath))
+        for cand in ordered:
             t = replay(cand, SCORING_ID_POLICY_IDENTITY)
             if t is not None and {k: _tally_projection(t)[k] for k in want} == want:
                 rec.status, rec.reason = "already-identity", "identity result reproduced; no change"
@@ -615,11 +630,29 @@ def rescore_cell(
                 )
     rec.reproducing = [{"payload": c.relpath, "sha256": c.sha256[:12], "policy": p} for c, p in reproducing]
     distinct = {(c.relpath, c.sha256) for c, _ in reproducing}
-    if len(distinct) != 1:
-        rec.status = "non-replayable"
-        rec.reason = "no-candidate-reproduces" if not distinct else "ambiguous-candidates"
+    if not distinct:
+        rec.status, rec.reason = "non-replayable", "no-candidate-reproduces"
         rec.manifest = {"nearest": nearest[:6]}
         return rec
+    if len(distinct) > 1:
+        # Several byte-different payloads reproduce the stored result. The
+        # ambiguity is immaterial only if they also agree under the identity
+        # key; then any of them is the same evidence and the first by path is
+        # selected (recorded as consistent). Otherwise it stays ambiguous.
+        by_key = {(c.relpath, c.sha256): c for c, _ in reproducing}
+        projections = []
+        for key in sorted(by_key):
+            t = replay(by_key[key], SCORING_ID_POLICY_IDENTITY)
+            projections.append(None if t is None else _tally_projection(t))
+        if any(pr is None for pr in projections) or any(pr != projections[0] for pr in projections):
+            rec.status, rec.reason = "non-replayable", "ambiguous-candidates"
+            rec.manifest = {"nearest": nearest[:6]}
+            return rec
+        rec.ambiguous_consistent = True
+        rec.reproducing_shas = [sha for _, sha in sorted(by_key)]
+        reproducing = [(c, p) for c, p in reproducing if (c.relpath, c.sha256) == sorted(by_key)[0]] + [
+            (c, p) for c, p in reproducing if (c.relpath, c.sha256) != sorted(by_key)[0]
+        ]
 
     selected = reproducing[0][0]
     policies = sorted({p for c, p in reproducing})
@@ -688,6 +721,8 @@ def rescore_cell(
         "payload_path": selected.relpath,
         "payload_source": selected.source,
         "payload_sha256": selected.sha256,
+        "ambiguous_consistent": rec.ambiguous_consistent,
+        "reproducing_payload_sha256s": rec.reproducing_shas,
         "classification_path": classification_rel,
         "classification_sha256": classification_sha,
         "classification_pin": pin,
@@ -731,13 +766,9 @@ def rescore_cell(
     (out_cell / "evaluation_result.json").write_text(json.dumps(patched, indent=2) + "\n")
 
     # Copy the selected artifact directory so the promoted cell's artifacts
-    # agree with its result (docs/re-evaluation.md, promotion rule 2).
-    if selected.source == "artifacts-dir":
-        src_dir = cell_dir / Path(selected.relpath).parent
-        dst_dir = out_cell / Path(selected.relpath).parent
-        if dst_dir.exists():
-            shutil.rmtree(dst_dir)
-        shutil.copytree(src_dir, dst_dir)
+    # agree with its result (docs/re-evaluation.md, promotion rule 2). A
+    # payload that only survives inside artifacts.tar.gz is extracted from it.
+    artifacts_note = _copy_selected_artifacts(cell_dir, selected, out_cell)
 
     stale = list(STALE_AFTER_RETALLY)
     if filter_list and any(
@@ -763,12 +794,40 @@ def rescore_cell(
         f"- selected payload: `{selected.relpath}` ({selected.source}, sha256 {selected.sha256})\n"
         "- this mirror contains: evaluation_result.json"
         + (", evaluation_result_filtered.json" if rec.filtered_regenerated else "")
-        + ", the selected artifact directory, rescore_manifest.json\n"
+        + f", {artifacts_note}, rescore_manifest.json\n"
         "- NOT regenerated here (must be handled at promotion):\n"
         + "".join(f"  - {s}\n" for s in stale)
     )
     rec.mirrored = True
     return rec
+
+
+def _copy_selected_artifacts(cell_dir: Path, selected: CandidatePayload, out_cell: Path) -> str:
+    """Materialise the selected payload's artifact directory in the mirror cell
+    (from artifacts/ or from artifacts.tar.gz) and describe what was copied."""
+    art_dir = Path(selected.relpath).parent  # artifacts/<pid>
+    dst_dir = out_cell / art_dir
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+    if selected.source == "artifacts-dir":
+        shutil.copytree(cell_dir / art_dir, dst_dir)
+        return f"the selected artifact directory `{art_dir}` (copied from artifacts/)"
+    tarball = cell_dir / "artifacts.tar.gz"
+    prefix = str(art_dir).strip("/") + "/"
+    with tarfile.open(tarball) as tf:
+        members = [
+            m for m in tf.getmembers()
+            if m.isfile() and m.name.lstrip("./").startswith(prefix)
+            and not (".." in Path(m.name).parts or Path(m.name).is_absolute())
+        ]
+        for m in members:
+            rel = m.name.lstrip("./")
+            target = out_cell / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            extracted = tf.extractfile(m)
+            if extracted is not None:
+                target.write_bytes(extracted.read())
+    return f"the selected artifact directory `{art_dir}` (extracted from artifacts.tar.gz, {len(members)} file(s))"
 
 
 # --- campaign driver ------------------------------------------------------------
