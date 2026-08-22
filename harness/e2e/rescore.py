@@ -833,14 +833,24 @@ def _copy_selected_artifacts(cell_dir: Path, selected: CandidatePayload, out_cel
 # --- campaign driver ------------------------------------------------------------
 
 
-def _iter_cells(trial_roots: Iterable[Path], cells: Iterable[Path]) -> List[Path]:
+def _iter_cells(
+    trial_roots: Iterable[Path], cells: Iterable[Path], authoritative: bool = False
+) -> List[Path]:
+    """Cells to process. With ``authoritative`` only the attempt directory the
+    collector serves per milestone (collect_results.authoritative_cells) is
+    taken from each trial root; otherwise every directory holding a result."""
     out: List[Path] = [Path(c) for c in cells]
     for root in trial_roots:
         eval_dir = Path(root) / "evaluation"
-        if eval_dir.is_dir():
-            for cell in sorted(eval_dir.iterdir()):
-                if cell.is_dir() and (cell / "evaluation_result.json").exists():
-                    out.append(cell)
+        if not eval_dir.is_dir():
+            continue
+        if authoritative:
+            from harness.e2e.collect_results import authoritative_cells
+            out.extend(authoritative_cells(eval_dir).values())
+            continue
+        for cell in sorted(eval_dir.iterdir()):
+            if cell.is_dir() and (cell / "evaluation_result.json").exists():
+                out.append(cell)
     return out
 
 
@@ -959,11 +969,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", required=True, type=Path, help="campaign output directory")
     ap.add_argument("--mode", choices=("report", "mirror"), default="report",
                     help="report: records only; mirror: also write corrected outputs under --out/mirror")
+    ap.add_argument("--authoritative", action="store_true",
+                    help="with --trial-root: only the attempt directory the collector serves per milestone "
+                         "(collect_results.authoritative_cells), not every directory holding a result")
     ap.add_argument("--include-pass-wins", action="store_true",
                     help="also mirror cells reproducible only under the pre-2026-07-15 pass-wins scorer "
                          "(frozen by default: their stored values may be lucky, not correct)")
     args = ap.parse_args(argv)
-    cells = _iter_cells(args.trial_root, args.cell)
+    cells = _iter_cells(args.trial_root, args.cell, authoritative=args.authoritative)
     if not cells:
         print("no cells found", file=sys.stderr)
         return 2

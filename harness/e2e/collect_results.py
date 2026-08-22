@@ -788,6 +788,95 @@ def find_milestones_e2e(workspace_root: Path, trials: List[str]) -> List[str]:
     return sorted(milestones, key=sort_milestone_key)
 
 
+
+def _read_summary_results(eval_dir: Path) -> Dict[str, Dict]:
+    """``results`` of ``<eval_dir>/summary.json`` ({} when absent/unreadable)."""
+    summary_path = eval_dir / "summary.json"
+    if not summary_path.exists():
+        return {}
+    try:
+        with open(summary_path) as f:
+            return json.load(f).get("results", {}) or {}
+    except Exception as e:  # noqa: BLE001 — a broken summary must not hide the results
+        print(f"Warning: Failed to load {summary_path}: {e}", file=sys.stderr)
+        return {}
+
+
+def _index_summary_attempts(
+    raw_results: Dict[str, Dict],
+) -> Tuple[Dict[str, Dict], Dict[str, int], Dict[str, str]]:
+    """Merge retry keys into base milestone IDs, keeping only the latest attempt
+    (``M001`` attempt 0 and ``M001-retry1`` attempt 1 -> the retry1 entry under
+    ``M001``).  Returns (results, attempt per base id, summary key per base id)."""
+    results: Dict[str, Dict] = {}
+    summary_attempts: Dict[str, int] = {}
+    summary_keys: Dict[str, str] = {}
+    for raw_key, raw_val in raw_results.items():
+        base_id = _strip_retry_suffix(raw_key)
+        attempt = raw_val.get("attempt", _get_retry_attempt(raw_key))
+        try:
+            attempt = int(attempt)
+        except (TypeError, ValueError):
+            attempt = _get_retry_attempt(raw_key)
+        if base_id not in results or attempt > summary_attempts[base_id]:
+            results[base_id] = dict(raw_val)
+            summary_attempts[base_id] = attempt
+            summary_keys[base_id] = raw_key
+    return results, summary_attempts, summary_keys
+
+
+def select_served_attempts(
+    eval_dir: Path,
+    summary_attempts: Dict[str, int],
+    summary_keys: Dict[str, str],
+    prefer_filtered: bool = True,
+) -> Dict[str, Tuple[str, int, Dict, Optional[str]]]:
+    """Per base milestone, the evaluation directory the collector serves:
+    ``(dir_name, attempt, eval_result, result_type)``.
+
+    Deterministic rule (shared by every consumer that must agree with the
+    leaderboard): the directory named by the summary's key when it holds a
+    result; otherwise the highest attempt that holds one; a directory older
+    than a newer summary-only attempt is not served at all.  Iterating the
+    directories directly could let an older retry overwrite a newer one."""
+    candidates: Dict[str, List[Tuple[str, int, Dict, Optional[str]]]] = {}
+    if eval_dir.exists():
+        for item in eval_dir.iterdir():
+            if is_milestone_dir(item):
+                dir_name = item.name
+                base_id = _strip_retry_suffix(dir_name)
+                eval_result, result_type = load_evaluation_result(
+                    item / "evaluation_result.json", prefer_filtered
+                )
+                if eval_result:
+                    candidates.setdefault(base_id, []).append(
+                        (dir_name, _get_retry_attempt(dir_name), eval_result, result_type)
+                    )
+    selected: Dict[str, Tuple[str, int, Dict, Optional[str]]] = {}
+    for base_id, cands in candidates.items():
+        preferred_key = summary_keys.get(base_id)
+        matching = [c for c in cands if c[0] == preferred_key]
+        candidate = matching[0] if matching else max(cands, key=lambda value: value[1])
+        # Never replace a known newer summary attempt with an older result file.
+        if base_id in summary_attempts and not matching and candidate[1] < summary_attempts[base_id]:
+            continue
+        selected[base_id] = candidate
+    return selected
+
+
+def authoritative_cells(eval_dir: Path, prefer_filtered: bool = True) -> Dict[str, Path]:
+    """The cell directory ``load_e2e_results`` serves for each base milestone of
+    a trial (``<trial>/evaluation``).  Summary-only milestones (no served
+    directory) are omitted.  Re-evaluation, re-tally and promotion drivers
+    must enumerate cells through this function rather than scanning base
+    directories: for a milestone with retry attempts the served cell is the
+    retry directory, and work done on another attempt never reaches the board."""
+    raw_results = _read_summary_results(eval_dir)
+    _, summary_attempts, summary_keys = _index_summary_attempts(raw_results)
+    served = select_served_attempts(eval_dir, summary_attempts, summary_keys, prefer_filtered)
+    return {base_id: eval_dir / candidate[0] for base_id, candidate in sorted(served.items())}
+
+
 def load_e2e_results(
     workspace_root: Path, trial: str, prefer_filtered: bool = True
 ) -> Tuple[Dict[str, Dict], Dict[str, int]]:
@@ -806,63 +895,16 @@ def load_e2e_results(
     eval_dir = workspace_root / "e2e_trial" / trial / "evaluation"
 
     # First, load from summary.json
-    raw_results = {}
-    summary_path = eval_dir / "summary.json"
-    if summary_path.exists():
-        try:
-            with open(summary_path) as f:
-                summary = json.load(f)
-                raw_results = summary.get("results", {})
-        except Exception as e:
-            print(f"Warning: Failed to load {summary_path}: {e}", file=sys.stderr)
+    raw_results = _read_summary_results(eval_dir)
+    summary_results, summary_attempts, summary_keys = _index_summary_attempts(raw_results)
+    results.update(summary_results)
 
-    # Merge retry keys into base milestone IDs, keeping only the latest attempt.
-    # e.g. if both "M001" (attempt 0) and "M001-retry1" (attempt 1) exist,
-    # keep only the retry1 result under key "M001".
-    summary_attempts: Dict[str, int] = {}
-    summary_keys: Dict[str, str] = {}
-    for raw_key, raw_val in raw_results.items():
-        base_id = _strip_retry_suffix(raw_key)
-        attempt = raw_val.get("attempt", _get_retry_attempt(raw_key))
-        try:
-            attempt = int(attempt)
-        except (TypeError, ValueError):
-            attempt = _get_retry_attempt(raw_key)
-        if base_id not in results or attempt > summary_attempts[base_id]:
-            results[base_id] = dict(raw_val)
-            summary_attempts[base_id] = attempt
-            summary_keys[base_id] = raw_key
-
-    # Then, check all evaluation_result files.  Select one deterministic/latest
-    # attempt per base milestone before merging; iterating directories directly
-    # can otherwise let an older retry overwrite a newer one.
-    evaluation_candidates: Dict[str, List[Tuple[str, int, Dict, Optional[str]]]] = {}
-    if eval_dir.exists():
-        for item in eval_dir.iterdir():
-            if is_milestone_dir(item):
-                dir_name = item.name
-                base_id = _strip_retry_suffix(dir_name)
-                result_file = item / "evaluation_result.json"
-
-                # Try to load the result (filtered or unfiltered based on preference)
-                eval_result, result_type = load_evaluation_result(result_file, prefer_filtered)
-
-                if eval_result:
-                    evaluation_candidates.setdefault(base_id, []).append(
-                        (dir_name, _get_retry_attempt(dir_name), eval_result, result_type)
-                    )
-
-    for base_id, candidates in evaluation_candidates.items():
-        # Prefer the exact summary key when it exists.  This handles summaries
-        # that store an explicit attempt number under an unsuffixed directory.
-        preferred_key = summary_keys.get(base_id)
-        matching = [candidate for candidate in candidates if candidate[0] == preferred_key]
-        candidate = matching[0] if matching else max(candidates, key=lambda value: value[1])
+    # Then the per-attempt evaluation files: one deterministic attempt per base
+    # milestone (see select_served_attempts), merged over the summary entry.
+    for base_id, candidate in select_served_attempts(
+        eval_dir, summary_attempts, summary_keys, prefer_filtered
+    ).items():
         _dir_name, attempt, eval_result, result_type = candidate
-
-        # Never replace a known newer summary attempt with an older result file.
-        if base_id in summary_attempts and not matching and attempt < summary_attempts[base_id]:
-            continue
 
         resolved = is_resolved(eval_result)
         infra_invalid = is_infra_invalid(eval_result)
