@@ -1,4 +1,4 @@
-"""Residue prune: eval-tree reassembly semantics (docs/residue-prune-spec.md).
+"""Residue prune: eval-tree reassembly semantics (docs/maintainers/residue-prune-spec.md).
 
 The evaluation tree is assembled as "checkout GT base tag + untar agent
 snapshot" — a purely additive overlay. This module implements the deletion
