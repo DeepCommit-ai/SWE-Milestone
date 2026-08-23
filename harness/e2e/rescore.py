@@ -41,6 +41,25 @@ results lack:
    for a later human-approved promotion (docs/maintainers/re-evaluation.md). Nothing is
    ever written into the source cell. Re-running on an already corrected cell
    is a verified no-op (``already-identity``).
+6. **Filter-only mode** (``--mode filter-only``, v1.0.2 filter campaigns).
+   When only the filter lists changed, no replay is needed or wanted: the
+   stored raw ``evaluation_result.json`` is taken as-is (never a filtered
+   file), the filter list is validated against the pinned classification,
+   ``ran_test_ids`` is the union over ``artifacts/*/eval.json`` (the
+   evaluator's own rule, ``collect_ran_test_ids``) and
+   ``evaluation_result_filtered.json`` is regenerated from it with the
+   envelope's resolution locks re-applied. Replay selection is deliberately
+   absent: it would strand every non-replayable and every frozen pass-wins
+   cell although their derivative is exactly as stale as any other. The
+   mirror holds a byte-identical copy of the raw result, the regenerated
+   derivative (or none, when the milestone has no filter list and a stale
+   derivative must be deleted on promotion), a manifest and notes; no
+   artifacts. Statuses: ``filter-regenerated`` (derivative differs or was
+   absent; mirrored), ``filter-identity`` (derivative already equals the
+   regeneration), ``stale-derivative`` (no filter list, derivative present;
+   mirrored without one), ``no-filter``, ``non-promotable:<reason>`` (no
+   classification / drift / no eval.json), ``error:<reason>`` (the campaign
+   exits non-zero).
 """
 
 from __future__ import annotations
@@ -67,15 +86,22 @@ from harness.e2e.evaluator import (
     ScoringTally,
     _harness_revision,
     _resolve_test_framework,
+    classification_buckets,
+    collect_ran_test_ids,
     filter_evaluation_result,
+    filter_list_has_entries,
+    filter_list_test_ids,
     load_filter_list,
     load_repo_config,
     select_classification,
     tally_scoring,
+    validate_filter_list,
+    validate_workspace_filter_lists,
 )
 from harness.utils.test_id_normalizer import TestIdNormalizer
 
 RESCORE_TOOL_VERSION = "rescore/2"
+FILTER_ONLY_TOOL_VERSION = "rescore-filter-only/1"
 LEGACY_POLICIES = (SCORING_ID_POLICY_LEGACY, SCORING_ID_POLICY_LEGACY_PASSWINS)
 ERA_BY_POLICY = {
     SCORING_ID_POLICY_LEGACY: "fail-close",
@@ -92,6 +118,10 @@ STALE_AFTER_RETALLY = (
     "trial summary_filtered.json: same, when a filtered result exists",
     "<cell>/feedback_report.md: embeds the old status/regressions; regenerate or mark superseded",
     "<cell>/artifacts.tar.gz: regenerate from the promoted artifacts/ (they must agree)",
+)
+STALE_AFTER_FILTER_ONLY = (
+    "trial summary_filtered.json: results[<milestone>] (eval_status, test_summary, filter_stats) must be synced "
+    "(summary.json, feedback_report.md, artifacts and the raw result are untouched by a filter-only re-tally)",
 )
 
 
@@ -830,6 +860,269 @@ def _copy_selected_artifacts(cell_dir: Path, selected: CandidatePayload, out_cel
     return f"the selected artifact directory `{art_dir}` (extracted from artifacts.tar.gz, {len(members)} file(s))"
 
 
+# --- filter-only re-tally (v1.0.2) ----------------------------------------------
+
+
+def _served_view(cell_dir: Path, envelope: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """What the collector reads today: the stored filtered file when present
+    (even if unreadable: then it shadows the raw result with garbage), else the
+    raw envelope."""
+    stored_f = cell_dir / "evaluation_result_filtered.json"
+    if not stored_f.exists():
+        return envelope, "raw"
+    try:
+        return _load_json(stored_f), "filtered"
+    except (OSError, ValueError):
+        return {}, "filtered-unreadable"
+
+
+def _adjust_n2p_missing(filtered: Dict[str, Any], raw: Dict[str, Any], ran: set) -> None:
+    """``filter_evaluation_result`` removes waived N2P ids from the success /
+    failure lists but leaves ``none_to_pass_missing`` as stored. Subtract the
+    waived failure ids that never ran (they were the missing ones), as the
+    #24 mirror derives it from the tally. A no-op when no N2P id is waived."""
+    raw_n2p = (raw.get("tests_status") or {}).get("NONE_TO_PASS") or {}
+    new_n2p = (filtered.get("tests_status") or {}).get("NONE_TO_PASS") or {}
+    if not isinstance(raw_n2p, dict) or not isinstance(new_n2p, dict):
+        return
+    removed = set(raw_n2p.get("failure") or []) - set(new_n2p.get("failure") or [])
+    removed_missing = sum(1 for t in removed if t not in ran)
+    if not removed_missing:
+        return
+    stored_missing = raw_n2p.get("missing")
+    if isinstance(stored_missing, int):
+        new_n2p["missing"] = max(0, stored_missing - removed_missing)
+    summary = filtered.setdefault("test_summary", {})
+    if isinstance(summary.get("none_to_pass_missing"), int):
+        summary["none_to_pass_missing"] = max(0, summary["none_to_pass_missing"] - removed_missing)
+
+
+def regenerate_filtered_from_stored(
+    envelope: Dict[str, Any],
+    filter_list: Dict[str, Any],
+    ran: set,
+    p2p_universe: set,
+) -> Tuple[Dict[str, Any], bool]:
+    """The filtered derivative of a stored raw result under the current filter
+    list: ``filter_evaluation_result`` with the intersection rule, N2P missing
+    adjusted, and the envelope's own resolution locks (infra / scored failure
+    / identity-untrusted) re-applied so a waiver can never un-lock a cell.
+    Returns (filtered, locks_reapplied)."""
+    filtered = filter_evaluation_result(
+        copy.deepcopy(envelope), filter_list, ran_test_ids=ran, p2p_universe=p2p_universe
+    )
+    _adjust_n2p_missing(filtered, envelope, ran)
+    locked, _ = _resolution_locked(envelope)
+    untrusted = bool((envelope.get("scoring_identity") or {}).get("untrusted"))
+    reapplied = bool(locked or untrusted)
+    if reapplied:
+        filtered["resolved"] = False
+    filtered.setdefault("scoring_identity", {}).update({"filtered_locks_reapplied": reapplied})
+    return filtered, reapplied
+
+
+def _filtered_semantics(d: Dict[str, Any]) -> Dict[str, Any]:
+    """The part of a filtered file a promotion must not churn on: score-owned
+    projection, resolved, filter_stats."""
+    return {
+        "projection": _projection(d.get("tests_status") or {}, d.get("test_summary") or {}),
+        "resolved": d.get("resolved"),
+        "filter_stats": d.get("filter_stats"),
+    }
+
+
+def filter_only_cell(
+    cell_dir: Path,
+    *,
+    data_root: Path,
+    mirror_dir: Optional[Path],
+    campaign: str = "",
+) -> CellRecord:
+    """Regenerate one cell's filtered derivative from its stored raw result
+    (see module docstring, item 6). Never writes into the source cell."""
+    cell_dir = cell_dir.resolve()
+    milestone = cell_dir.name
+    classification_milestone = re.sub(r"-retry\d+$", "", milestone)
+    trial_dir = cell_dir.parent.parent
+    trial = trial_dir.name
+    repo = data_root.name
+    rec = CellRecord(
+        cell=str(cell_dir), repo=repo, trial=trial, milestone=milestone, framework=None, status="error"
+    )
+    result_path = cell_dir / "evaluation_result.json"
+    if not result_path.exists():
+        rec.status, rec.reason = "non-promotable", "no-evaluation_result.json"
+        return rec
+    try:
+        raw_bytes = result_path.read_bytes()
+        envelope = json.loads(raw_bytes)
+    except (OSError, ValueError) as exc:
+        rec.status, rec.reason = "non-promotable", f"unreadable-result:{exc.__class__.__name__}"
+        return rec
+    rec.stored_resolved = envelope.get("resolved")
+    served, served_kind = _served_view(cell_dir, envelope)
+    stored_filtered_path = cell_dir / "evaluation_result_filtered.json"
+
+    classification_rel = (
+        f"test_results/{classification_milestone}/{classification_milestone}_classification.json"
+    )
+    classification_path = data_root / classification_rel
+    if not classification_path.exists():
+        rec.status, rec.reason = "non-promotable", "no-classification"
+        return rec
+    try:
+        baseline = _load_json(classification_path)
+    except (OSError, ValueError) as exc:
+        rec.status, rec.reason = "non-promotable", f"unreadable-classification:{exc.__class__.__name__}"
+        return rec
+    classification_sha = _sha256_path(classification_path)
+    pin = _classification_pin(data_root, trial_dir, classification_rel, classification_sha)
+    filter_path = (
+        data_root / "test_results" / classification_milestone
+        / f"{classification_milestone}_filter_list.json"
+    )
+    filter_list = load_filter_list(data_root, classification_milestone)
+    has_entries = filter_list_has_entries(filter_list)
+    rec.inputs = {
+        "classification_sha256": classification_sha,
+        "classification_pin": pin,
+        "filter_list_sha256": _sha256_path(filter_path) if filter_path.exists() else "",
+        "filter_list_entries": {
+            k: len(filter_list_test_ids((filter_list or {}).get(k))) for k in
+            ("invalid_fail_to_pass", "invalid_none_to_pass", "invalid_pass_to_pass")
+        } if filter_list else {},
+        "served": served_kind,
+    }
+    if pin["status"] == "mismatch":
+        rec.status, rec.reason = "non-promotable", "classification-drift"
+        return rec
+    if pin["status"] == "unresolvable":
+        rec.status, rec.reason = "non-promotable", "classification-pin-unresolvable"
+        return rec
+    if filter_path.exists() and filter_list is None:
+        rec.status, rec.reason = "error", "filter-list-unreadable"
+        return rec
+    if has_entries:
+        errors = validate_filter_list(filter_list, baseline, classification_milestone)
+        if errors:
+            rec.status, rec.reason = "error", "filter-list-invalid"
+            rec.manifest = {"filter_list_errors": errors[:20], "filter_list_error_count": len(errors)}
+            return rec
+
+    manifest: Dict[str, Any] = {
+        "tool": FILTER_ONLY_TOOL_VERSION,
+        "mode": "filter-only",
+        "campaign": campaign,
+        "scorer_revision": _harness_revision(),
+        "classification_path": classification_rel,
+        "classification_sha256": classification_sha,
+        "classification_pin": pin,
+        "filter_list_path": str(filter_path.relative_to(data_root)) if filter_path.exists() else "",
+        "filter_list_sha256": rec.inputs["filter_list_sha256"],
+        "filter_list_entries": rec.inputs["filter_list_entries"],
+        "stored_result_sha256": _sha256_bytes(raw_bytes),
+        "stored_filtered_sha256": _sha256_path(stored_filtered_path) if stored_filtered_path.exists() else "",
+        "ran_test_ids_rule": "union of nodeid over artifacts/*/eval.json (evaluator.collect_ran_test_ids)",
+        "stale_after_retally": list(STALE_AFTER_FILTER_ONLY),
+    }
+    previous_manifest_path = cell_dir / "rescore_manifest.json"
+    if previous_manifest_path.exists():
+        try:
+            manifest["supersedes"] = _load_json(previous_manifest_path)
+        except (OSError, ValueError):
+            manifest["supersedes"] = {"unreadable": str(previous_manifest_path)}
+
+    filtered: Optional[Dict[str, Any]] = None
+    if not has_entries:
+        if not stored_filtered_path.exists():
+            rec.status, rec.reason = "no-filter", ""
+            rec.new_resolved = rec.stored_resolved
+            return rec
+        rec.status = "stale-derivative"
+        rec.reason = "milestone has no filter list; the stored filtered file shadows the raw result and must be deleted"
+        rec.new_resolved = envelope.get("resolved")
+        rec.delta = {"resolved": {"before": served.get("resolved"), "after": rec.new_resolved}} \
+            if served.get("resolved") != rec.new_resolved else {}
+        manifest["regenerated_filtered_sha256"] = ""
+        manifest["action"] = "delete-stale-derivative"
+    else:
+        ran = collect_ran_test_ids(cell_dir)
+        if ran is None or not any((cell_dir / "artifacts").glob("*/eval.json")):
+            rec.status, rec.reason = "non-promotable", "no-eval.json"
+            return rec
+        p2p_universe = classification_buckets(baseline)["pass_to_pass"]
+        filtered, reapplied = regenerate_filtered_from_stored(envelope, filter_list, ran, p2p_universe)
+        rec.resolution_locked = reapplied
+        rec.new_resolved = bool(filtered.get("resolved"))
+        manifest["ran_test_ids_count"] = len(ran)
+        manifest["locks_reapplied"] = reapplied
+        manifest["regenerated_filtered_sha256"] = _sha256_bytes(
+            (json.dumps(filtered, indent=2) + "\n").encode()
+        )
+        if served_kind == "filtered" and _filtered_semantics(served) == _filtered_semantics(filtered):
+            rec.status, rec.reason = "filter-identity", "stored filtered file already equals the regeneration"
+            rec.manifest = manifest
+            return rec
+        rec.status = "filter-regenerated"
+        rec.reason = "no stored filtered file" if served_kind == "raw" else (
+            "stored filtered file unreadable" if served_kind == "filtered-unreadable"
+            else "stored filtered file differs from the regeneration"
+        )
+        served_proj = _projection(served.get("tests_status") or {}, served.get("test_summary") or {})
+        new_proj = _projection(filtered.get("tests_status") or {}, filtered.get("test_summary") or {})
+        delta: Dict[str, Any] = {}
+        for key in ("f2p_success", "f2p_failure", "p2p_failure", "n2p_success", "n2p_failure"):
+            before, after = set(served_proj.get(key) or []), set(new_proj.get(key) or [])
+            if before != after:
+                delta[key] = {"before": len(before), "after": len(after)}
+                rec.changed_ids[key] = {"gained": sorted(after - before), "lost": sorted(before - after)}
+        for key in ("p2p_success_count", "p2p_missing", "n2p_missing",
+                    "summary.pass_to_pass_required", "summary.fail_to_pass_required",
+                    "summary.none_to_pass_required"):
+            if served_proj.get(key) != new_proj.get(key):
+                delta[key] = {"before": served_proj.get(key), "after": new_proj.get(key)}
+        if bool(served.get("resolved")) != rec.new_resolved:
+            delta["resolved"] = {"before": bool(served.get("resolved")), "after": rec.new_resolved}
+        rec.delta = delta
+        manifest["action"] = "write-regenerated-derivative"
+    rec.manifest = manifest
+
+    if mirror_dir is None:
+        return rec
+    out_cell = mirror_dir / repo / trial / milestone
+    out_cell.mkdir(parents=True, exist_ok=True)
+    (out_cell / "evaluation_result.json").write_bytes(raw_bytes)  # byte-identical: promotion leaves the raw result alone
+    if filtered is not None:
+        (out_cell / "evaluation_result_filtered.json").write_text(json.dumps(filtered, indent=2) + "\n")
+        rec.filtered_regenerated = True
+    (out_cell / "rescore_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    previous_notes = ""
+    if (cell_dir / "PROMOTION_NOTES.md").exists():
+        try:
+            previous_notes = (cell_dir / "PROMOTION_NOTES.md").read_text()
+        except OSError:
+            previous_notes = ""
+    (out_cell / "PROMOTION_NOTES.md").write_text(
+        f"# Promotion notes (filter-only re-tally{', campaign ' + campaign if campaign else ''})\n\n"
+        f"- source cell: `{cell_dir}`\n"
+        f"- action: {manifest['action']}\n"
+        f"- filter list: `{manifest['filter_list_path'] or '(none)'}` sha256 {manifest['filter_list_sha256'] or '-'}\n"
+        f"- raw result: unchanged (sha256 {manifest['stored_result_sha256']}); not replayed\n"
+        + (f"- ran_test_ids: {manifest['ran_test_ids_count']} ids, {manifest['ran_test_ids_rule']}\n"
+           if "ran_test_ids_count" in manifest else "")
+        + (f"- resolution locks re-applied to the derivative: {manifest['locks_reapplied']}\n"
+           if "locks_reapplied" in manifest else "")
+        + "- this mirror contains: evaluation_result.json (byte-identical copy)"
+        + (", evaluation_result_filtered.json" if filtered is not None else " and NO filtered file (delete the stale one)")
+        + ", rescore_manifest.json\n"
+        "- NOT regenerated here (must be handled at promotion):\n"
+        + "".join(f"  - {s}\n" for s in STALE_AFTER_FILTER_ONLY)
+        + (("\n---\nPrevious promotion notes of this cell:\n\n" + previous_notes) if previous_notes else "")
+    )
+    rec.mirrored = True
+    return rec
+
+
 # --- campaign driver ------------------------------------------------------------
 
 
@@ -854,6 +1147,25 @@ def _iter_cells(
     return out
 
 
+class FilterListError(RuntimeError):
+    """A data workspace carries a defective filter list; no campaign may start."""
+
+
+def refuse_on_invalid_filter_lists(data_root: Path) -> None:
+    """Every ``<data_root>/test_results/<MID>/<MID>_filter_list.json`` must
+    validate against its classification before any cell is touched: a
+    defective list is a defect in every cell of that milestone, so the run is
+    refused, never one cell silently mis-scored."""
+    errors = validate_workspace_filter_lists(data_root)
+    if errors:
+        lines = [e for errs in errors.values() for e in errs[:5]]
+        more = sum(max(0, len(errs) - 5) for errs in errors.values())
+        raise FilterListError(
+            f"{len(errors)} invalid filter list(s) under {data_root}/test_results: "
+            + "; ".join(lines) + (f"; ... {more} more" if more else "")
+        )
+
+
 def run_campaign(
     *,
     data_root: Path,
@@ -861,10 +1173,13 @@ def run_campaign(
     out_dir: Path,
     mirror: bool,
     include_pass_wins: bool = False,
+    filter_only: bool = False,
+    campaign: str = "",
 ) -> Dict[str, Any]:
     data_root = data_root.resolve()
     repo = data_root.name
-    repo_config = load_repo_config(repo, workspace_root=data_root)
+    refuse_on_invalid_filter_lists(data_root)
+    repo_config = load_repo_config(repo, workspace_root=data_root) if not filter_only else {}
     cfg_path = data_root.parent / "config" / f"{repo}.yaml"
     repo_config_sha = _sha256_path(cfg_path) if cfg_path.exists() else ""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -874,15 +1189,18 @@ def run_campaign(
         scratch = Path(tmp)
         for cell in cells:
             try:
-                rec = rescore_cell(
-                    cell,
-                    data_root=data_root,
-                    repo_config=repo_config,
-                    repo_config_sha256=repo_config_sha,
-                    mirror_dir=mirror_dir,
-                    scratch=scratch,
-                    include_pass_wins=include_pass_wins,
-                )
+                if filter_only:
+                    rec = filter_only_cell(cell, data_root=data_root, mirror_dir=mirror_dir, campaign=campaign)
+                else:
+                    rec = rescore_cell(
+                        cell,
+                        data_root=data_root,
+                        repo_config=repo_config,
+                        repo_config_sha256=repo_config_sha,
+                        mirror_dir=mirror_dir,
+                        scratch=scratch,
+                        include_pass_wins=include_pass_wins,
+                    )
             except Exception as exc:  # noqa: BLE001 — a campaign must not die on one cell
                 rec = CellRecord(
                     cell=str(cell), repo=repo, trial=Path(cell).parent.parent.name, milestone=Path(cell).name,
@@ -920,8 +1238,23 @@ def summarize(records: List[CellRecord]) -> Dict[str, Any]:
         "invariant_failures": [],
         "mirrored": 0,
         "filtered_not_regenerated": {},
+        "by_status": {},
     }
     for r in records:
+        s["by_status"][r.status] = s["by_status"].get(r.status, 0) + 1
+        if r.status in ("filter-regenerated", "stale-derivative"):
+            s["changed_cells"] += 1
+            for key, d in r.delta.items():
+                if key == "resolved":
+                    target = "resolved_false_to_true" if d["after"] else "resolved_true_to_false"
+                    s[target].append(f"{r.trial}/{r.milestone}")
+                elif key in s["delta_totals"] and isinstance(d.get("before"), int) and isinstance(d.get("after"), int):
+                    s["delta_totals"][key] += d["after"] - d["before"]
+            if r.mirrored:
+                s["mirrored"] += 1
+            continue
+        if r.status in ("filter-identity", "no-filter"):
+            continue
         if r.status in ("replayable", "invariant-failed"):
             if r.status == "replayable":
                 s["replayable"] += 1
@@ -949,7 +1282,7 @@ def summarize(records: List[CellRecord]) -> Dict[str, Any]:
                 s["filtered_not_regenerated"][r.filtered_reason] = s["filtered_not_regenerated"].get(r.filtered_reason, 0) + 1
         elif r.status == "already-identity":
             s["already_identity"] += 1
-        elif r.status == "non-replayable":
+        elif r.status in ("non-replayable", "non-promotable"):
             s["non_replayable"] += 1
             s["non_replayable_reasons"][r.reason] = s["non_replayable_reasons"].get(r.reason, 0) + 1
         else:
@@ -967,8 +1300,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="trial directory containing evaluation/<MID>/ (repeatable)")
     ap.add_argument("--cell", action="append", default=[], type=Path, help="one cell dir (repeatable)")
     ap.add_argument("--out", required=True, type=Path, help="campaign output directory")
-    ap.add_argument("--mode", choices=("report", "mirror"), default="report",
-                    help="report: records only; mirror: also write corrected outputs under --out/mirror")
+    ap.add_argument("--mode", choices=("report", "mirror", "filter-only"), default="report",
+                    help="report: records only; mirror: also write corrected outputs under --out/mirror; "
+                         "filter-only: regenerate evaluation_result_filtered.json from the stored raw result "
+                         "under the current (validated) filter lists, no replay, mirror under --out/mirror "
+                         "(module docstring, item 6)")
+    ap.add_argument("--campaign", default="", help="campaign name recorded in every filter-only manifest")
     ap.add_argument("--authoritative", action="store_true",
                     help="with --trial-root: only the attempt directory the collector serves per milestone "
                          "(collect_results.authoritative_cells), not every directory holding a result")
@@ -980,11 +1317,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not cells:
         print("no cells found", file=sys.stderr)
         return 2
-    summary = run_campaign(
-        data_root=args.data_root, cells=cells, out_dir=args.out,
-        mirror=args.mode == "mirror", include_pass_wins=args.include_pass_wins,
-    )
+    try:
+        summary = run_campaign(
+            data_root=args.data_root, cells=cells, out_dir=args.out,
+            mirror=args.mode in ("mirror", "filter-only"), include_pass_wins=args.include_pass_wins,
+            filter_only=args.mode == "filter-only", campaign=args.campaign,
+        )
+    except FilterListError as exc:
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=2, sort_keys=True))
+    if summary.get("error"):
+        print(f"{summary['error']} cell(s) ended in error; see records.jsonl", file=sys.stderr)
+        return 1
     return 0
 
 

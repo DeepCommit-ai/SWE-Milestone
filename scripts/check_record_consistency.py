@@ -24,7 +24,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import sys
 from collections import Counter, defaultdict
@@ -35,8 +34,14 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from harness.e2e.collect_results import authoritative_cells  # noqa: E402
-from harness.e2e.evaluator import filter_evaluation_result, load_filter_list  # noqa: E402
-from harness.e2e.rescore import _ran_test_ids, run_campaign  # noqa: E402
+from harness.e2e.evaluator import (  # noqa: E402
+    classification_buckets,
+    collect_ran_test_ids,
+    filter_list_has_entries,
+    load_filter_list,
+    validate_filter_list,
+)
+from harness.e2e.rescore import FilterListError, regenerate_filtered_from_stored, run_campaign  # noqa: E402
 
 FILTER_COMPARE_KEYS = (
     "total", "passed", "failed", "error", "fail_to_pass_required", "fail_to_pass_achieved",
@@ -59,22 +64,42 @@ def load_accepted(path: Optional[Path]) -> Dict[Tuple[str, str, str], str]:
     return accepted
 
 
-def _filtered_drift(cell: Path, data_root: Path, selected_payload: str) -> Optional[str]:
-    """'' when the stored filtered file equals what the current filter list produces,
-    None when the cell has no filtered file, else a reason string."""
+def _filtered_drift(cell: Path, data_root: Path) -> Optional[str]:
+    """'' when the served derivative is what the current filter list produces from the
+    stored raw result, None when the milestone has no filter list and the cell no
+    filtered file, else a reason string.
+
+    Rules shared with the evaluator and the filter-only re-tally (rescore.py item 6):
+    the filter list must validate against the classification; ``ran_test_ids`` is the
+    union over ``artifacts/*/eval.json``; the derivative is regenerated with the
+    envelope's resolution locks re-applied. A universe with a filter list and a cell
+    without a derivative is a failure (the collector would serve the raw result, i.e.
+    a half-finished filter campaign would pass the gate)."""
     stored_f = cell / "evaluation_result_filtered.json"
-    if not stored_f.exists():
-        return None
     base = cell.name.split("-retry", 1)[0]
     filter_list = load_filter_list(data_root, base)
-    if not filter_list or not any(filter_list.get(k) for k in ("invalid_fail_to_pass", "invalid_none_to_pass", "invalid_pass_to_pass")):
-        return "stale filtered file: the milestone has no filter list now (it shadows the unfiltered result)"
-    eval_json = (cell / selected_payload).with_name("eval.json") if selected_payload else None
-    ran = _ran_test_ids(eval_json) if eval_json is not None and eval_json.exists() else None
-    if ran is None:
-        return "cannot regenerate the filtered result (no eval.json next to the selected report)"
+    has_entries = filter_list_has_entries(filter_list)
+    if not has_entries:
+        if stored_f.exists():
+            return "stale filtered file: the milestone has no filter list now (it shadows the unfiltered result)"
+        return None
+    classification_path = data_root / "test_results" / base / f"{base}_classification.json"
+    try:
+        baseline = json.load(open(classification_path))
+    except (OSError, ValueError) as exc:
+        return f"cannot validate the filter list: classification unreadable ({exc.__class__.__name__})"
+    errors = validate_filter_list(filter_list, baseline, base)
+    if errors:
+        return "filter list invalid: " + "; ".join(errors[:3]) + (f"; ... {len(errors) - 3} more" if len(errors) > 3 else "")
+    if not stored_f.exists():
+        return "derivative missing for a universe with a filter list (the raw result would be served)"
+    ran = collect_ran_test_ids(cell)
+    if ran is None or not any((cell / "artifacts").glob("*/eval.json")):
+        return "cannot regenerate the filtered result (no artifacts/*/eval.json in the cell)"
     unfiltered = json.load(open(cell / "evaluation_result.json"))
-    expected = filter_evaluation_result(copy.deepcopy(unfiltered), filter_list, ran_test_ids=ran)
+    expected, _ = regenerate_filtered_from_stored(
+        unfiltered, filter_list, ran, classification_buckets(baseline)["pass_to_pass"]
+    )
     stored = json.load(open(stored_f))
     es, ss = expected.get("test_summary") or {}, stored.get("test_summary") or {}
     diffs = [k for k in FILTER_COMPARE_KEYS if k in ss and ss.get(k) != es.get(k)]
@@ -84,6 +109,8 @@ def _filtered_drift(cell: Path, data_root: Path, selected_payload: str) -> Optio
             b = (expected.get("tests_status") or {}).get(cat, {}).get(sub)
             if isinstance(a, list) and isinstance(b, list) and sorted(a) != sorted(b):
                 diffs.append(f"{cat}.{sub}")
+    if bool(stored.get("resolved")) != bool(expected.get("resolved")):
+        diffs.append("resolved")
     return "" if not diffs else "filtered file disagrees with the current filter list: " + ", ".join(diffs)
 
 
@@ -98,7 +125,15 @@ def check_repo(args: Tuple[str, str, str, str, bool]) -> Dict:
     out.mkdir(parents=True, exist_ok=True)
     if not cells:
         return {"repo": repo, "cells": 0, "rows": []}
-    run_campaign(data_root=data_root / repo, cells=cells, out_dir=out, mirror=False)
+    try:
+        run_campaign(data_root=data_root / repo, cells=cells, out_dir=out, mirror=False)
+    except FilterListError as exc:
+        # A defective filter list is a defect in every cell of the repo: report it on
+        # each served cell instead of crashing the gate.
+        rows = [{"repo": repo, "trial": c.parent.parent.name, "cell": c.name, "verdict": "fail",
+                 "why": f"filter list invalid: {exc}", "status": "not-checked", "era": "", "frozen": False}
+                for c in cells]
+        return {"repo": repo, "cells": len(cells), "rows": rows}
     rows = []
     for line in open(out / "records.jsonl"):
         rec = json.loads(line)
@@ -115,7 +150,7 @@ def check_repo(args: Tuple[str, str, str, str, bool]) -> Dict:
         fdrift = None
         if verdict == "ok":
             try:
-                fdrift = _filtered_drift(cell, data_root / repo, rec.get("selected_payload") or "")
+                fdrift = _filtered_drift(cell, data_root / repo)
             except Exception as exc:  # noqa: BLE001 — a gate must report, not crash
                 fdrift = f"filtered check raised {exc.__class__.__name__}: {exc}"
             if fdrift:

@@ -2374,10 +2374,165 @@ def load_filter_list(workspace_root: Path, milestone_id: str) -> Optional[Dict[s
         return None
 
 
+FILTER_LIST_KEYS = ("invalid_fail_to_pass", "invalid_none_to_pass", "invalid_pass_to_pass")
+# Filter-list entries are unconditional waivers (schema version 1). A future
+# conditional entry (e.g. applied only when the owner milestone precedes the
+# victim in a trial) needs a new schema version; a v1 reader must refuse it
+# instead of silently applying it unconditionally.
+FILTER_LIST_SCHEMA_VERSION = 1
+
+
+def filter_list_test_ids(items: Any) -> Set[str]:
+    """Test ids of one filter-list bucket (string entries or
+    ``{"test_id": ..., "reason": ...}`` entries; anything else is ignored)."""
+    out: Set[str] = set()
+    for item in items or []:
+        if isinstance(item, dict):
+            if "test_id" in item:
+                out.add(item["test_id"])
+        elif isinstance(item, str):
+            out.add(item)
+    return out
+
+
+def filter_list_has_entries(filter_list: Optional[Dict[str, Any]]) -> bool:
+    return bool(filter_list) and any(filter_list.get(key) for key in FILTER_LIST_KEYS)
+
+
+def classification_buckets(baseline_classification: Dict[str, Any]) -> Dict[str, Set[str]]:
+    """``{fail_to_pass, none_to_pass, pass_to_pass}`` id sets of the
+    classification the scorer uses (``select_classification``)."""
+    chosen, _ = select_classification(baseline_classification)
+    buckets: Dict[str, Set[str]] = {}
+    for cat in ("fail_to_pass", "none_to_pass", "pass_to_pass"):
+        ids: Set[str] = set()
+        for t in chosen.get(cat, []) or []:
+            tid = t if isinstance(t, str) else (t.get("test_id", "") if isinstance(t, dict) else "")
+            if tid:
+                ids.add(tid)
+        buckets[cat] = ids
+    return buckets
+
+
+def validate_filter_list(
+    filter_list: Dict[str, Any],
+    baseline_classification: Dict[str, Any],
+    milestone_id: str = "",
+) -> List[str]:
+    """Every way a filter list can silently mis-score a cell, as a list of
+    error strings (empty = valid).
+
+    Checks: the schema version is absent or ``FILTER_LIST_SCHEMA_VERSION``;
+    no entry carries a ``condition`` (conditional waivers are not a v1
+    concept); each bucket is a list of string / ``{"test_id"}`` entries;
+    every ``invalid_pass_to_pass`` id is in the classification's
+    ``pass_to_pass`` bucket; every ``invalid_fail_to_pass`` /
+    ``invalid_none_to_pass`` id is in ``fail_to_pass ∪ none_to_pass`` (the
+    filter merges those two keys); no id is listed twice, within or across
+    buckets. An id that is in no bucket is the defect this guards against:
+    ``filter_evaluation_result`` subtracts the P2P *count* from
+    ``pass_to_pass_required``, so a wrong-bucket or unknown id would lower
+    the requirement without removing any obligation.
+    """
+    prefix = f"{milestone_id}: " if milestone_id else ""
+    errors: List[str] = []
+    if not isinstance(filter_list, dict):
+        return [f"{prefix}filter list is not a JSON object"]
+    version = filter_list.get("version")
+    if version is not None and version != FILTER_LIST_SCHEMA_VERSION:
+        errors.append(f"{prefix}unsupported filter list version {version!r} (reader supports {FILTER_LIST_SCHEMA_VERSION})")
+    buckets = classification_buckets(baseline_classification)
+    f2p_n2p_universe = buckets["fail_to_pass"] | buckets["none_to_pass"]
+    seen: Dict[str, str] = {}
+    for key in FILTER_LIST_KEYS:
+        items = filter_list.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            errors.append(f"{prefix}{key} is not a list")
+            continue
+        universe = buckets["pass_to_pass"] if key == "invalid_pass_to_pass" else f2p_n2p_universe
+        for idx, item in enumerate(items):
+            if isinstance(item, dict):
+                tid = item.get("test_id")
+                if not isinstance(tid, str) or not tid:
+                    errors.append(f"{prefix}{key}[{idx}] has no string test_id")
+                    continue
+                if item.get("condition") is not None:
+                    errors.append(f"{prefix}{key}[{idx}] {tid}: conditional entries are not supported by schema v{FILTER_LIST_SCHEMA_VERSION}")
+            elif isinstance(item, str) and item:
+                tid = item
+            else:
+                errors.append(f"{prefix}{key}[{idx}] is neither a test id string nor a {{test_id}} object")
+                continue
+            if tid in seen:
+                errors.append(f"{prefix}{key}: duplicate test id {tid} (also in {seen[tid]})")
+            else:
+                seen[tid] = key
+            if tid not in universe:
+                where = "pass_to_pass" if key == "invalid_pass_to_pass" else "fail_to_pass/none_to_pass"
+                errors.append(f"{prefix}{key}: {tid} is not in the classification's {where} bucket")
+    return errors
+
+
+def find_classification_path(workspace_root: Path, milestone_id: str) -> Path:
+    """The classification file of a milestone in a data workspace: the same
+    candidate locations the orchestrator and run_milestone use; the first
+    existing one, else the canonical ``test_results`` path (which will then
+    fail to open, reported by the caller)."""
+    candidates = [
+        Path(workspace_root) / "test_results" / milestone_id / f"{milestone_id}_classification.json",
+        Path(workspace_root) / "test_data" / milestone_id / f"{milestone_id}_classification.json",
+        Path(workspace_root) / "classification" / f"{milestone_id}_classification.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def validate_workspace_filter_lists(workspace_root: Path) -> Dict[str, List[str]]:
+    """Validate every ``test_results/<MID>/<MID>_filter_list.json`` of a data
+    workspace against its sibling classification. Returns ``{milestone_id:
+    [errors]}`` (empty = every list valid). A filter list whose classification
+    is missing or unreadable, or which is itself unreadable, is an error.
+
+    Used as a start-up preflight (``run_e2e``) and by the re-tally tool: a
+    defective filter list is a defect in every cell it touches, so the
+    whole run is refused rather than one cell silently mis-scored.
+    """
+    errors: Dict[str, List[str]] = {}
+    test_results = Path(workspace_root) / "test_results"
+    if not test_results.is_dir():
+        return errors
+    for filter_path in sorted(test_results.glob("*/*_filter_list.json")):
+        mid = filter_path.parent.name
+        if filter_path.name != f"{mid}_filter_list.json":
+            continue
+        try:
+            with open(filter_path) as f:
+                filter_list = json.load(f)
+        except Exception as exc:  # noqa: BLE001 — reported, not raised
+            errors[mid] = [f"{mid}: unreadable filter list {filter_path}: {exc.__class__.__name__}: {exc}"]
+            continue
+        classification_path = find_classification_path(workspace_root, mid)
+        try:
+            with open(classification_path) as f:
+                baseline = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            errors[mid] = [f"{mid}: cannot read {classification_path} to validate the filter list: {exc.__class__.__name__}: {exc}"]
+            continue
+        found = validate_filter_list(filter_list, baseline, mid)
+        if found:
+            errors[mid] = found
+    return errors
+
+
 def filter_evaluation_result(
     eval_dict: Dict[str, Any],
     filter_list: Dict[str, List[str]],
     ran_test_ids: Optional[Set[str]] = None,
+    p2p_universe: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """Filter evaluation result dict, excluding invalid tests.
 
@@ -2389,6 +2544,11 @@ def filter_evaluation_result(
                      invalid_pass_to_pass lists
         ran_test_ids: Optional set of test IDs that actually ran in the evaluation.
                       Used to correctly adjust pass_to_pass_missing when filtering P2P tests.
+        p2p_universe: Optional set of the classification's pass_to_pass ids. When
+                      given, only invalid P2P ids that are in the universe count
+                      against pass_to_pass_required / pass_to_pass_missing (an
+                      intersection, not the raw count). When None the legacy
+                      behaviour is kept byte for byte (count of all listed ids).
 
     Returns:
         Filtered evaluation result dict with recalculated metrics
@@ -2397,23 +2557,14 @@ def filter_evaluation_result(
 
     result = copy.deepcopy(eval_dict)
 
-    # Helper to extract test_id from filter list items (handles both string and dict formats)
-    def extract_test_ids(items: list) -> set:
-        result_set = set()
-        for item in items:
-            if isinstance(item, dict):
-                # New format: {"test_id": "...", "reason": "..."}
-                if "test_id" in item:
-                    result_set.add(item["test_id"])
-            elif isinstance(item, str):
-                # Old format: just the test_id string
-                result_set.add(item)
-        return result_set
+    extract_test_ids = filter_list_test_ids
 
     # Get invalid test sets
     invalid_f2p = extract_test_ids(filter_list.get("invalid_fail_to_pass", []))
     invalid_n2p = extract_test_ids(filter_list.get("invalid_none_to_pass", []))
     invalid_p2p = extract_test_ids(filter_list.get("invalid_pass_to_pass", []))
+    if p2p_universe is not None:
+        invalid_p2p = invalid_p2p & set(p2p_universe)
 
     tests_status = result.get("tests_status", {})
     test_summary = result.get("test_summary", {})
@@ -2597,6 +2748,34 @@ def filter_evaluation_result(
     return result
 
 
+def collect_ran_test_ids(cell_dir: Path) -> Optional[Set[str]]:
+    """The ids that actually ran in a cell: the union of ``nodeid`` over every
+    ``artifacts/*/eval.json`` the cell holds. None when the cell has no
+    ``artifacts/`` directory (no evidence; callers must not guess).
+
+    This is the one rule for ``ran_test_ids`` — the evaluator at evaluation
+    time, the filter-only re-tally and the release gate all use it, so a
+    filtered result regenerated by any of them is the same file. An unreadable
+    eval.json is skipped with a warning (the evaluator never refused to filter
+    on one); a cell whose artifacts/ holds no readable eval.json yields an
+    empty set, which the re-tally treats as no evidence.
+    """
+    artifacts_dir = Path(cell_dir) / "artifacts"
+    if not artifacts_dir.is_dir():
+        return None
+    ran: Set[str] = set()
+    for eval_json_path in sorted(artifacts_dir.glob("*/eval.json")):
+        try:
+            with open(eval_json_path) as f:
+                eval_data = json.load(f)
+            for test in eval_data.get("tests", []) or []:
+                if isinstance(test, dict) and test.get("nodeid"):
+                    ran.add(test["nodeid"])
+        except Exception as e:  # noqa: BLE001 — logged, consistent with the evaluator's historic behaviour
+            logger.warning(f"Failed to load {eval_json_path}: {e}")
+    return ran
+
+
 def generate_filtered_evaluation(
     eval_result_path: Path,
     workspace_root: Path,
@@ -2617,10 +2796,7 @@ def generate_filtered_evaluation(
         return None
 
     # Check if any filtering is needed
-    has_invalid = any(
-        filter_list.get(key) for key in ["invalid_fail_to_pass", "invalid_none_to_pass", "invalid_pass_to_pass"]
-    )
-    if not has_invalid:
+    if not filter_list_has_entries(filter_list):
         logger.debug(f"filter_list.json exists but has no invalid tests for {milestone_id}")
         return None
 
@@ -2631,26 +2807,46 @@ def generate_filtered_evaluation(
         logger.warning(f"Failed to load evaluation_result.json: {e}")
         return None
 
+    # Validate the list against the classification the cell was scored with.
+    # A defective list (unknown / wrong-bucket / duplicate id, unsupported
+    # version) must not produce a filtered file: that file would shadow the
+    # raw result with a silently mis-scored one. Fail closed: no derivative,
+    # an existing one renamed aside, the raw result stamped scoring_blocked.
+    filtered_path = eval_result_path.parent / "evaluation_result_filtered.json"
+    classification_path = find_classification_path(workspace_root, milestone_id)
+    p2p_universe: Optional[Set[str]] = None
+    try:
+        with open(classification_path) as f:
+            baseline = json.load(f)
+        errors = validate_filter_list(filter_list, baseline, milestone_id)
+        p2p_universe = classification_buckets(baseline)["pass_to_pass"]
+    except Exception as e:  # noqa: BLE001 — an unreadable classification is a validation failure
+        errors = [f"{milestone_id}: cannot read {classification_path} to validate the filter list: {e.__class__.__name__}: {e}"]
+    if errors:
+        for err in errors[:20]:
+            logger.error(f"filter list rejected: {err}")
+        if filtered_path.exists():
+            stale = filtered_path.with_name(filtered_path.name + ".stale")
+            filtered_path.replace(stale)
+            logger.error(f"existing filtered result moved aside: {stale}")
+        eval_dict["filter_list_error"] = errors
+        eval_dict["scoring_blocked"] = True
+        try:
+            with open(eval_result_path, "w") as f:
+                json.dump(eval_dict, f, indent=2)
+        except OSError as e:
+            logger.error(f"could not stamp filter_list_error on {eval_result_path}: {e}")
+        return None
+
     # Load ran test IDs from eval.json artifacts to correctly handle P2P missing counts.
     # Without this, filtering P2P tests that were "missing" (didn't run) would not
     # reduce pass_to_pass_missing, causing pass_to_pass_achieved to be undercounted.
-    ran_test_ids: Optional[Set[str]] = None
-    artifacts_dir = eval_result_path.parent / "artifacts"
-    if artifacts_dir.exists():
-        ran_test_ids = set()
-        for eval_json_path in artifacts_dir.glob("*/eval.json"):
-            try:
-                with open(eval_json_path) as f:
-                    eval_data = json.load(f)
-                for test in eval_data.get("tests", []):
-                    if "nodeid" in test:
-                        ran_test_ids.add(test["nodeid"])
-            except Exception as e:
-                logger.warning(f"Failed to load {eval_json_path}: {e}")
+    ran_test_ids = collect_ran_test_ids(eval_result_path.parent)
 
-    filtered_dict = filter_evaluation_result(eval_dict, filter_list, ran_test_ids=ran_test_ids)
+    filtered_dict = filter_evaluation_result(
+        eval_dict, filter_list, ran_test_ids=ran_test_ids, p2p_universe=p2p_universe
+    )
 
-    filtered_path = eval_result_path.parent / "evaluation_result_filtered.json"
     with open(filtered_path, "w") as f:
         json.dump(filtered_dict, f, indent=2)
 
