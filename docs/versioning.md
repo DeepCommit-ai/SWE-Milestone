@@ -143,6 +143,44 @@ SCORE_CHANGES_this_round) say which arms moved and by how much. Results
 produced before this fold cite their evaluator commit in
 `evaluation_environment.harness_revision`.
 
+Release record for `v1.0.2` (2026-08-24): a data-and-grading patch over v1.0.1; no image bytes
+changed (`diff manifests/digests-v1.0.1.tsv manifests/digests-v1.0.2.tsv` shows only the tag column;
+the 115 tags were carried over). What moved and why:
+
+- Issue #25 (cross-universe test conflicts): 860 per-universe `invalid_pass_to_pass` waivers in 67
+  filter lists for P2P obligations that contradict the behaviour another milestone's SRS mandates
+  (strict census cohort with execution or mechanical proof, plus 12 element leakage entries); four
+  misplaced dubbo M024 entries deleted. 46 cells flip resolved False→True, 0 the other way.
+- Issue #26 (undisclosed upstream prerequisites): 2,115 waivers in six scikit-learn lists (M01,
+  M12.1–M12.5) for test files that only collect with the image's [ENV-PATCH] placeholders, which the
+  e2e evaluation tree does not have; the reference END state fails collection too. The M12.1 SRS
+  (FR28) and three companions now name the placeholders. The 20 `sklearn/tests/test_common.py` ids of
+  M12.5 are not waived (that SRS discloses `ClassifierTags`).
+- dubbo evaluation-era re-evaluation (campaign `dubbo_era_20260823`): dubbo cells graded before the
+  v1.0 data release lacked `dockerfiles/evaluation_post_snapshot.sh` (the dependency closure) and
+  `residue_prune`; the same one-line agent defect that trials graded after 2026-07-16 are forgiven
+  aborted the Maven reactor and charged up to 88 never-run P2P ids per cell in April-graded trials.
+  58 of 69 re-evaluated cells promoted from the frozen snapshots (no agent re-runs); 3 POM-failure
+  cells, 1 reproducible decrease and 6 unchanged cells keep their published values; maintainer waiver
+  on legacy snapshots, unpinned bindings and 12 known-flaky `testClientClose` regressions is recorded
+  with the campaign. dubbo column 32.6 → 40.2.
+- Forward-only SRS disclosures (ripgrep passthru, dubbo M003.2 Mutiny shape, go-zero M023 variadic
+  `StartAsync`, element be3778b FR3, nushell source-level compatibility clauses).
+- New board entry: GLM 5.3 (`_claude-code_glm-5.3_run_002`, local run `_003` migrated, #24 identity
+  re-tally applied, derivatives under the v1.0.2 lists; Score 55.09, rank 4; placeholder pricing).
+- Harness: filter lists validated at launch/evaluation/re-tally/release time, `rescore.py --mode
+  filter-only`, derivative-aware release gate (PR #42); the leaderboard revision switcher and the
+  full-version badge (decree above).
+
+Effect on the published record (re-tally of stored reports; agents never re-run): 7-repo macro
+`score_reliable` 32.06 → 35.59 over the 33 v1.0.1 models (36.16 over the 34-model board), mean
+Resolve 12.51 % → 13.99 %, resolved cells 356 → 398. Every model's Score rises (+0.10 to +9.14); the
+top three are unchanged. Full per-cell and per-trial tables:
+`SWE-Milestone-data/reeval/v102-filters/SCORE_DELTA_v102-filters.md` and
+`SWE-Milestone-log/reeval/dubbo_era_20260823/SCORE_DELTA_dubbo_era_20260823.md`. Not re-tallied: the
+46 go-zero cells of issue #33 (kept as stored, listed in ACCEPTED_LEGACY.tsv) and one element cell
+with classification drift. Issue #23 part 2 (crash-hidden passable tests) is not in this release.
+
 Patch releases (`vX.Y.Z`) — repairing published images, rc-tag campaigns,
 and the promotion runbook that reuses steps 3-5 below with carried-over
 name sets — are specified in **[image-patching.md](maintainers/image-patching.md)**.
