@@ -347,28 +347,28 @@ python3 scripts/verify_quarantine.py --repo <short>
 # 6. Tag the data repo with the SAME version (from the release data checkout)
 git -C <SWE-Milestone-data> tag v1.0 && git -C <SWE-Milestone-data> push origin v1.0
 
-# 7. Tag the published log corpus at the revision the release uploaded
-#    (the .hf_revision the release's sync wrote; huggingface_hub)
-python3 - <<'EOF'
-from huggingface_hub import HfApi
-HfApi().create_tag("DeepCommit-ai/SWE-Milestone-log", tag="v1.0", repo_type="dataset",
-                   revision=open("<SWE-Milestone-log>/.hf_revision").read().strip())
-EOF
+#    The log corpus is NOT tagged: trajectories accrue continuously (new trials land
+#    between releases), so a version tag on SWE-Milestone-log would imply a benchmark-
+#    version cut that does not exist there. Its reproduction coordinate is the HF
+#    revision recorded by the release sync (`<SWE-Milestone-log>/.hf_revision`);
+#    cite that revision in the Release notes.
 
-# 8. Publish the GitHub Release (this is what people see; a bare git tag is not a release).
+# 7. Publish the GitHub Release (this is what people see; a bare git tag is not a release).
 #    Body template: the asset table (harness tag / data tag / image tag + digest manifest /
-#    log tag + revision) followed by "Why scores moved" — every score-affecting change with
+#    log HF revision) followed by "Why scores moved" — every score-affecting change with
 #    its mechanism and its board effect, and where the per-cell accounting lives. Follow the
 #    v1.0.1 / v1.0.2 releases as the format precedent.
 gh release create v1.0 --title "SWE-Milestone v1.0" --notes-file <notes.md> --latest
 
-# 9. Cross-asset consistency check — all four labels must resolve before announcing:
+# 8. Cross-asset consistency check — the three version labels plus the log revision
+#    must all resolve before announcing:
 gh api repos/DeepCommit-ai/SWE-Milestone/releases/tags/v1.0 --jq .name          # release exists
 git ls-remote --tags origin | grep v1.0                                          # harness tag
 git -C <SWE-Milestone-data> ls-remote --tags origin | grep v1.0                  # data tag on HF
 python3 scripts/verify_image_digests.py --hub --version v1.0                     # image tags + digests
 python3 -c "from huggingface_hub import HfApi; \
-  print(HfApi().repo_info('DeepCommit-ai/SWE-Milestone-log', repo_type='dataset', revision='v1.0').sha)"  # log tag
+  print(HfApi().repo_info('DeepCommit-ai/SWE-Milestone-log', repo_type='dataset', \
+        revision=open('<SWE-Milestone-log>/.hf_revision').read().strip()).sha)"  # log revision exists on HF
 ```
 
 After release: bump `manifests/BENCHMARK_VERSION` (the single source of truth
