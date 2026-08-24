@@ -2305,6 +2305,7 @@ def _run_resume_mode(args):
         metadata["model"] = args.model
     requested_agent_version = metadata.get("requested_agent_version")
     workspace_root = Path(metadata["workspace_root"]).resolve()
+    _preflight_filter_lists(workspace_root)
 
     repo_config_binding = load_trial_repo_config_binding(
         trial_root,
@@ -2413,6 +2414,36 @@ def _run_resume_mode(args):
     # Run with resume mode
     success = trial.run_resume(trial_state, resume_session=not args.no_resume_session)
     sys.exit(0 if success else 1)
+
+
+def _preflight_filter_lists(workspace_root: Path) -> None:
+    """Refuse to start (or resume) a trial whose data workspace carries a
+    defective filter list.
+
+    ``test_results/<MID>/<MID>_filter_list.json`` entries are waivers applied
+    to every cell of the milestone; an id that is not in the classification's
+    bucket (or is listed twice, or under an unsupported schema version) would
+    lower ``pass_to_pass_required`` without removing an obligation
+    (``filter_evaluation_result`` subtracts a count). The evaluator also
+    refuses to write a filtered result for such a list, but that surfaces per
+    cell hours later; here it stops the run before any trial state exists.
+    """
+    from harness.e2e.evaluator import validate_workspace_filter_lists
+
+    errors = validate_workspace_filter_lists(Path(workspace_root))
+    if not errors:
+        return
+    for mid, errs in sorted(errors.items()):
+        for err in errs[:10]:
+            logger.error(f"filter list rejected: {err}")
+        if len(errs) > 10:
+            logger.error(f"filter list rejected: {mid}: ... {len(errs) - 10} more")
+    logger.error(
+        f"{len(errors)} filter list(s) under {workspace_root}/test_results are invalid; "
+        "fix the data (every listed id must be in its classification bucket, no duplicates, "
+        "version 1) before starting a trial"
+    )
+    sys.exit(1)
 
 
 def _preflight_ast_grep() -> None:
@@ -2688,6 +2719,7 @@ Example:
 
     # Setup Paths
     workspace_root = args.workspace_root.resolve()
+    _preflight_filter_lists(workspace_root)
     resolved_repo_config = resolve_repo_config(args.repo_name, workspace_root)
 
     # Load workspace metadata (repo_src_dirs, test_dirs, exclude_patterns)

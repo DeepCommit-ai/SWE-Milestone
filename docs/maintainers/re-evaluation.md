@@ -171,6 +171,69 @@ promoted once, by hand, after user sign-off.
    store the diff as `SCORE_DELTA_<campaign>.md` next to the campaign's
    EXPECTATION.md, then regenerate any downstream aggregates.
 
+## Filter-list campaigns (filter-only re-tally, v1.0.2)
+
+When only `test_results/<MID>/<MID>_filter_list.json` changes (a waiver is
+added or withdrawn), nothing is replayed: the stored raw
+`evaluation_result.json` is the evidence, and only the derivative
+`evaluation_result_filtered.json` is regenerated. Three rules make that
+repeatable (harness PR for v1.0.2):
+
+1. **Filter lists are validated against the classification** (`evaluator.
+   validate_filter_list`): every `invalid_pass_to_pass` id must be in the
+   `stable_classification.pass_to_pass` bucket, every `invalid_fail_to_pass` /
+   `invalid_none_to_pass` id in `fail_to_pass ∪ none_to_pass`; no duplicate
+   within or across buckets; `version` absent or 1; no `condition` on an entry.
+   An invalid list is refused everywhere: `run_e2e` (start and resume) exits
+   before any trial state exists, the evaluator writes no derivative and stamps
+   `filter_list_error` / `scoring_blocked: true` on the raw result (an existing
+   derivative is moved to `.stale`), `rescore.py` refuses the campaign, and the
+   release gate fails every served cell of the repo. The defect this guards
+   against: `filter_evaluation_result` subtracts the *count* of listed P2P ids
+   from `pass_to_pass_required`; an id outside the bucket lowered the
+   requirement without removing an obligation. With a classification at hand the
+   evaluator now subtracts the intersection (`p2p_universe`); for a valid list
+   both rules give the same bytes.
+2. **`ran_test_ids` has one rule**: the union of `nodeid` over every
+   `artifacts/*/eval.json` of the cell (`evaluator.collect_ran_test_ids`),
+   used by the evaluator at evaluation time, by the filter-only re-tally and
+   by the release gate. A cell without any `artifacts/*/eval.json` cannot have
+   its derivative regenerated (`non-promotable:no-eval.json`).
+3. **The release gate checks derivatives, not only raw results**
+   (`scripts/check_record_consistency.py`): a universe with a non-empty filter
+   list and a served cell without a derivative fails (`derivative missing`:
+   the collector would serve the raw result, i.e. a half-finished campaign
+   would pass); a derivative that differs from the regeneration (counts,
+   success/failure lists, or `resolved` with the envelope's locks re-applied)
+   fails; a derivative in a universe without a filter list fails (stale).
+
+Procedure (report first, then mirror, per repo; then promote with the generic
+tool):
+
+```
+python -m harness.e2e.rescore --mode filter-only --campaign <name> \
+  --data-root <SWE-Milestone-data>/<repo> --trial-root <SWE-Milestone-log>/<repo>/e2e_trial/_<trial> ... \
+  --authoritative --out <campaign-dir>/<repo>
+python scripts/promote_cells.py --log-root <SWE-Milestone-log> --repo <repo> \
+  --source-root <campaign-dir>/<repo>/mirror --layout mirror --all-in-source \
+  --backup-root <SWE-Milestone-log>/reeval/promotion_backup --campaign <name> --data-root <SWE-Milestone-data> [--execute]
+```
+
+Per cell the mirror holds a byte-identical copy of the raw result (so the
+promotion leaves it alone), the regenerated derivative — or none, when the
+milestone has no filter list and a stale derivative must be deleted —,
+`rescore_manifest.json` (mode, campaign, filter-list sha256 and entry counts,
+classification sha256 and pin, `ran_test_ids` count, locks re-applied; a
+previous manifest is kept under `supersedes`) and `PROMOTION_NOTES.md`. Statuses:
+`filter-regenerated` (mirrored), `filter-identity` (derivative already equals
+the regeneration; nothing written), `stale-derivative` (mirrored without a
+derivative), `no-filter`, `non-promotable:<reason>` (`no-eval.json`,
+`classification-drift`, `no-classification`), `error:<reason>` (exit 1). Replay
+selection is deliberately absent in this mode: a non-replayable or frozen
+pass-wins cell has a derivative exactly as stale as any other. The envelope's
+resolution locks (infrastructure / scored failure / identity-untrusted) are
+re-applied to the derivative, so a waiver can never un-lock a cell.
+
 ## Current application: D-1 (nushell)
 
 | Item | Value |

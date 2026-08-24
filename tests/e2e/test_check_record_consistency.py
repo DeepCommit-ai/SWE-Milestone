@@ -62,3 +62,73 @@ def test_local_trials_are_skipped_unless_requested(tmp_path):
     assert r.returncode == 0, r.stdout                    # not published -> not checked
     r = _run(log_root, data_root, ["--all-trials"])
     assert r.returncode == 1, r.stdout
+
+
+# --- v1.0.2: filter-list validation, derivative-missing, the shared regeneration rule ---
+
+PY_F = "sklearn/tests/test_feature.py::test_feature"
+UNIVERSE = {"stable_classification": {"pass_to_pass": [_h.PY_A, _h.PY_C], "fail_to_pass": [PY_F]}}
+FL_C = {"invalid_pass_to_pass": [_h.PY_C], "invalid_fail_to_pass": [], "invalid_none_to_pass": []}
+
+
+def _regenerate(cell, data_root):
+    """The derivative the filter-only re-tally would promote for this cell."""
+    from harness.e2e.rescore import filter_only_cell
+    out = cell.parent.parent.parent.parent.parent / "mirror"
+    rec = filter_only_cell(cell, data_root=data_root, mirror_dir=out)
+    assert rec.status == "filter-regenerated", (rec.status, rec.reason)
+    src = out / "repo_x" / cell.parent.parent.name / cell.name / "evaluation_result_filtered.json"
+    shutil.copy(src, cell / "evaluation_result_filtered.json")
+
+
+def test_derivative_missing_for_a_filtered_universe_fails_until_promoted(tmp_path):
+    payload = _h._payload(passed=[_h.PY_A], failed=[PY_F])        # C never ran -> missing, and waived
+    data_root, log_root, cell = _world(tmp_path, payload, UNIVERSE, filter_list=FL_C)
+    r = _run(log_root, data_root)
+    assert r.returncode == 1 and "derivative missing for a universe with a filter list" in r.stdout, r.stdout
+    _regenerate(cell, data_root)
+    r = _run(log_root, data_root)
+    assert r.returncode == 0 and "OK:" in r.stdout, r.stdout + r.stderr
+
+
+def test_derivative_regenerated_under_the_union_rule_passes_and_an_old_one_fails(tmp_path):
+    payload = _h._payload(passed=[_h.PY_A], failed=[PY_F])
+    data_root, log_root, cell = _world(tmp_path, payload, UNIVERSE, filter_list=FL_C)
+    # C ran in a second artifact dir: the union rule says it is not missing
+    second = cell / "artifacts" / "456"
+    second.mkdir()
+    (second / "eval.json").write_text(json.dumps({"tests": [{"nodeid": _h.PY_C}]}))
+    _regenerate(cell, data_root)
+    r = _run(log_root, data_root)
+    assert r.returncode == 0, r.stdout
+    # a derivative written under the single-payload rule disagrees on pass_to_pass_missing
+    f = json.loads((cell / "evaluation_result_filtered.json").read_text())
+    f["test_summary"]["pass_to_pass_missing"] = 0
+    f["test_summary"]["pass_to_pass_achieved"] = 1
+    f["tests_status"]["PASS_TO_PASS"]["missing"] = 0
+    (cell / "evaluation_result_filtered.json").write_text(json.dumps(f))
+    r = _run(log_root, data_root)
+    assert r.returncode == 1 and "disagrees with the current filter list" in r.stdout, r.stdout
+
+
+def test_derivative_whose_resolved_disagrees_with_the_locked_regeneration_fails(tmp_path):
+    payload = _h._payload(passed=[_h.PY_A, PY_F])               # only C missing; waived -> resolvable
+    data_root, log_root, cell = _world(tmp_path, payload, UNIVERSE, filter_list=FL_C)
+    _regenerate(cell, data_root)
+    r = _run(log_root, data_root)
+    assert r.returncode == 0, r.stdout
+    # the raw result later carries an infrastructure lock the derivative ignores
+    raw = json.loads((cell / "evaluation_result.json").read_text())
+    raw["infrastructure_failure"] = "docker daemon died"
+    (cell / "evaluation_result.json").write_text(json.dumps(raw))
+    r = _run(log_root, data_root)
+    assert r.returncode == 1 and "resolved" in r.stdout, r.stdout
+
+
+def test_invalid_filter_list_fails_every_served_cell_of_the_repo_without_crashing(tmp_path):
+    payload = _h._payload(passed=[_h.PY_A], failed=[PY_F])
+    bad = {"invalid_pass_to_pass": [_h.PY_C, "ghost::nowhere"], "invalid_fail_to_pass": [], "invalid_none_to_pass": []}
+    data_root, log_root, cell = _world(tmp_path, payload, UNIVERSE, filter_list=bad)
+    r = _run(log_root, data_root)
+    assert r.returncode == 1 and "filter list invalid" in r.stdout and "ghost" in r.stdout, r.stdout + r.stderr
+    assert "Traceback" not in r.stderr
