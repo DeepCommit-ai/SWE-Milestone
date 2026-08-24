@@ -14,6 +14,7 @@ Running the benchmark needs none of this; see [`docs/`](../README.md).
 | [env-deps-verification.md](env-deps-verification.md) | Design draft: verifying environment dependencies declared by the dataset |
 | [adding-a-repo.md](adding-a-repo.md) | The test-ID identity contract a new repo must satisfy, and the `scripts/check_test_id_identity.py` gate |
 | [scoring-id-identity-fix.md](scoring-id-identity-fix.md) | Spec for the identity-preserving scoring key (issue #24) and the re-tally tool `harness/e2e/rescore.py` |
+| [v1.0.2-release-plan.md](v1.0.2-release-plan.md) | v1.0.2 plan: cross-universe conflict filters (#25), reference-unachievable and undisclosed-prerequisite filters (#23, #26), forward-only SRS fixes, the conditional crash-hidden re-evaluation; harness changes R1–R3, commands, expected deltas, maintainer decisions |
 
 Local, git-ignored working notes (design specs and plans written by the planning workflow) live in
 `docs/superpowers/`; they are not part of the repository.

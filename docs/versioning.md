@@ -149,36 +149,24 @@ name sets — are specified in **[image-patching.md](maintainers/image-patching.
 Their core invariant: the released image is digest-identical to what the
 re-evaluation campaign scored ("evaluate-then-christen").
 
-### Displaying the version: minor in public, patch for reproduction
+### Displaying the version: the badge shows the score revision (decreed 2026-08-23)
 
-The version has two audiences, and they need different precision. The public
-presentation therefore shows the **minor** level only:
+The website badge shows the **full version of the score revision being displayed** — `v1.0.2` for the
+current board, `v1.0.1` when the reader switches to the archived revision. The leaderboard offers a
+revision switcher; archived revisions are frozen snapshots of what the board showed when that revision
+was current, clearly labelled as superseded.
 
-> **The website badge reads `v1.0`, never `v1.0.1`.** The patch level is not
-> hidden — it lives in the data (trial metadata, digest manifests, release
-> notes) where anyone reproducing a number will find it.
+This replaces the earlier policy of showing only the minor level (`v1.0`) in public. That policy assumed
+patches move scores too little for the casual reader to care; v1.0.2's grading corrections (conflict and
+collection-death waivers, the dubbo evaluation-era re-evaluation) moved the macro board by several points
+and individual columns by tens of points, so presenting `v1.0.1` and `v1.0.2` numbers under one
+indistinguishable label would mislead rather than simplify. The comparability contract is unchanged —
+everything inside `v1.0.x` remains one comparable class, and the release notes say exactly what moved and
+why — but the label a number is shown under now names its revision.
 
-This is deliberate, and it follows from what the two levels mean:
-
-- **Minor is the comparability class.** A patch is, by definition, an
-  explicitly declared assertion that old and new scores sit on one scale
-  (see the rule above — patches exist only by decree, precisely because that
-  assertion has to be made consciously). So everything inside `v1.0.x` is one
-  comparable set, and `v1.0` is the honest name for that set. A first-time
-  reader comparing a `v1.0.1` score against a `v1.0` score is doing something
-  the version system supports.
-- **Patch is the reproduction coordinate.** Someone re-running a cell needs to
-  know exactly which image bytes produced a number — that is what
-  `manifests/digests-v1.0.1.tsv`, the data-repo tag, and the release notes are
-  for. Surfacing it in a headline badge would add precision the casual reader
-  cannot use and does not need, while implying a discontinuity that does not
-  exist.
-
-Consequence for tooling: **do not "fix" the badge to render the full version.**
-If the badge is ever derived from `manifests/BENCHMARK_VERSION` instead of being
-written by hand, it must be truncated to `major.minor` — that keeps the
-single-source-of-truth property without leaking the patch level into the public
-comparability statement.
+Consequence for tooling: the badge is derived from the displayed revision (not hand-written); each
+release freezes the previous revision's leaderboard data under the website's `data/revisions/<v>/` before
+syncing the new one.
 
 ### One label, three repos
 
