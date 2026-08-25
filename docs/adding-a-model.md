@@ -36,16 +36,23 @@ below are the details and the two exceptions (new domain, pricing).
 
 > **`auto_compact_window` (claude-code only).** Sets the native
 > `CLAUDE_CODE_AUTO_COMPACT_WINDOW` so claude-code compacts its own context
-> instead of running to the endpoint's limit (native agent behaviour, keeps
-> parity). It's capped at the model's context window, which is **200K** for a
-> third-party id claude-code can't pattern-match (e.g. `glm-5.2`). So only two
-> settings are supported:
+> (native agent behaviour, keeps parity). claude-code caps the value at the
+> model's pattern-matched context window, which is **200K** for a third-party
+> id it can't pattern-match (e.g. `glm-5.3`) — so any value above 200K silently
+> compacts at the ~167K default line anyway (probe-verified 2026-08-24, on both
+> 2.1.212 and 2.1.241). Effective settings:
 >
-> - **unset** → no compaction (context runs to the endpoint's ~1M ceiling).
-> - **`200000`** → compact at 200K. The monitor header's `context=` label
->   reflects the effective window (`context=200K` vs `context=1M`).
+> - **`200000`** → compact at the 200K budget (ceiling ~167K). The monitor
+>   header's `context=` label reflects the effective window.
+> - **unset** → the agent-version default, which CHANGED: 2.1.212 runs
+>   pattern-unknown models uncompacted (measured 744K/920K); **>=2.1.24x
+>   auto-compacts them at ~167K**, i.e. same class as `200000`.
 >
-> Any value above 200K is capped to 200K, so don't bother — `200000` is the max.
+> **Full-window ("1M") runs** therefore require BOTH: `agent_version: 2.1.212`
+> (pinned) AND `auto_compact_window` unset. run_all.py fail-louds on any
+> "-1m"-named trial that violates this shape. Verify a live run by probing the
+> in-container session jsonl: max per-call prompt tokens must exceed 200K and
+> no `compact_boundary` events may appear.
 
 ---
 

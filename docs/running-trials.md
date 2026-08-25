@@ -66,12 +66,16 @@ Two forms for `trial_name`:
 > all of these slots with the one value, keeping every request on your proxy.
 > (Renamed from `default_haiku_model`; the old field name is a hard error.)
 
-> **Context compaction (`auto_compact_window`, claude-code only):** by default
-> claude-code runs with **no compaction** — context grows to the endpoint's
-> ceiling (~1M). Set `auto_compact_window: 200000` in the trial config to make
-> it compact at 200K instead (its native `CLAUDE_CODE_AUTO_COMPACT_WINDOW`;
-> values above 200K are capped, so `200000` is the only useful setting). The
-> monitor header's `context=` label reflects the effective window. Details:
+> **Context compaction (`auto_compact_window`, claude-code only):** the unset
+> default is **agent-version dependent**: claude-code 2.1.212 runs
+> pattern-unknown models uncompacted (context grows to the endpoint ceiling,
+> measured 744K/920K), while >=2.1.24x auto-compacts them at ~167K. Setting
+> `auto_compact_window: 200000` compacts at the 200K budget; values above 200K
+> are capped to the model's pattern-matched window (200K for unknown ids) and
+> so still compact at ~167K — on 2.1.212 too (probe-verified 2026-08-24). A
+> true full-window run needs `agent_version: 2.1.212` pinned AND the field
+> unset; run_all.py enforces this for "-1m"-named trials. The monitor header's
+> `context=` label reflects the effective window. Details:
 > [`adding-a-model.md`](./adding-a-model.md).
 
 > **Agent CLI version (`agent_version` — claude-code, codex, gemini-cli):**

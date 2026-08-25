@@ -8,7 +8,10 @@ model: glm-5.2
 default_agent_model: glm-5.2
 reasoning_effort: max
 timeout: 18000
-# 1M-context variant: no auto_compact_window — runs the full model window.
+# 1M-context variant. Historical: this config relied on claude-code 2.1.212's
+# native default (no compaction for unknown models; measured up to 920K). On
+# >=2.1.24x that default compacts at ~167K — declare auto_compact_window
+# explicitly (see claude-code_glm-5.3-1m.yaml) for any future 1M run.
 
 # Uncomment to pin the claude-code CLI version instead of installing latest.
 # agent_version: 2.1.210

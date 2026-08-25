@@ -431,6 +431,31 @@ def main():
     auto_compact_window = cfg.get("auto_compact_window", None)
     if auto_compact_window:
         os.environ["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+    # Fail-loud guard: a trial that CLAIMS a full-window run ("-1m" in its name)
+    # must use the probe-verified shape (2026-08-24, docs/running-trials.md):
+    #   - agent_version pinned (2.1.212 verified: native default = no compaction
+    #     for pattern-unknown models; >=2.1.24x compacts them at ~167K), AND
+    #   - auto_compact_window UNSET (claude-code caps the env at the model's
+    #     pattern-matched window — 200K for unknown ids — so any value >200K
+    #     silently reintroduces ~167K compaction, on 2.1.212 too).
+    if "-1m" in str(yaml_trial_name).lower() and agent == "claude-code":
+        if auto_compact_window:
+            print(
+                "Error: '-1m' trial sets auto_compact_window, but claude-code caps the\n"
+                "value at the model's pattern-matched window (200K for unknown ids), so\n"
+                "this compacts at ~167K instead of running the full window. Remove\n"
+                "auto_compact_window and pin agent_version (2.1.212 verified).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not cfg.get("agent_version"):
+            print(
+                "Error: '-1m' trial without a pinned agent_version. Current claude-code\n"
+                "(>=2.1.24x) auto-compacts pattern-unknown models at ~167K, so the run\n"
+                "would NOT be 1M. Pin the verified version: agent_version: 2.1.212.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Tool Search (claude-code only): `enable_tool_search: false` pins
     # claude-code's native ENABLE_TOOL_SEARCH env var inside the agent
