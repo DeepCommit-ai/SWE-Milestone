@@ -25,7 +25,10 @@ from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-API_VERSION = "1.0"
+# 1.1: EvalResult gained `scoring_blocked` (additive; the harness's v1.0.2
+# fail-closed filter verdict). Consumers on 1.0 keep working but cannot tell a
+# blocked cell from a scored one.
+API_VERSION = "1.1"
 PROMPT_DIR = Path(__file__).parent / "e2e" / "prompt"
 # The node runtime Claude Code needs. go/java/rust testbed images ship none;
 # runtime_spec() bootstraps this static build when npm is absent.
@@ -294,13 +297,28 @@ def _milestone_id(task: TaskRecord) -> str:
 
 def _normalize_eval(d: dict) -> dict:
     """Official EvaluationResult.to_dict() -> cross-source EvalResult primitives
-    (§4). reward formula stays a training-side config; we only pass counts."""
+    (§4). reward formula stays a training-side config; we only pass counts.
+
+    `scoring_blocked` is the harness's fail-closed verdict (v1.0.2): when filter-list
+    validation fails, the official evaluator stamps the RAW result and produces no
+    filtered derivative. The raw numbers are still present and still parsed here, but
+    they are NOT a valid score — the required set was never reduced by the waivers it
+    should have been. Consumers must treat a blocked result as unscoreable (drop the
+    sample) rather than feeding `resolved` into a reward."""
     ts = d.get("tests_status", {}) or {}
     f2p = ts.get("FAIL_TO_PASS", {}) or {}
     p2p = ts.get("PASS_TO_PASS", {}) or {}
     summ = d.get("test_summary", {}) or {}
     n_fixed = len(f2p.get("success", []) or [])
+    blocked = bool(d.get("scoring_blocked", False))
+    if blocked:
+        logger.error(
+            "scoring_blocked: filter-list validation failed for this cell; the raw "
+            "numbers below are NOT a valid score (see harness.e2e.evaluator."
+            "generate_filtered_evaluation). Drop this sample."
+        )
     return {
+        "scoring_blocked": blocked,
         "resolved": bool(d.get("resolved", False)),
         "n_f2p_fixed": n_fixed,
         "n_f2p_inscope": n_fixed + len(f2p.get("failure", []) or []),
@@ -343,6 +361,10 @@ def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
     raw_path = scratch / "evaluation_result.json"
     raw_path.write_text(json.dumps(result.to_dict()))
     filtered = generate_filtered_evaluation(raw_path, ws, milestone)   # official flaky filter_list pass
+    # None has two meanings and the raw file distinguishes them: benign (this milestone
+    # has no filter_list -> raw IS the score) vs fail-closed (validation failed -> the
+    # official code stamped `scoring_blocked` on the raw file). Re-read raw either way;
+    # _normalize_eval surfaces the stamp so the caller can drop blocked samples.
     final = json.loads((filtered or raw_path).read_text())
     return _normalize_eval(final)
 

@@ -163,3 +163,31 @@ def test_tag_derivation_uses_milestone_id_consistently():
     instr = api.build_instruction(tr)
     assert "agent-impl-M001" in instr and "r__M001" not in instr
     assert "agent-impl-M001" in api.agent_session_spec(tr).completion["signal_cmd"]
+
+
+# ─────────────────── fail-closed scoring verdict passthrough ────────────────
+# harness v1.0.2 made generate_filtered_evaluation fail-closed: when filter-list
+# validation fails it writes NO filtered derivative and stamps `scoring_blocked`
+# on the raw result. evaluate() falls back to the raw file in that case, so the
+# flag has to survive normalization or the training stack silently rewards a cell
+# the harness declared unscoreable.
+def test_normalize_eval_passes_through_scoring_blocked():
+    raw = {"resolved": True, "scoring_blocked": True,
+           "tests_status": {"FAIL_TO_PASS": {"success": ["t1"], "failure": []},
+                            "PASS_TO_PASS": {"success": [], "failure": []}},
+           "test_summary": {"pass_to_pass_required": 0, "total": 1, "passed": 1}}
+    out = api._normalize_eval(raw)
+    assert out["scoring_blocked"] is True
+    # the raw numbers are still parsed (the caller decides to drop the sample)
+    assert out["resolved"] is True and out["n_f2p_fixed"] == 1
+
+
+def test_normalize_eval_defaults_scoring_blocked_false():
+    # benign path: milestone has no filter_list, raw IS the score, no stamp present
+    raw = {"resolved": False,
+           "tests_status": {"FAIL_TO_PASS": {"success": [], "failure": ["t1"]},
+                            "PASS_TO_PASS": {"success": [], "failure": []}},
+           "test_summary": {"pass_to_pass_required": 0, "total": 1, "passed": 0}}
+    out = api._normalize_eval(raw)
+    assert out["scoring_blocked"] is False
+    assert out["n_f2p_inscope"] == 1
