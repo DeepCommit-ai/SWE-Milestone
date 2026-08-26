@@ -1552,18 +1552,14 @@ fi
                 logger.warning(f"Timeout waiting for fakeroot user (waited {max_wait}s)")
         return False
 
-    def truncate_git_history(self, main_branch: str = "main") -> None:
-        """Truncate git history to prevent agent from seeing future commits.
+    @staticmethod
+    def truncate_history_script(main_branch: str = "main") -> str:
+        """The anti-leak history truncation script (single definition).
 
-        This removes all tags, branches (except main), remotes, reflog,
-        and runs garbage collection to remove unreachable objects.
-
-        Args:
-            main_branch: Name of the main branch to keep
-        """
-        logger.info(f"Truncating git history (main_branch={main_branch})...")
-
-        truncate_script = f"""
+        Exposed so consumers that build their own sandbox (harness.api.harden_container
+        for the external training seam) run the SAME script instead of a copy that can
+        drift away from this one."""
+        return f"""
 set -e
 cd /testbed
 
@@ -1660,6 +1656,19 @@ echo "Current branch: $(git branch --show-current)"
 echo ""
 echo "Git history truncated successfully"
 """
+
+    def truncate_git_history(self, main_branch: str = "main") -> None:
+        """Truncate git history to prevent agent from seeing future commits.
+
+        This removes all tags, branches (except main), remotes, reflog,
+        and runs garbage collection to remove unreachable objects.
+
+        Args:
+            main_branch: Name of the main branch to keep
+        """
+        logger.info(f"Truncating git history (main_branch={main_branch})...")
+
+        truncate_script = self.truncate_history_script(main_branch)
 
         result = subprocess.run(
             [

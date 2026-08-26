@@ -72,7 +72,8 @@ def test_iter_task_records_fields(tmp_path):
     assert set(recs) == {"myrepo__M001", "myrepo__M002"}
 
     m1 = recs["myrepo__M001"]
-    assert m1.docker_image == "myrepo/m001:latest"
+    from harness.e2e.image_version import DEFAULT_IMAGE_TAG, local_ref
+    assert m1.docker_image == local_ref("myrepo", "M001", DEFAULT_IMAGE_TAG)
     assert m1.problem_statement == "Problem one {keep braces}"
     assert m1.fail_to_pass == ["t1"] and m1.pass_to_pass == ["t2"]
     assert m1.framework == "go_test"
@@ -191,3 +192,144 @@ def test_normalize_eval_defaults_scoring_blocked_false():
     out = api._normalize_eval(raw)
     assert out["scoring_blocked"] is False
     assert out["n_f2p_inscope"] == 1
+
+
+# ═════════════ post-v1.0.2 harness-contract regressions (merge drift) ═══════════
+# The seam was written 208 commits before main's v1.0.2 snapshot/grading contract.
+# These lock the four places where main changed behaviour under it.
+import tarfile
+
+from harness.utils.snapshot import ManifestOverlay, SNAPSHOT_METADATA_SCHEMA_VERSION
+
+
+def _tar_with(tmp_path, names):
+    p = tmp_path / "snap.tar"
+    with tarfile.open(p, "w") as t:
+        for n in names:
+            f = tmp_path / "payload.txt"
+            f.write_text("x")
+            t.add(f, arcname=n)
+    return p
+
+
+def _members(p):
+    with tarfile.open(p, "r") as t:
+        return sorted(m.name for m in t.getmembers() if m.isfile())
+
+
+# ── S3: the tar pass must use the build-manifest-aware wrapper ──────────────
+def test_filter_snapshot_tar_drops_unchanged_manifest_under_src_dir(tmp_path):
+    # main's should_include_snapshot_file short-circuits EVERY build manifest: a pom.xml
+    # nested under a broad src dir is kept only when the overlay upserts it. Letting it
+    # fall through to SrcFileFilter is the stale-POM pollution bug.
+    tar = _tar_with(tmp_path, ["src/app.java", "src/pom.xml"])
+    f = api._src_filter_for(TaskRecord.from_row({
+        "docker_image": "r/m:latest", "problem_statement": "", "instance_id": "r__M001",
+        "source_spec": {"repo_config": {"src_dirs": ["src/"], "test_dirs": ["**/*_test.java"],
+                                        "exclude_patterns": [], "generated_patterns": [],
+                                        "modifiable_test_patterns": []}}}))
+    api._filter_snapshot_tar(tar, f, extra_build_manifests=set())
+    assert _members(tar) == ["src/app.java"]
+
+
+def test_filter_snapshot_tar_keeps_manifest_the_overlay_upserts(tmp_path):
+    tar = _tar_with(tmp_path, ["src/app.java", "src/pom.xml"])
+    f = api._src_filter_for(TaskRecord.from_row({
+        "docker_image": "r/m:latest", "problem_statement": "", "instance_id": "r__M001",
+        "source_spec": {"repo_config": {"src_dirs": ["src/"], "test_dirs": ["**/*_test.java"],
+                                        "exclude_patterns": [], "generated_patterns": [],
+                                        "modifiable_test_patterns": []}}}))
+    api._filter_snapshot_tar(tar, f, extra_build_manifests={"src/pom.xml"})
+    assert _members(tar) == ["src/app.java", "src/pom.xml"]
+
+
+def test_filter_snapshot_tar_runs_without_test_or_exclude_patterns(tmp_path):
+    # main: "This pass also strips unchanged build manifests, so it is mandatory even
+    # with no test/exclude patterns." The old early-return skipped it entirely.
+    tar = _tar_with(tmp_path, ["src/app.rs", "Cargo.toml"])
+    f = api._src_filter_for(TaskRecord.from_row({
+        "docker_image": "r/m:latest", "problem_statement": "", "instance_id": "r__M001",
+        "source_spec": {"repo_config": {"src_dirs": ["src/"], "test_dirs": [],
+                                        "exclude_patterns": [], "generated_patterns": [],
+                                        "modifiable_test_patterns": []}}}))
+    api._filter_snapshot_tar(tar, f, extra_build_manifests=set())
+    assert _members(tar) == ["src/app.rs"]
+
+
+# ── S1: the capture must emit the integrity sidecar the evaluator demands ───
+def test_snapshot_sidecar_payload_satisfies_the_evaluator_contract(tmp_path):
+    # evaluator._load_and_validate_snapshot_metadata requires: schema_version, ok is True,
+    # tag in {agent-impl-<mid>, agent-workdir-<mid>}, snapshot_sha256 matching the tar,
+    # and a well-formed manifest_overlay. Go repos additionally need agent_base_image_id,
+    # agent_tag_commit, go_manifest_projection and capture_filter.
+    tar = _tar_with(tmp_path, ["src/app.go", "go.mod"])
+    overlay = ManifestOverlay.create("a" * 40, upserts={"go.mod"}, deletes=())
+    payload = api._snapshot_sidecar_payload(
+        tag="agent-impl-M001", snapshot_file=tar, manifest_overlay=overlay,
+        capture_filter={"src_dirs": ["src/"]}, agent_base_image_id="b" * 64,
+        agent_tag_commit="c" * 40)
+
+    assert payload["schema_version"] == SNAPSHOT_METADATA_SCHEMA_VERSION
+    assert payload["ok"] is True
+    assert payload["tag"] == "agent-impl-M001"
+    from harness.utils.snapshot import snapshot_sha256
+    assert payload["snapshot_sha256"] == snapshot_sha256(tar)
+    assert ManifestOverlay.from_metadata(payload["manifest_overlay"]).upserts == frozenset({"go.mod"})
+    assert payload["go_manifest_projection"]["present"] == ["go.mod"]
+    assert payload["agent_base_image_id"] == "b" * 64
+    assert payload["agent_tag_commit"] == "c" * 40
+    assert isinstance(payload["capture_filter"], dict)
+    # binding fields must be ABSENT: declaring them forces the evaluator into
+    # trial-pinned mode, which this seam cannot satisfy.
+    assert "repo_config_binding" not in payload
+    assert "runtime_policy_binding" not in payload
+
+
+# ── S4: infra-poisoned cells must be distinguishable from honest failures ───
+def test_normalize_eval_passes_through_infrastructure_verdict():
+    raw = {"resolved": False, "infrastructure_failure": "docker_oom",
+           "infra_invalid": True, "infra_invalid_reason": "container died",
+           "eval_status": "infra-invalid",
+           "tests_status": {"FAIL_TO_PASS": {"success": [], "failure": []},
+                            "PASS_TO_PASS": {"success": [], "failure": []}},
+           "test_summary": {"pass_to_pass_required": 0, "total": 0, "passed": 0}}
+    out = api._normalize_eval(raw)
+    assert out["infra_invalid"] is True
+    assert out["eval_status"] == "infra-invalid"
+    assert out["infrastructure_failure"] == "docker_oom"
+    assert out["infra_invalid_reason"] == "container died"
+
+
+def test_normalize_eval_infra_defaults_are_clean_for_an_honest_failure():
+    raw = {"resolved": False,
+           "tests_status": {"FAIL_TO_PASS": {"success": [], "failure": ["t1"]},
+                            "PASS_TO_PASS": {"success": [], "failure": []}},
+           "test_summary": {"pass_to_pass_required": 0, "total": 1, "passed": 0}}
+    out = api._normalize_eval(raw)
+    assert out["infra_invalid"] is False
+    assert out["eval_status"] == ""
+    assert out["infrastructure_failure"] == ""
+
+
+# ── image naming must follow the released scheme, not a hand-rolled one ─────
+def test_iter_task_records_emits_the_canonical_image_ref(tmp_path):
+    # The offline dataset build feeds metadata.docker_image straight into the
+    # consumer's `docker pull`. A hand-rolled "<repo>/<mid>:latest" neither exists
+    # nor tracks BENCHMARK_VERSION, so training silently drifts off the released
+    # image set. Pin the released scheme instead.
+    from harness.e2e.image_version import local_ref, DEFAULT_IMAGE_TAG
+    root = _make_tree(tmp_path)
+    recs = {t.instance_id: t for t in api.iter_task_records(root)}
+    assert recs["myrepo__M001"].docker_image == local_ref("myrepo", "M001", DEFAULT_IMAGE_TAG)
+    assert recs["myrepo__M001"].docker_image.endswith(f":{DEFAULT_IMAGE_TAG}")
+
+
+# ── anti-leak: history hardening must exist and must fail loudly ────────────
+def test_harden_container_raises_when_the_container_is_unreachable():
+    # The official harness truncates git history at container setup ("prevent agent
+    # from seeing future commits"); the seam had no equivalent, so an RL work
+    # container kept every future commit -- including "End state for <milestone>".
+    # A silent failure here would reopen that hole, so the contract is fail-loud.
+    import pytest
+    with pytest.raises(RuntimeError):
+        api.harden_container("swe_milestone_no_such_container_zzz")

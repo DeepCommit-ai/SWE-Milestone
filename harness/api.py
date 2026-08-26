@@ -25,10 +25,16 @@ from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-# 1.1: EvalResult gained `scoring_blocked` (additive; the harness's v1.0.2
-# fail-closed filter verdict). Consumers on 1.0 keep working but cannot tell a
-# blocked cell from a scored one.
-API_VERSION = "1.1"
+# 1.2: realigned with main's v1.0.2 snapshot/grading contract.
+#  - EvalResult gained `scoring_blocked` (1.1) and the infra verdict fields
+#    (`infra_invalid`, `infra_invalid_reason`, `infrastructure_failure`,
+#    `eval_status`). Both mark a cell as unscoreable; consumers must drop or
+#    retry it instead of feeding `resolved` to a reward.
+#  - extract_snapshot now writes the `<tar>.integrity.json` sidecar the official
+#    evaluator requires, and captures build manifests through the overlay.
+#  - harden_container() truncates the work container's git history (anti-leak).
+#  - iter_task_records emits the released image ref pinned to BENCHMARK_VERSION.
+API_VERSION = "1.2"
 PROMPT_DIR = Path(__file__).parent / "e2e" / "prompt"
 # The node runtime Claude Code needs. go/java/rust testbed images ship none;
 # runtime_spec() bootstraps this static build when npm is absent.
@@ -256,7 +262,7 @@ def mask_tests(container_name: str, task: TaskRecord, *, workdir: str = "/testbe
 # stays official — no reimplementation, no materialization. Point at it with
 # EVOCLAW_DATA_ROOT (default ~/worksapce/EvoClaw-data). The consumer is
 # responsible for a version self-check (tree commit ↔ parquet source_commit).
-EVOCLAW_DATA_ROOT = os.environ.get("EVOCLAW_DATA_ROOT") or str(Path.home() / "worksapce" / "EvoClaw-data")
+EVOCLAW_DATA_ROOT = os.environ.get("EVOCLAW_DATA_ROOT") or str(Path.home() / "workspace" / "EvoClaw-data")
 
 
 def _repo_dir(task: TaskRecord, root: Optional[Path] = None) -> str:
@@ -317,8 +323,27 @@ def _normalize_eval(d: dict) -> dict:
             "numbers below are NOT a valid score (see harness.e2e.evaluator."
             "generate_filtered_evaluation). Drop this sample."
         )
+    # Infra verdict. The official consumer (orchestrator._require_scoreable) raises
+    # InfrastructureFailureError on these and RETRIES the cell instead of recording
+    # it. Without them a docker/OOM/network-poisoned cell that ran zero tests is
+    # indistinguishable from an honest "agent did not solve it" and poisons the
+    # reward with a false negative.
+    infra_invalid = bool(d.get("infra_invalid", False))
+    infra_reason = str(d.get("infra_invalid_reason") or "")
+    infra_failure = str(d.get("infrastructure_failure") or "")
+    eval_status = str(d.get("eval_status") or "")
+    if infra_invalid or infra_failure or eval_status == "infra-invalid":
+        logger.error(
+            "infrastructure failure: this cell is not safe to score (status=%r, "
+            "signature=%r, reason=%r). Retry it; do not feed it to the reward.",
+            eval_status, infra_failure, infra_reason,
+        )
     return {
         "scoring_blocked": blocked,
+        "infra_invalid": infra_invalid,
+        "infra_invalid_reason": infra_reason,
+        "infrastructure_failure": infra_failure,
+        "eval_status": eval_status,
         "resolved": bool(d.get("resolved", False)),
         "n_f2p_fixed": n_fixed,
         "n_f2p_inscope": n_fixed + len(f2p.get("failure", []) or []),
@@ -380,6 +405,70 @@ def _fakeroot_exec(container_name: str) -> list[str]:
             "-w", "/testbed", container_name]
 
 
+def harden_container(container_name: str, *, main_branch: str = "main") -> str:
+    """Pre-agent anti-leak hook: truncate /testbed's git history, return the baseline commit.
+
+    The milestone images ship the FULL upstream history plus the generator's own
+    commits — "Add test code for <milestone>" and "End state for <milestone>" are
+    reachable from tags/remotes, so an agent that runs `git log --all` / `git show`
+    reads both the graded tests and the reference solution. `mask_tests` does not
+    help: it chmods the working tree, while the objects stay in .git. The official
+    harness closes this at container setup (container_setup.truncate_git_history,
+    "prevent agent from seeing future commits"); a consumer that builds its own
+    sandbox must call this instead, BEFORE the agent starts.
+
+    Returns the post-truncation HEAD, i.e. the pre-agent baseline commit — pass it
+    to extract_snapshot(baseline=...) so the manifest overlay diffs against the
+    real BASE rather than an inferred one.
+
+    Raises RuntimeError on any failure: a container whose history was not truncated
+    must not run an agent."""
+    import subprocess  # noqa: PLC0415
+    from harness.e2e.container_setup import ContainerSetup  # noqa: PLC0415
+
+    script = ContainerSetup.truncate_history_script(main_branch=main_branch)
+    r = subprocess.run(_root_exec(container_name) + ["/bin/sh", "-c", script],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "unknown git error").strip()
+        raise RuntimeError(f"harden_container: history truncation failed on "
+                           f"{container_name}: {detail}")
+    head = subprocess.run(_root_exec(container_name) + ["git", "rev-parse", "HEAD"],
+                          capture_output=True, text=True)
+    baseline = head.stdout.strip()
+    if head.returncode != 0 or not baseline:
+        detail = (head.stderr or head.stdout or "no HEAD").strip()
+        raise RuntimeError(f"harden_container: could not read the baseline commit on "
+                           f"{container_name}: {detail}")
+    logger.info("harden_container: %s history truncated; baseline=%s", container_name, baseline)
+    return baseline
+
+
+def _snapshot_sidecar_payload(*, tag: str, snapshot_file: Path, manifest_overlay,
+                              capture_filter: dict, agent_base_image_id: Optional[str] = None,
+                              agent_tag_commit: Optional[str] = None) -> dict:
+    """The capture sidecar the evaluator validates before it will grade a tar.
+
+    Deliberately omits `repo_config_binding` / `runtime_policy_binding`: declaring
+    either forces the evaluator into trial-pinned mode, which this seam cannot
+    satisfy (it passes no frozen config path + sha256). Go repos additionally
+    require agent_base_image_id / agent_tag_commit / capture_filter for exact
+    module replay, so pass them whenever they are known."""
+    from harness.utils.snapshot import make_snapshot_metadata  # noqa: PLC0415
+    extra: dict = {"tag": tag, "ok": True, "capture_filter": capture_filter}
+    if agent_base_image_id:
+        extra["agent_base_image_id"] = agent_base_image_id
+    if agent_tag_commit:
+        extra["agent_tag_commit"] = agent_tag_commit
+    return make_snapshot_metadata(tag=tag, snapshot_file=Path(snapshot_file),
+                                  manifest_overlay=manifest_overlay, extra=extra)
+
+
+def _root_exec(container_name: str) -> list[str]:
+    """`docker exec` as root in /testbed (history truncation predates the agent user)."""
+    return ["docker", "exec", "-w", "/testbed", container_name]
+
+
 def _tag_exists(container_name: str, tag: str) -> bool:
     import subprocess  # noqa: PLC0415
     r = subprocess.run(_fakeroot_exec(container_name) + ["git", "tag", "-l", tag],
@@ -430,13 +519,19 @@ def _existing_root_files_workdir(container_name: str, files: list) -> set:
     return {ln for ln in r.stdout.strip().split("\n") if ln}
 
 
-def _filter_snapshot_tar(tar_path: Path, src_filter) -> int:
-    """Drop tar members should_include_in_snapshot() rejects (test/excluded files),
-    keeping src + generated + modifiable-test files. No-op when no test/exclude patterns
-    are defined. Mirrors run_milestone._filter_tar_archive."""
+def _filter_snapshot_tar(tar_path: Path, src_filter, extra_build_manifests=None) -> int:
+    """Drop tar members the official snapshot policy rejects, keeping src + generated
+    + modifiable-test files and exactly the build manifests the capture overlay upserts.
+
+    Mirrors run_milestone._filter_tar_archive. Two things this must NOT do (both were
+    bugs here): skip the pass when a repo declares no test/exclude patterns — the pass
+    also strips unchanged build manifests, so it is mandatory — and call
+    SrcFileFilter.should_include_in_snapshot directly, which lets a pom.xml nested
+    under a broad source dir through and overwrites the evaluator's END manifest
+    (main's stale-POM pollution bug)."""
     import tarfile  # noqa: PLC0415
-    if not src_filter.test_dirs and not src_filter.exclude_patterns:
-        return 0
+    from harness.utils.snapshot import should_include_snapshot_file  # noqa: PLC0415
+    explicit = set(extra_build_manifests or set())
     n = 0
     tmp = tar_path.with_suffix(".filtered.tar")
     with tarfile.open(tar_path, "r") as src, tarfile.open(tmp, "w") as dst:
@@ -444,7 +539,7 @@ def _filter_snapshot_tar(tar_path: Path, src_filter) -> int:
             if not m.isfile():
                 dst.addfile(m)
                 continue
-            if src_filter.should_include_in_snapshot(m.name):
+            if should_include_snapshot_file(m.name, src_filter, extra_build_manifests=explicit):
                 fo = src.extractfile(m)
                 if fo:
                     dst.addfile(m, fo)
@@ -454,56 +549,173 @@ def _filter_snapshot_tar(tar_path: Path, src_filter) -> int:
     return n
 
 
-def extract_snapshot(container_name: str, task: TaskRecord, *, dest: Path) -> Path:
-    """Extract the gradeable source snapshot from the live work container into ``dest`` (a .tar).
+def _git_out(container_name: str, *args: str) -> str:
+    """Run git in the container, returning stdout; raise with git's own message."""
+    import subprocess  # noqa: PLC0415
+    r = subprocess.run(_fakeroot_exec(container_name) + ["git", *args],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return r.stdout
+
+
+def _resolve_baseline(container_name: str, tag: str, baseline: Optional[str]) -> str:
+    """The pre-agent BASE the manifest overlay diffs against.
+
+    Explicit wins (harden_container returns it). Otherwise reuse the official legacy
+    rule (run_milestone._infer_legacy_snapshot_baseline): the parent of the earliest
+    reachable agent tag."""
+    if baseline:
+        return str(baseline).strip()
+    reachable = []
+    for cand in (t.strip() for t in _git_out(container_name, "tag", "-l", "agent-impl-*").splitlines()):
+        if not cand:
+            continue
+        import subprocess  # noqa: PLC0415
+        anc = subprocess.run(_fakeroot_exec(container_name)
+                             + ["git", "merge-base", "--is-ancestor", cand, tag],
+                             capture_output=True, text=True)
+        if anc.returncode != 0:
+            continue
+        n = _git_out(container_name, "rev-list", "--count", f"{cand}..{tag}").strip()
+        reachable.append((int(n or 0), cand))
+    earliest = max(reachable, default=(0, tag))[1]
+    base = _git_out(container_name, "rev-parse", f"{earliest}^").strip()
+    if not base:
+        raise RuntimeError(f"extract_snapshot: could not infer a pre-agent BASE for {tag}")
+    logger.warning("extract_snapshot: no baseline passed; inferred %s from %s^ "
+                   "(pass harden_container()'s return value for an exact BASE)", base, earliest)
+    return base
+
+
+def _manifest_overlay(container_name: str, *, baseline: str, rev: Optional[str],
+                      src_dirs: list, src_filter):
+    """The agent-authoritative build-manifest delta, expanded to the Go projection.
+
+    Mirrors run_milestone._get_build_manifest_overlay_in_git / _in_workdir: upserts are
+    ACMT-changed manifests, deletes are D-removed ones, then scoped Go manifests are
+    projected exactly (unchanged Go metadata is captured too, so a prepared END manifest
+    cannot supply a dependency the agent never declared). ``rev=None`` diffs the worktree."""
+    from harness.utils.snapshot import (  # noqa: PLC0415
+        ManifestOverlay, expand_atomic_manifest_overlay, find_build_manifests,
+    )
+    diff_target = [baseline, rev, "--"] if rev else [baseline, "--"]
+
+    def _names(diff_filter: str) -> list:
+        out = _git_out(container_name, "-c", "core.quotePath=false", "diff", "--no-renames",
+                       "--name-only", "-z", f"--diff-filter={diff_filter}", *diff_target)
+        return out.split("\0")
+
+    inventory = _git_out(container_name, "-c", "core.quotePath=false", "ls-tree", "-r", "-z",
+                         "--name-only", rev).split("\0") if rev else \
+        _git_out(container_name, "-c", "core.quotePath=false", "ls-files", "-z").split("\0")
+    overlay = ManifestOverlay.create(baseline,
+                                     find_build_manifests(_names("ACMT"), src_filter),
+                                     find_build_manifests(_names("D"), src_filter))
+    return expand_atomic_manifest_overlay(
+        overlay, find_build_manifests(inventory, src_filter), src_dirs)
+
+
+def extract_snapshot(container_name: str, task: TaskRecord, *, dest: Path,
+                     baseline: Optional[str] = None) -> Path:
+    """Extract the gradeable source snapshot from the live work container into ``dest`` (a .tar),
+    plus the ``<dest>.integrity.json`` sidecar the official evaluator requires.
 
     OFFICIAL logic, two paths: if the agent created the completion tag
     ``agent-impl-<milestone>`` → ``git archive`` that tag; otherwise fall back to taring the
-    working dir (regardless of git state). In both cases only the source dirs that EXIST plus
-    ROOT_BUILD_FILES are archived, then the tar is filtered by ``should_include_in_snapshot``
-    (keeps generated code + modifiable tests, drops other tests/excludes — see _src_filter_for).
+    working dir. Both compute the build-manifest overlay against ``baseline`` (pass
+    harden_container()'s return value; inferred from the earliest agent tag otherwise),
+    archive only the source dirs that EXIST plus exactly the manifests that overlay upserts,
+    filter the tar under the official snapshot policy, and write the integrity sidecar —
+    without it PatchEvaluator refuses the tar ("Snapshot metadata sidecar is missing").
+
     The TaskRecord must carry ``source_spec.repo_config`` (built by iter_task_records). Raises
     RuntimeError on infra failure so the consumer can turn it into an abort."""
     from harness.utils.snapshot import ROOT_BUILD_FILES, get_snapshot_paths  # noqa: PLC0415
+    import json  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
 
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tag = f"agent-impl-{_milestone_id(task)}"
+    mid = _milestone_id(task)
+    tag = f"agent-impl-{mid}"
     rc = task.source_spec.get("repo_config") or {}
     src_dirs = list(rc.get("src_dirs") or [])
     if not src_dirs:
         raise RuntimeError("extract_snapshot: no src_dirs in source_spec.repo_config "
                            "(build the TaskRecord via iter_task_records)")
     src_filter = _src_filter_for(task)
+    tagged = _tag_exists(container_name, tag)
+    base = _resolve_baseline(container_name, tag if tagged else "HEAD", baseline)
+    overlay = _manifest_overlay(container_name, baseline=base, rev=tag if tagged else None,
+                                src_dirs=src_dirs, src_filter=src_filter)
+    manifests = set(overlay.upserts)
 
-    if _tag_exists(container_name, tag):
+    if tagged:
         existing = _existing_src_dirs_git(container_name, src_dirs, tag)
         if not existing:
             raise RuntimeError(f"extract_snapshot: no source directories found at {tag}")
         root_files = _existing_root_files_git(container_name, ROOT_BUILD_FILES, tag)
-        paths = get_snapshot_paths(existing, existing_root_files=root_files)
+        paths = get_snapshot_paths(existing, existing_root_files=root_files,
+                                   extra_build_manifests=manifests)
         cmd = _fakeroot_exec(container_name) + ["git", "archive", "--format=tar", tag] + paths
-        logger.info("extract_snapshot: git archive %s (%d/%d src dirs)", tag, len(existing), len(src_dirs))
+        sidecar_tag = tag
+        logger.info("extract_snapshot: git archive %s (%d/%d src dirs, %d manifests)",
+                    tag, len(existing), len(src_dirs), len(manifests))
     else:
         existing = _existing_workdir_dirs(container_name, src_dirs)
         if not existing:
             raise RuntimeError("extract_snapshot: no source directories in container workdir (no tag, fallback)")
         root_files = _existing_root_files_workdir(container_name, ROOT_BUILD_FILES)
-        paths = get_snapshot_paths(existing, existing_root_files=root_files)
+        paths = get_snapshot_paths(existing, existing_root_files=root_files,
+                                   extra_build_manifests=manifests)
         tar_cmd = "tar -cf - --ignore-failed-read " + " ".join(paths) + " 2>/dev/null"
         cmd = _fakeroot_exec(container_name) + ["sh", "-c", tar_cmd]
-        logger.info("extract_snapshot: workdir tar fallback (no %s); %d/%d src dirs", tag, len(existing), len(src_dirs))
+        sidecar_tag = f"agent-workdir-{mid}"
+        logger.info("extract_snapshot: workdir tar fallback (no %s); %d/%d src dirs, %d manifests",
+                    tag, len(existing), len(src_dirs), len(manifests))
 
     with open(dest, "wb") as f:
         r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
         if r.returncode != 0:
             raise RuntimeError(f"extract_snapshot: archive failed: {r.stderr.decode(errors='replace')}")
 
-    dropped = _filter_snapshot_tar(dest, src_filter)
+    dropped = _filter_snapshot_tar(dest, src_filter, extra_build_manifests=manifests)
     if dropped:
         logger.info("extract_snapshot: filtered out %d test/excluded files", dropped)
+
+    # Sidecar last: snapshot_sha256 must bind the FINAL tar.
+    sidecar = dest.parent / (dest.stem + ".integrity.json")
+    sidecar.write_text(json.dumps(_snapshot_sidecar_payload(
+        tag=sidecar_tag, snapshot_file=dest, manifest_overlay=overlay,
+        capture_filter=_capture_filter(src_filter),
+        agent_base_image_id=_container_image_id(container_name),
+        agent_tag_commit=_git_out(container_name, "rev-parse",
+                                  tag if tagged else "HEAD").strip(),
+    ), indent=2))
     return dest
+
+
+def _capture_filter(src_filter) -> dict:
+    """The filter config the sidecar records (Go exact-replay provenance)."""
+    return {
+        "src_dirs": list(getattr(src_filter, "src_dirs", []) or []),
+        "test_dirs": list(getattr(src_filter, "test_dirs", []) or []),
+        "exclude_patterns": list(getattr(src_filter, "exclude_patterns", []) or []),
+        "generated_patterns": list(getattr(src_filter, "generated_patterns", []) or []),
+        "modifiable_test_patterns": list(getattr(src_filter, "modifiable_test_patterns", []) or []),
+    }
+
+
+def _container_image_id(container_name: str) -> Optional[str]:
+    """The 64-hex image id backing the work container (Go replay provenance)."""
+    import subprocess  # noqa: PLC0415
+    r = subprocess.run(["docker", "inspect", "-f", "{{.Image}}", container_name],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return (r.stdout.strip().split(":")[-1] or None)
 
 
 # ───────────────────────────── offline data build ──────────────────────────
@@ -611,6 +823,7 @@ def iter_task_records(data_root, repos=None, *, framework=None, f2p_strict: bool
     repo_config/new_tests/filter_list population — listing only (masking/snapshot then won't
     work). on_error='skip' logs and skips a malformed repo/milestone; anything else re-raises."""
     import json  # noqa: PLC0415
+    from harness.e2e.image_version import DEFAULT_IMAGE_TAG, local_ref  # noqa: PLC0415
     root = Path(data_root)
     if not root.is_dir():
         raise FileNotFoundError(f"iter_task_records: data_root not found: {root}")
@@ -636,9 +849,10 @@ def iter_task_records(data_root, repos=None, *, framework=None, f2p_strict: bool
                 fail_to_pass, pass_to_pass, new_tests = _read_classification(ws, mid, f2p_strict=f2p_strict)
                 srs = ws / "srs" / mid / "SRS.md"
                 problem = srs.read_text(encoding="utf-8") if srs.exists() else ""
-                image = f"{repo.lower()}/{mid.lower()}"
-                if ":" not in image:
-                    image += ":latest"
+                # The released naming scheme, pinned to the benchmark data version
+                # the tree belongs to. A hand-rolled "<repo>/<mid>:latest" matches no
+                # published image and silently drifts off the released set.
+                image = local_ref(repo, mid, DEFAULT_IMAGE_TAG)
                 ei = {
                     "instance_id": f"{repo}__{mid}",
                     "docker_image": image,
