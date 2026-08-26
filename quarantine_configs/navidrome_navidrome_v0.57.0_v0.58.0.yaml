@@ -1,0 +1,58 @@
+# Quarantine (anti-cheat) policy — navidrome v0.57.0 → v0.58.0
+#
+# Dual ecosystem: Go backend (same channel & defense as go-zero —
+# GOPROXY=off + proxy domain-deny) and npm UI (registry.npmjs.org rides
+# Cloudflare; ui/node_modules 748M is pre-baked, npm forced offline).
+# The agent attempted exactly 1 WebFetch of upstream master (blocked).
+
+ecosystem: [go, npm]
+
+deny_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - goproxy.cn
+  - goproxy.io
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+  - registry.npmjs.org
+  - registry.yarnpkg.com
+
+deny_cidrs:
+  - 104.16.0.0/12      # Cloudflare (npm registry + goproxy.io)
+  - 155.102.0.0/16     # Qiniu/Kunlun CDN (goproxy.cn)
+
+# Google-Vertex-shared go domains that can't be IP-blocked (defended by
+# /etc/hosts poison + GOPROXY=off). verify exempts ONLY these; omitting one ⇒
+# it (correctly) FAILs as reachable via the ACCEPTed Google range (#2b).
+firewall_exempt_domains:
+  - proxy.golang.org
+  - sum.golang.org
+  - golang.org
+  - go.dev
+  - pkg.go.dev
+
+go_offline: true
+npm_offline: true
+
+cache_forbid_globs:
+  - /go/pkg/mod/cache/download/github.com/navidrome/*
+  - /go/pkg/mod/github.com/navidrome/*
+
+# The Google-shared go domains are in firewall_exempt_domains above (GOPROXY=off
+# + /etc/hosts poison is their defense); assert the IP-blockable ones here.
+verify_fetch_urls:
+  - https://goproxy.cn/github.com/navidrome/navidrome/@v/v0.58.0.zip
+  - https://registry.npmjs.org/navidrome
+
+closure:
+  cache_paths:
+    - /go/pkg/mod/cache/download
+    - /root/.npm/_cacache
+  # Dual go+npm offline gate: `npm ci --offline` rebuilds node_modules from the
+  # warmed _cacache (npm run build alone can't — it needs node_modules present),
+  # then build the UI, then build-scope the Go backend with GOPROXY=off +
+  # GOTOOLCHAIN=local (the build-scoped `go build ./...` gate, like go-zero — not a
+  # whole-graph `go mod download`).
+  offline_build: "cd /testbed/ui && npm ci --offline && npm run build && cd /testbed && GOPROXY=off go build -tags=netgo ./..."
+  toolchain: {go: "1.24.5", gotoolchain_local: true}

@@ -1,0 +1,32 @@
+# Guards the benchmark image content identity: Docker Hub's v1.0 tags must
+# keep pointing at exactly the bytes frozen in manifests/digests-v1.0.tsv.
+# The daily schedule doubles as Hub-side monitoring — if anyone replaces a
+# Hub tag without updating the manifest, this goes red within 24h.
+# (The --local half of scripts/verify_image_digests.py cannot run here: it
+# needs the images on an evaluation machine; it belongs to the release
+# checklist, run before pushing images.)
+name: verify-image-digests
+
+on:
+  push:
+    paths:
+      - "manifests/**"
+      - "scripts/verify_image_digests.py"
+      - ".github/workflows/verify-image-digests.yml"
+  pull_request:
+    paths:
+      - "manifests/**"
+      - "scripts/verify_image_digests.py"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  hub-vs-manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Hub tags against the digest manifest
+        # version comes from manifests/BENCHMARK_VERSION (the script's default)
+        run: python3 scripts/verify_image_digests.py --hub

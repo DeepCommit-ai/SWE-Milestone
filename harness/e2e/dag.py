@@ -114,6 +114,8 @@ class DAGManager:
             for row in reader:
                 source = row["source_id"]
                 target = row["target_id"]
+                if source.startswith("#"):
+                    continue
 
                 # If selected_ids is specified, filter to only include selected milestones
                 if selected_ids is not None:
@@ -141,6 +143,8 @@ class DAGManager:
                 for row in reader:
                     source = row["source_id"]
                     target = row["target_id"]
+                    if source.startswith("#"):
+                        continue
 
                     if selected_ids is not None:
                         if source not in selected_ids or target not in selected_ids:

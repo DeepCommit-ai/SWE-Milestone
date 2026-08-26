@@ -1,0 +1,245 @@
+# Re-evaluation (v1.0 maintenance)
+
+How to re-score existing trials after a data-side repair (ENV-PATCH image
+layer, `filter_list`, classification amendment) **without re-running any
+agent**. Current benchmark version is **1.0**; every artifact below just
+records "1.0" plus the data-repo commit it was produced from.
+
+## Rules
+
+1. **Agents are never re-run.** Inputs are the frozen agent artifacts under
+   `EvoClaw-log/<range>/e2e_trial/<arm>/` — that directory is the primary
+   record and is **never written to** by re-evaluation.
+2. **Declare the expectation first.** Before re-running, write down which
+   (milestone × arm) pairs may change and in which direction; everything
+   else must come out identical. An undeclared change is a bug, not a result.
+3. **Compare mechanically, then decide.** A script diffs original vs re-eval
+   per test id. Promotion of re-eval results into the primary record is a
+   separate, explicit, human-approved step — not part of this procedure and
+   currently not enabled.
+4. **An output file is not proof of completion.** A replay cell is valid only
+   when the evaluator exits `0` or `1`, `patch_successfully_applied` is true,
+   and neither `infra_invalid` nor `infrastructure_failure` is set. Exit `2`
+   and `eval_status: infra-invalid` retain diagnostic evidence, but must be
+   retried or refined; they are never promotable ordinary zeroes.
+
+## Where things live
+
+```
+EvoClaw-log/reeval/                      # gitignored scratch area, safe to delete
+└── <range>/e2e_trial/<arm>/evaluation/<milestone>/
+    ├── evaluation_result.json           # evaluator output (same schema as primary)
+    └── ...                              # evaluator artifacts/logs
+└── <range>/EXPECTATION.md               # declared scope & direction, data commit,
+                                         # patched image tags, date
+```
+
+The tree **mirrors the primary layout** under `EvoClaw-log/<range>/…`, so any
+comparison is "same relative path, two roots". Patched images get a distinct
+local tag (recorded in `EXPECTATION.md`); published tags are never
+overwritten. The full standard for building, gating, naming, and promoting
+patched images — including the rc-tag convention (`:<vX.Y.Z>-rc<N>`) and
+the patch-release runbook — is **[image-patching.md](image-patching.md)**.
+
+**Evaluation-time repo hooks** live in the data workspace, wired via the repo
+config key `evaluation_post_snapshot_script` (e.g. dubbo's Maven closure,
+go-zero's go.mod backfill). The evaluator runs the hook after every snapshot
+application (END base and START fallback alike), passes context via env —
+`SWE_MILESTONE_ID`, `SWE_MILESTONE_BASE_TAG`,
+`SWE_MILESTONE_LEGACY_SNAPSHOT` (`1` when running under
+`--allow-legacy-snapshot`) — and echoes the script's stdout into the eval log
+as its audit trail. Hook identity (path + sha256 + applied flag) is persisted
+in `evaluation_result.json`.
+
+## How to re-evaluate one (arm × milestone)
+
+Offline evaluator CLI against the patched image, feeding the frozen agent
+snapshot/patch from the primary record:
+
+```
+python -m harness.e2e.evaluator \
+  --milestone-id <MID> \
+  --patch-file  EvoClaw-log/<range>/e2e_trial/<arm>/e2e_workspace/<MID>/... \
+  --baseline-classification EvoClaw-data/<range>/test_results/<MID>/<MID>_classification.json \
+  --output EvoClaw-log/reeval/<range>/e2e_trial/<arm>/evaluation/<MID>/evaluation_result.json
+```
+
+(Exact flags per `harness/e2e/evaluator.py --help`; `filter_list` is applied
+automatically when present.)
+
+Batch drivers must apply the validity gate above when deciding whether to
+skip an existing cell and again before reporting the campaign complete. The
+formal orchestrator retries this condition automatically; a direct CLI loop
+must do the same explicitly. After retries are exhausted, leave the evidence
+in the re-evaluation tree and mark the campaign incomplete rather than
+substituting a score.
+
+## How to compare
+
+Per test id, between primary and reeval `evaluation_result.json`:
+
+- pairs **outside** the declared scope: must be byte-equal on outcomes;
+- pairs **inside** the declared scope: deltas must match the declared
+  direction; list every delta in the comparison output.
+
+Store the comparison output next to `EXPECTATION.md`. Any undeclared delta →
+stop and investigate; nothing is promoted.
+
+## Previewing score impact with monitor.sh
+
+`scripts/monitor.sh` wraps `harness.e2e.collect_results --multi-repo`; because
+`reeval/` mirrors the primary layout, it can read either root directly:
+
+```
+./scripts/monitor.sh <arm> --data-root <EvoClaw-log>        --detail <repo>   # current scores
+./scripts/monitor.sh <arm> --data-root <EvoClaw-log>/reeval --detail <repo>   # re-eval scores
+```
+
+Read the two `--detail` tables side by side for per-milestone deltas
+(status / F2P / N2P / P2P / score). Caveats:
+
+- In the reeval root only re-evaluated cells have data; every other milestone
+  shows "Not run", so **repo-level aggregates are meaningless there** — only
+  per-milestone rows are comparable before promotion.
+- Score columns: `score_1000` = V2 (`(F2P+N2P)_ach/req × max(0, 1 −
+  P2P_missed/min(1000, P2P_req))`), `score_full` = V1 (ratio × P2P ratio),
+  `score_reliable` = PR-F1 where broken = P2P failed+missing. Repo score =
+  mean over graded milestones × 100. `resolve_pct` counts the `resolved` bit.
+- `collect_results` prefers `evaluation_result_filtered.json` over
+  `evaluation_result.json` per cell (`--non-filter` disables).
+
+## Preflight & silent-failure catalog
+
+Re-evaluation's characteristic failure is a config/environment gap that makes
+the evaluator emit a **plausible but wrong score with no error raised** — it
+survives direction-only comparison. The operational checklist (image pin,
+`config/<repo>.yaml` reachability so `test_framework` normalization stays on,
+anchor probe, concurrency/network budget) and the catalog of incidents that
+each cost a full re-run live in **`docs/maintainers/post_verify/re-evaluation-playbook.md`**.
+Run that playbook before launching and before believing any score.
+
+## Promotion procedure (explicit, human-approved; per campaign)
+
+**Tooling (2026-08-22):** promotion is executed with `scripts/promote_cells.py`
+(dry-run by default, `--execute` writes). It performs the four steps below for
+every listed cell atomically: append-only backup, result + filtered (a stale
+filtered file is deleted when the source has none), artifacts + repacked
+`artifacts.tar.gz` when the source ships artifacts, provenance files, and the
+`summary.json` / `summary_filtered.json` key update (attempt kept, keys never
+created). Do not promote by hand: the 2026-07-16 promotion that copied results
+without artifacts is exactly what the tool and the release gate
+(`scripts/check_record_consistency.py`, step 0 of `release.sh`) now prevent.
+Cells are enumerated with `collect_results.authoritative_cells()` so a retry
+attempt that carries the board number is the one promoted and checked.
+
+
+Promotion = replacing evaluator *outputs* in the primary record after the
+mechanical comparison passed. Never enabled by default; each campaign is
+promoted once, by hand, after user sign-off.
+
+1. **Back up, append-only**: move the cell's current evaluator outputs
+   (`evaluation_result.json`, `evaluation_result_filtered.json` if present,
+   `artifacts/`, `artifacts.tar.gz`, `feedback_report.md`) to
+   `reeval/promotion_backup/<range>/<arm>/<milestone>/`. Never delete.
+2. **Copy in the re-eval outputs** from the reeval mirror path. **Never touch
+   `source_snapshot.tar`** (frozen agent artifact — input, not output).
+   Two rules that are easy to miss and each silently void the promotion:
+   - **Filtered files shadow unfiltered ones.** `collect_results` reads
+     `evaluation_result_filtered.json` in preference to `evaluation_result.json`.
+     Copy the replay's filtered file when it produced one; when it did **not**,
+     **delete the destination's existing filtered file** — leaving it behind
+     means the reader keeps serving the pre-promotion score while every file you
+     wrote looks correct (playbook catalog #4).
+   - **Promote `artifacts/` too, not just the result files.** A promotion that
+     replaces `evaluation_result.json` and leaves the old artifacts produces a
+     cell whose stored summary and raw artifacts disagree. This is not
+     hypothetical: the 2026-07-16 `webset_replay` promotion did exactly that and
+     left 19 self-contradictory element-web cells that went unnoticed for three
+     months, corrupting any later raw-artifact comparison against those
+     primaries. Regenerate `artifacts.tar.gz` from the promoted artifacts.
+3. **Sync `summary.json`**: update `results[<milestone>]` (`eval_status`,
+   `test_summary`, keep `attempt`) to match the new evaluation_result.
+   Required because `collect_results.load_e2e_results` only replaces a
+   summary-sourced `test_summary` when it reads a *filtered* file; with plain
+   `evaluation_result.json` it corrects `eval_status` but keeps the stale
+   summary counts.
+   *Exception — filter_list-only campaigns (e.g. M021):* dropping the new
+   `evaluation_result_filtered.json` next to the untouched original is
+   sufficient; the filtered-preference path replaces `test_summary` on its
+   own, and the original file staying in place is the audit trail.
+4. **Record the flip**: run the two monitor commands above before/after,
+   store the diff as `SCORE_DELTA_<campaign>.md` next to the campaign's
+   EXPECTATION.md, then regenerate any downstream aggregates.
+
+## Filter-list campaigns (filter-only re-tally, v1.0.2)
+
+When only `test_results/<MID>/<MID>_filter_list.json` changes (a waiver is
+added or withdrawn), nothing is replayed: the stored raw
+`evaluation_result.json` is the evidence, and only the derivative
+`evaluation_result_filtered.json` is regenerated. Three rules make that
+repeatable (harness PR for v1.0.2):
+
+1. **Filter lists are validated against the classification** (`evaluator.
+   validate_filter_list`): every `invalid_pass_to_pass` id must be in the
+   `stable_classification.pass_to_pass` bucket, every `invalid_fail_to_pass` /
+   `invalid_none_to_pass` id in `fail_to_pass ∪ none_to_pass`; no duplicate
+   within or across buckets; `version` absent or 1; no `condition` on an entry.
+   An invalid list is refused everywhere: `run_e2e` (start and resume) exits
+   before any trial state exists, the evaluator writes no derivative and stamps
+   `filter_list_error` / `scoring_blocked: true` on the raw result (an existing
+   derivative is moved to `.stale`), `rescore.py` refuses the campaign, and the
+   release gate fails every served cell of the repo. The defect this guards
+   against: `filter_evaluation_result` subtracts the *count* of listed P2P ids
+   from `pass_to_pass_required`; an id outside the bucket lowered the
+   requirement without removing an obligation. With a classification at hand the
+   evaluator now subtracts the intersection (`p2p_universe`); for a valid list
+   both rules give the same bytes.
+2. **`ran_test_ids` has one rule**: the union of `nodeid` over every
+   `artifacts/*/eval.json` of the cell (`evaluator.collect_ran_test_ids`),
+   used by the evaluator at evaluation time, by the filter-only re-tally and
+   by the release gate. A cell without any `artifacts/*/eval.json` cannot have
+   its derivative regenerated (`non-promotable:no-eval.json`).
+3. **The release gate checks derivatives, not only raw results**
+   (`scripts/check_record_consistency.py`): a universe with a non-empty filter
+   list and a served cell without a derivative fails (`derivative missing`:
+   the collector would serve the raw result, i.e. a half-finished campaign
+   would pass); a derivative that differs from the regeneration (counts,
+   success/failure lists, or `resolved` with the envelope's locks re-applied)
+   fails; a derivative in a universe without a filter list fails (stale).
+
+Procedure (report first, then mirror, per repo; then promote with the generic
+tool):
+
+```
+python -m harness.e2e.rescore --mode filter-only --campaign <name> \
+  --data-root <SWE-Milestone-data>/<repo> --trial-root <SWE-Milestone-log>/<repo>/e2e_trial/_<trial> ... \
+  --authoritative --out <campaign-dir>/<repo>
+python scripts/promote_cells.py --log-root <SWE-Milestone-log> --repo <repo> \
+  --source-root <campaign-dir>/<repo>/mirror --layout mirror --all-in-source \
+  --backup-root <SWE-Milestone-log>/reeval/promotion_backup --campaign <name> --data-root <SWE-Milestone-data> [--execute]
+```
+
+Per cell the mirror holds a byte-identical copy of the raw result (so the
+promotion leaves it alone), the regenerated derivative — or none, when the
+milestone has no filter list and a stale derivative must be deleted —,
+`rescore_manifest.json` (mode, campaign, filter-list sha256 and entry counts,
+classification sha256 and pin, `ran_test_ids` count, locks re-applied; a
+previous manifest is kept under `supersedes`) and `PROMOTION_NOTES.md`. Statuses:
+`filter-regenerated` (mirrored), `filter-identity` (derivative already equals
+the regeneration; nothing written), `stale-derivative` (mirrored without a
+derivative), `no-filter`, `non-promotable:<reason>` (`no-eval.json`,
+`classification-drift`, `no-classification`), `error:<reason>` (exit 1). Replay
+selection is deliberately absent in this mode: a non-replayable or frozen
+pass-wins cell has a derivative exactly as stale as any other. The envelope's
+resolution locks (infrastructure / scored failure / identity-untrusted) are
+re-applied to the derivative, so a waiver can never un-lock a cell.
+
+## Current application: D-1 (nushell)
+
+| Item | Value |
+|---|---|
+| Repaired milestones | `milestone_G01_48bca0a`, `milestone_core_development.4` |
+| Repair | ENV-PATCH: mixed-tree conciliation (`apply_patches.sh`, idempotent, no-op on GT overlay) + feature-closure completion |
+| Declared expectation | these 2 milestones: `compilation_failure` → measured scores; all other milestones identical |
+| Out of scope | `core_development.1` (flaky census lane), `core_development.3` (classification adjudication lane) |
+| Acceptance before re-eval | GT empty-overlay self-grade green ×2 **and** mixed-tree probe with a real vintage `source_snapshot.tar` (a standalone-only fix caused this incident) |

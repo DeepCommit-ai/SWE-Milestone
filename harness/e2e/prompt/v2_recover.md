@@ -17,9 +17,13 @@ For EACH completed task, you MUST run these commands to submit:
 
 ```bash
 git add <source_dirs>
+for f in Cargo.toml Cargo.lock go.mod go.sum go.work go.work.sum pom.xml; do
+    if [ -e "$f" ] || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+        git add -A -- "$f"
+    fi
+done
 git commit -m "Implement <MILESTONE_ID>"
 git tag agent-impl-<MILESTONE_ID>
 ```
 
 **Without both `git commit` AND `git tag`, your work will NOT be recorded.** The tag is the ONLY signal that triggers evaluation.
-

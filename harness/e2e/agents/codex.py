@@ -7,7 +7,11 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional
 
-from harness.e2e.agents.base import AgentFramework, register_framework
+from harness.e2e.agents.base import (
+    AgentFramework,
+    register_framework,
+    validate_agent_cli_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +34,19 @@ class CodexFramework(AgentFramework):
 
     FRAMEWORK_NAME = "codex"
 
+    # ChatGPT OAuth sends Codex requests to this first-party endpoint instead
+    # of api.openai.com. ContainerSetup uses it only for firewall/tunnel
+    # planning; it is not injected as OPENAI_BASE_URL.
+    OAUTH_ENDPOINT_URL = "https://chatgpt.com/backend-api/codex"
+
     # Default model for Codex
     DEFAULT_MODEL = "gpt-5.2-codex"
 
-    # Valid reasoning effort levels
-    VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+    # Valid reasoning effort levels. gpt-5.6-sol (and later) add "max"
+    # (supported_reasoning_levels in the OAuth models cache); older codex
+    # models top out at xhigh. Passing an effort the model doesn't support is
+    # rejected by the CLI, so only set it for models that advertise it.
+    VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
     # Models that need litellm's /openai_passthrough endpoint because
     # litellm's native /v1/responses reconstructs the SSE stream and drops
@@ -42,12 +54,28 @@ class CodexFramework(AgentFramework):
     # causing Codex CLI to fail with "OutputTextDelta without active item".
     PASSTHROUGH_MODELS: set[str] = set()
 
+    # Server-side/product tools can bypass the container network boundary or
+    # expose account-connected data. Keep them out of benchmark sessions. The
+    # local shell/editing tools remain available.
+    BENCHMARK_DISABLED_FEATURES = (
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "image_generation",
+        "in_app_browser",
+        "plugins",
+        "remote_plugin",
+    )
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         include_directories: Optional[List[str]] = None,
+        agent_version: Optional[str] = None,
         **kwargs,
     ):
         """Initialize Codex framework.
@@ -60,16 +88,41 @@ class CodexFramework(AgentFramework):
                              Passed to Codex CLI via model_reasoning_effort.
             include_directories: Extra directories to pass to codex (currently unused,
                                  accepted for interface compatibility with other frameworks).
+            agent_version: Exact Codex CLI version to pin, or ``latest``.
         """
         self.api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self.base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self.reasoning_effort = reasoning_effort or "xhigh"
+        self._agent_version = validate_agent_cli_version(agent_version, agent_label="Codex")
         self._codex_auth_file = Path.home() / ".codex" / "auth.json"
         self._codex_config_file = Path.home() / ".codex" / "config.toml"
+
+    def get_requested_version(self) -> Optional[str]:
+        return self._agent_version
+
+    def get_version_command(self) -> List[str]:
+        return ["codex", "--version"]
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        match = re.search(r"\b(\d+\.\d+\.\d+)\b", output or "")
+        return match.group(1) if match else None
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        if self._agent_version in (None, "latest"):
+            return True
+        return actual_version == self._agent_version
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort (default: xhigh)."""
         return self.reasoning_effort
+
+    def get_network_endpoint_url(self) -> Optional[str]:
+        """Return the actual endpoint host for quarantine network planning."""
+        if self.base_url:
+            return self.base_url
+        if not self.api_key:
+            return self.OAUTH_ENDPOINT_URL
+        return "https://api.openai.com/v1"
 
     def _build_reasoning_effort_args(self) -> List[str]:
         """Return Codex CLI overrides for reasoning effort and safety knobs.
@@ -85,6 +138,8 @@ class CodexFramework(AgentFramework):
         backup to the in-container config.toml.
         """
         args: List[str] = ["-c", 'web_search="disabled"']
+        for feature in self.BENCHMARK_DISABLED_FEATURES:
+            args.extend(["-c", f"features.{feature}=false"])
         if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
             args.extend(["-c", f'model_reasoning_effort="{self.reasoning_effort}"'])
         return args
@@ -154,7 +209,7 @@ class CodexFramework(AgentFramework):
         """Return Python init script for Codex setup.
 
         The script:
-        1. Installs Codex CLI via npm (if not present)
+        1. Installs Codex CLI via the official standalone installer (if not present)
         2. Copies OAuth credentials from mounted host files (when available)
         3. Verifies installation
 
@@ -164,9 +219,11 @@ class CodexFramework(AgentFramework):
         Returns:
             Python script as a string
         """
-        return """
+        script = """
 # === Codex: Install Codex CLI ===
 try:
+    import os
+    import re as _re
     import subprocess
     import shutil
 
@@ -183,72 +240,93 @@ try:
         except Exception as e:
             return False, '', str(e)
 
-    # Check current Node.js version
-    success, node_version, _ = run_cmd(['node', '--version'])
-    if success:
-        print(f"Current Node.js version: {node_version}")
-        try:
-            major = int(node_version.lstrip('v').split('.')[0])
-            need_upgrade = major < 20
-        except:
-            need_upgrade = True
-    else:
-        print("Node.js not found")
-        need_upgrade = True
-
-    # Install Node.js 20 if needed
-    if need_upgrade:
-        print("Installing Node.js 20 via NodeSource...")
-
-        # Ensure curl is available
-        if not shutil.which('curl'):
-            print("Installing curl...")
-            run_cmd(['apt-get', 'update'])
-            run_cmd(['apt-get', 'install', '-y', 'curl', 'ca-certificates'])
-
-        # Add NodeSource repository and install Node.js 20
-        success, stdout, stderr = run_cmd(
-            'curl -fsSL https://deb.nodesource.com/setup_20.x | bash -',
-            shell=True
-        )
-        if not success:
-            print(f"Warning: NodeSource setup output: {stderr}")
-
-        success, stdout, stderr = run_cmd(['apt-get', 'install', '-y', 'nodejs'])
-        if success:
-            success, node_version, _ = run_cmd(['node', '--version'])
-            print(f"Node.js installed: {node_version}")
-        else:
-            print(f"Failed to install Node.js: {stderr}")
-            raise Exception("Node.js installation failed")
-
-    # Check if codex is already installed
+    # Check if codex is already installed. An exact requested version can be
+    # reused only when it matches; 'latest' always re-resolves via the installer.
+    requested_version = __CODEX_AGENT_VERSION__
     result = subprocess.run(['which', 'codex'], capture_output=True, text=True)
-    if result.returncode == 0:
+    needs_install = result.returncode != 0
+    if requested_version == 'latest':
+        needs_install = True
+    elif requested_version and not needs_install:
+        ok, ver_out, _ = run_cmd(['codex', '--version'])
+        m = _re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', ver_out) if ok else None
+        if not m or m.group(1) != requested_version:
+            needs_install = True
+
+    if not needs_install:
         print(f"Codex already installed at: {result.stdout.strip()}")
     else:
-        print("Installing Codex CLI via npm...")
+        target_version = requested_version or 'latest'
+        print(f"Installing Codex CLI standalone release ({target_version})...")
 
-        # Install codex globally
-        install_result = subprocess.run(
-            ['npm', 'i', '-g', '@openai/codex'],
+        if not shutil.which('curl'):
+            print("Installing curl...")
+            success, _, stderr = run_cmd(['apt-get', 'update'])
+            if not success:
+                raise RuntimeError(f"Failed to update apt metadata for curl: {stderr}")
+            success, _, stderr = run_cmd(
+                ['apt-get', 'install', '-y', 'curl', 'ca-certificates']
+            )
+            if not success:
+                raise RuntimeError(f"Failed to install curl: {stderr}")
+
+        installer_result = subprocess.run(
+            ['curl', '-fsSL', 'https://chatgpt.com/codex/install.sh'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=300,
         )
-        if install_result.returncode == 0:
-            print("Codex CLI installed successfully")
-        else:
-            print(f"Failed to install Codex: {install_result.stderr}")
+        if installer_result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to download Codex standalone installer: "
+                f"{installer_result.stderr.strip()}"
+            )
+
+        # Keep the root-owned standalone package outside /root so the fakeroot
+        # agent user can traverse the symlink installed in /usr/local/bin.
+        # CODEX_RELEASE preserves exact agent_version pins while avoiding npm,
+        # whose container-wide offline flag is intentionally active in some
+        # quarantined repositories.
+        install_env = os.environ.copy()
+        install_env.update({
+            'CODEX_HOME': '/opt/codex',
+            'CODEX_INSTALL_DIR': '/usr/local/bin',
+            'CODEX_NON_INTERACTIVE': '1',
+            'CODEX_RELEASE': target_version,
+        })
+        install_result = subprocess.run(
+            ['sh'],
+            input=installer_result.stdout,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=install_env,
+        )
+        if install_result.returncode != 0:
+            detail = install_result.stderr.strip() or install_result.stdout.strip()
+            raise RuntimeError(f"Failed to install Codex standalone release: {detail}")
+        print(install_result.stdout.strip() or "Codex CLI installed successfully")
 
     # Verify installation
     version_result = subprocess.run(['codex', '--version'], capture_output=True, text=True)
-    if version_result.returncode == 0:
-        print(f"Codex version: {version_result.stdout.strip()}")
-    else:
-        print("Warning: Could not verify Codex installation")
+    if version_result.returncode != 0:
+        raise RuntimeError(
+            f"Could not verify Codex installation: "
+            f"{version_result.stderr.strip() or version_result.stdout.strip()}"
+        )
+    installed_output = version_result.stdout.strip()
+    installed_match = _re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', installed_output)
+    installed_version = installed_match.group(1) if installed_match else None
+    if requested_version not in (None, 'latest') and installed_version != requested_version:
+        raise RuntimeError(
+            f"Codex version mismatch: requested {requested_version}, "
+            f"installed {installed_version or installed_output or 'unknown'}"
+        )
+    print(f"Codex version: {installed_output}")
 
 except Exception as e:
     print(f"Error setting up Codex: {e}")
+    raise
 
 # === Codex: Setup OAuth credentials ===
 try:
@@ -283,7 +361,12 @@ try:
     # letting the agent fetch upstream code from github/etc even when the
     # repo's own network path is blocked. Kept strictly off for benchmark
     # integrity (valid values: disabled, cached, live).
-    config_lines = ['web_search = "disabled"']
+    config_lines = [
+        'web_search = "disabled"',
+        '',
+        '[features]',
+        *[f'{feature} = false' for feature in __CODEX_DISABLED_FEATURES__],
+    ]
     if base_url:
         config_lines.append(f'openai_base_url = "{base_url}"')
     with open(config_dst, 'w') as f:
@@ -295,6 +378,12 @@ try:
 except Exception as e:
     print(f"Error setting up Codex OAuth files: {e}")
 """
+        return script.replace(
+            "__CODEX_AGENT_VERSION__", repr(self._agent_version)
+        ).replace(
+            "__CODEX_DISABLED_FEATURES__",
+            repr(self.BENCHMARK_DISABLED_FEATURES),
+        )
 
     def build_run_command(
         self,

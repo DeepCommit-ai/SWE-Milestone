@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch EvoClaw E2E trials across repos as detached processes.
+"""Launch SWE-Milestone E2E trials across repos as detached processes.
 
 Reads a trial_config.yaml, resolves the final trial_name based on flags +
 existing trial dirs, and spawns one detached run_e2e per repo. Exits
@@ -27,6 +27,35 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
+
+from harness.e2e.data_version import check_data_version
+from harness.e2e.env_guard import reject_legacy_env
+from harness.e2e.runtime_policy_binding import (
+    RUNTIME_POLICY_MODE_UNPROTECTED,
+    ResolvedRuntimePolicy,
+    image_for_runtime_policy,
+    resolve_runtime_policy,
+    runtime_policy_coverage_errors,
+    runtime_policy_subprocess_env,
+)
+
+
+def validate_agent_version(agent: str, value: object) -> str:
+    """Validate an agent CLI selector using that adapter's version contract."""
+    candidate = str(value).strip()
+    if agent == "claude-code":
+        from harness.e2e.agents.claude_code import validate_claude_code_version
+
+        return validate_claude_code_version(candidate)
+    if agent in ("codex", "gemini-cli"):
+        from harness.e2e.agents.base import validate_agent_cli_version
+
+        label = "Codex" if agent == "codex" else "gemini-cli"
+        return validate_agent_cli_version(candidate, agent_label=label)
+    raise ValueError(
+        "agent_version is supported only for agent: "
+        "claude-code, codex, or gemini-cli"
+    )
 
 
 def _adc_project() -> str | None:
@@ -73,94 +102,6 @@ def _load_dotenv_files() -> None:
         os.environ.setdefault(key, val)  # a real shell-exported var wins
 
 
-def _assert_wheelhouse_excludes(wheelhouse: str, forbid: list[str]) -> None:
-    """Fail closed if the offline quarantine wheelhouse contains an artifact
-    whose distribution name matches a forbidden prefix (the repo-under-test's own
-    package). Without this, an un-audited wheelhouse could silently serve the
-    answer offline via PIP_FIND_LINKS, defeating the network deny. See
-    docs/quarantine.md.
-    """
-    norm_forbid = [f.strip().lower().replace("_", "-") for f in forbid if f.strip()]
-    if not norm_forbid:
-        return
-    offending = []
-    for name in os.listdir(wheelhouse):
-        low = name.lower().replace("_", "-")
-        if not low.endswith((".whl", ".tar.gz", ".zip")):
-            continue
-        if any(low.startswith(pref + "-") for pref in norm_forbid):
-            offending.append(name)
-    if offending:
-        print(
-            f"Error: quarantine wheelhouse {wheelhouse} contains forbidden "
-            f"artifact(s) {sorted(offending)} matching wheelhouse_forbid={forbid}. "
-            f"Refusing to run — this would serve the repo's own target source "
-            f"offline. Rebuild the wheelhouse with scripts/build_quarantine_wheelhouse.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def load_quarantine_env(repo_name: str, project_root: Path) -> dict:
-    """Per-repo anti-cheat ("quarantine") policy → container env vars.
-
-    Quarantine prevents an agent from fetching the repo-under-test's own
-    target-version source (the answer) over the network: it denies the registry
-    serving that source and forces the package manager offline against a vetted
-    wheelhouse. The policy is **repo-intrinsic** (scikit denies PyPI, go-zero the
-    Go proxy, …), so it lives once per repo in `quarantine_configs/<repo>.yaml`.
-
-    Auto-on: presence of the file IS the switch (no trial-config flag). Returns
-    {} (quarantine off) if the file is absent. Applied only to THIS repo's
-    container — not globally to the whole trial. Fails closed (sys.exit) on a
-    malformed policy or a wheelhouse that ships the repo's own package.
-    See docs/quarantine.md.
-    """
-    conf_path = project_root / "quarantine_configs" / f"{repo_name}.yaml"
-    if not conf_path.exists():
-        return {}
-    try:
-        with open(conf_path) as f:
-            q = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"Error: failed to read quarantine config {conf_path}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    env: dict[str, str] = {}
-    dd = q.get("deny_domains")
-    dc = q.get("deny_cidrs")
-    wh = q.get("pip_wheelhouse")
-    if dd:
-        env["EVOCLAW_DENY_DOMAINS"] = ",".join(dd) if isinstance(dd, list) else str(dd)
-    if dc:
-        env["EVOCLAW_DENY_CIDRS"] = ",".join(dc) if isinstance(dc, list) else str(dc)
-    if wh:
-        # Expand ${EVOCLAW_WHEELHOUSE_DIR} etc. so the policy file carries no
-        # host-specific absolute path (set the base once in .env_private).
-        wh = str(Path(os.path.expandvars(str(wh))).expanduser().resolve())
-        if not Path(wh).is_dir():
-            print(f"Error: {conf_path}: pip_wheelhouse not found: {wh} "
-                  f"(is EVOCLAW_WHEELHOUSE_DIR set in .env_private?)", file=sys.stderr)
-            sys.exit(1)
-        # Fail closed if the wheelhouse ships the repo's own package — an
-        # un-audited wheelhouse must not be able to serve the answer offline.
-        forbid = q.get("wheelhouse_forbid") or []
-        if isinstance(forbid, str):
-            forbid = [forbid]
-        _assert_wheelhouse_excludes(wh, forbid)
-        if not forbid:
-            print(
-                f"Warning: {conf_path}: pip_wheelhouse set without wheelhouse_forbid "
-                f"— cannot assert the wheelhouse excludes the repo's own package "
-                f"(see docs/quarantine.md).",
-                file=sys.stderr,
-            )
-        else:
-            env["EVOCLAW_WHEELHOUSE_FORBID"] = ",".join(forbid)
-        env["EVOCLAW_PIP_WHEELHOUSE"] = wh
-    return env
-
-
 def discover_repos(data_root: Path, repo_filters: list[str] | None = None) -> list[Path]:
     """Find all repo directories in data_root that contain metadata.json."""
     repos = []
@@ -177,9 +118,15 @@ def discover_repos(data_root: Path, repo_filters: list[str] | None = None) -> li
     return repos
 
 
-def get_image_name(repo_name: str) -> str:
-    """Derive Docker image name from repo directory name (lowercase)."""
-    return f"{repo_name.lower()}/base:latest"
+def _image_exists(ref: str) -> bool:
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", ref],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
 
 
 def generate_collect_config(
@@ -266,15 +213,18 @@ def build_cmd(
     timeout: int,
     trial_name: str,
     reasoning_effort: str | None,
-    api_router: bool,
+    agent_version: str | None,
     force: bool,
     milestones: str | None = None,
+    project_root: Path | None = None,
+    build_failure_fail_closed: bool = False,
+    runtime_policy: ResolvedRuntimePolicy | None = None,
+    skip_testbed_copy: bool = False,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
     trial_dir = repo / "e2e_trial" / trial_name
     metadata_path = trial_dir / "trial_metadata.json"
-
     if not force and trial_dir.exists() and metadata_path.exists():
         # Resume reuses the existing trial dir, where --milestones already wrote
         # milestone_selection.txt on first run (the orchestrator still reads it),
@@ -284,31 +234,54 @@ def build_cmd(
             "resume",
         )
 
+    # Compatibility for direct callers of build_cmd.  The normal main() path
+    # always supplies its one pre-resolved object, which is then used for the
+    # coverage gate, environment, image, and parent/worker identity handshake.
+    if runtime_policy is None:
+        _root = project_root or Path(__file__).resolve().parent.parent
+        runtime_policy = resolve_runtime_policy(repo_name, _root)
+    if runtime_policy.repo_name != repo_name:
+        raise ValueError(
+            f"runtime policy repo mismatch: expected {repo_name!r}, "
+            f"got {runtime_policy.repo_name!r}"
+        )
+    image = image_for_runtime_policy(runtime_policy)
+
     cmd = [
         sys.executable, "-m", "harness.e2e.run_e2e",
         "--repo-name", repo_name,
-        "--image", get_image_name(repo_name),
+        "--image", image,
         "--srs-root", str(repo / "srs"),
         "--workspace-root", str(repo),
         "--agent", agent,
         "--model", model,
         "--timeout", str(timeout),
         "--trial-name", trial_name,
+        "--expected-runtime-policy-sha256", runtime_policy.sha256,
+        "--expected-runtime-policy-mode", runtime_policy.mode,
     ]
+    if runtime_policy.mode == RUNTIME_POLICY_MODE_UNPROTECTED:
+        cmd.append("--unprotected")
     if reasoning_effort:
         cmd.extend(["--reasoning-effort", reasoning_effort])
+    if agent_version:
+        cmd.extend(["--agent-version", agent_version])
     if milestones:
         cmd.extend(["--milestones", str(milestones)])
-    if api_router:
-        cmd.append("--api-router")
+    if build_failure_fail_closed:
+        cmd.append("--fail-closed-build-reports")
+    else:
+        cmd.append("--allow-partial-build-reports")
     if force:
         cmd.append("--force")
+    if skip_testbed_copy:
+        cmd.append("--skip-testbed-copy")
     return cmd, ("force" if force else "fresh")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Launch EvoClaw trials (detached, fire-and-forget)",
+        description="Launch SWE-Milestone trials (detached, fire-and-forget)",
     )
     parser.add_argument("--config", type=Path, required=True, help="Path to trial_config.yaml")
     parser.add_argument("--repos", nargs="+", default=None, help="Override repo filters (substring match)")
@@ -328,6 +301,22 @@ def main():
              "Selection is the first N in topological order (prerequisites always included), "
              "written per-trial to milestone_selection.txt; the dataset is never modified.",
     )
+    parser.add_argument(
+        "--unprotected", action="store_true",
+        help="Bypass the quarantine coverage gate and launch even if a repo's "
+             "anti-cheat policy is missing/incomplete. Scores from unprotected "
+             "repos can be tainted by registry answer-fetch (see issue #12).",
+    )
+    parser.add_argument(
+        "--skip-testbed-copy", action="store_true",
+        help="Don't copy /testbed out of the container when the trial finishes. "
+             "Score-neutral: evaluation reads the per-milestone snapshots taken "
+             "during the run, and the published corpus never carries testbed/. "
+             "A Rust testbed is ~120GB per trial, so skipping it is the "
+             "difference between fitting a wide parallel launch on disk and not. "
+             "Forensics that need the agent's git history can still use the "
+             "container, which is kept unless --remove-container.",
+    )
     args = parser.parse_args()
 
     if args.new and args.force:
@@ -336,30 +325,67 @@ def main():
 
     # Load host paths from .env / .env_private (once-configured, persists).
     _load_dotenv_files()
+    reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
 
     # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    # data_root: from the trial config, or EVOCLAW_DATA_ROOT (.env_private).
-    # Supports ${EVOCLAW_DATA_ROOT} expansion so trial configs need no host path.
-    _dr = cfg.get("data_root") or os.environ.get("EVOCLAW_DATA_ROOT")
+    # data_root: from the trial config, or SWE_MILESTONE_DATA_ROOT (.env_private).
+    # Supports ${SWE_MILESTONE_DATA_ROOT} expansion so trial configs need no host path.
+    _dr = cfg.get("data_root") or os.environ.get("SWE_MILESTONE_DATA_ROOT")
     if not _dr:
         print("Error: data_root not set. Put 'data_root:' in the trial config "
-              "or set EVOCLAW_DATA_ROOT in .env_private (see README).", file=sys.stderr)
+              "or set SWE_MILESTONE_DATA_ROOT in .env_private (see README).", file=sys.stderr)
         sys.exit(1)
     data_root = Path(os.path.expandvars(str(_dr))).expanduser().resolve()
+
+    # Benchmark-version gate (docs/versioning.md): verify the data checkout
+    # against the version tag before spawning any per-repo worker. Explicit
+    # SWE_MILESTONE_IMAGE_TAG refuses on mismatch; the default pin warns.
+    check_data_version(data_root, context="run_all")
+
     yaml_trial_name = cfg["trial_name"]
     agent = cfg.get("agent", "claude-code")
     model = cfg.get("model", "claude-sonnet-4-5-20250929")
     timeout = cfg.get("timeout", 18000)
     reasoning_effort = cfg.get("reasoning_effort", None)
+    agent_version = cfg.get("agent_version", None)
+    if agent_version is not None:
+        try:
+            agent_version = validate_agent_version(agent, agent_version)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     # Optional milestone-prefix: run only the first N (or P%) of each repo's DAG,
     # dependency-closed. CLI --milestones overrides the trial config's 'milestones:'.
     milestones = args.milestones if args.milestones is not None else cfg.get("milestones", None)
-    api_router = cfg.get("api_router", cfg.get("drop_params", False))
-    default_haiku_model = cfg.get("default_haiku_model", None)
+    # `default_agent_model` overrides ALL of Claude Code's class-based model
+    # slots (ANTHROPIC_DEFAULT_HAIKU/SONNET/OPUS/FABLE_MODEL,
+    # CLAUDE_CODE_SUBAGENT_MODEL, ANTHROPIC_MODEL) with one value. Renamed
+    # from `default_haiku_model` 2026-07-16; the old name is a hard error so
+    # a stale config can't silently run without the slot pin.
+    if cfg.get("default_haiku_model") is not None:
+        print(
+            "Error: 'default_haiku_model' was renamed to 'default_agent_model' "
+            "(same semantics: one value overrides ALL of Claude Code's "
+            "class-based model slots). Update the trial config.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    default_agent_model = cfg.get("default_agent_model", None)
     repo_filters = args.repos or cfg.get("repos", None)
+    evaluation_cfg = cfg.get("evaluation") or {}
+    if not isinstance(evaluation_cfg, dict):
+        print("Error: evaluation must be a YAML mapping", file=sys.stderr)
+        sys.exit(1)
+    build_failure_fail_closed = evaluation_cfg.get("build_failure_fail_closed", False)
+    if not isinstance(build_failure_fail_closed, bool):
+        print(
+            "Error: evaluation.build_failure_fail_closed must be true or false",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Anti-cheat ("quarantine") is now PER-REPO and auto-on: each repo's policy
     # lives in quarantine_configs/<repo>.yaml and is applied only to that repo's
@@ -382,18 +408,110 @@ def main():
     vertex_location = cfg.get("vertex_location", "global")
     vertex_project = cfg.get("vertex_project", None)
     if vertex_ai:
-        # No Anthropic↔OpenAI router in Vertex mode. For claude-code, route all
-        # of Claude Code's class-based model slots to this same Vertex model so
-        # background/subagent calls don't fall back to the hard-coded Anthropic
-        # defaults (which may not be enabled on the Vertex project).
-        api_router = False
-        if not default_haiku_model:
-            default_haiku_model = model
+        # For claude-code, route all of Claude Code's class-based model slots to
+        # this same Vertex model so background/subagent calls don't fall back to
+        # the hard-coded Anthropic defaults (which may not be enabled on the
+        # Vertex project).
+        if not default_agent_model:
+            default_agent_model = model
 
-    # Propagate default_haiku_model to child processes via env var
-    # (ClaudeCodeFramework reads UNIFIED_DEFAULT_HAIKU_MODEL)
-    if default_haiku_model:
-        os.environ["UNIFIED_DEFAULT_HAIKU_MODEL"] = default_haiku_model
+    # Propagate default_agent_model to child processes via env var
+    # (ClaudeCodeFramework reads UNIFIED_DEFAULT_AGENT_MODEL)
+    if default_agent_model:
+        os.environ["UNIFIED_DEFAULT_AGENT_MODEL"] = default_agent_model
+
+    # Auto-compaction window: a single yaml flag (auto_compact_window: 300000)
+    # makes claude-code trigger native context compaction at that token budget
+    # instead of the model's pattern-matched default. Propagated to the agent
+    # container as CLAUDE_CODE_AUTO_COMPACT_WINDOW (ClaudeCodeFramework reads
+    # SWE_MILESTONE_AUTO_COMPACT_WINDOW). Compaction is built-in agent behaviour, not
+    # a custom optimization — preserves benchmark parity. claude-code caps the
+    # value at the model's context window; for pattern-unknown third-party
+    # models that ceiling may fall back to 200K.
+    auto_compact_window = cfg.get("auto_compact_window", None)
+    if auto_compact_window:
+        os.environ["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+    # Fail-loud guard: a trial that CLAIMS a full-window run ("-1m" in its name)
+    # must use the probe-verified shape (2026-08-24, docs/running-trials.md):
+    #   - agent_version pinned (2.1.212 verified: native default = no compaction
+    #     for pattern-unknown models; >=2.1.24x compacts them at ~167K), AND
+    #   - auto_compact_window UNSET (claude-code caps the env at the model's
+    #     pattern-matched window — 200K for unknown ids — so any value >200K
+    #     silently reintroduces ~167K compaction, on 2.1.212 too).
+    if "-1m" in str(yaml_trial_name).lower() and agent == "claude-code":
+        if auto_compact_window:
+            print(
+                "Error: '-1m' trial sets auto_compact_window, but claude-code caps the\n"
+                "value at the model's pattern-matched window (200K for unknown ids), so\n"
+                "this compacts at ~167K instead of running the full window. Remove\n"
+                "auto_compact_window and pin agent_version (2.1.212 verified).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not cfg.get("agent_version"):
+            print(
+                "Error: '-1m' trial without a pinned agent_version. Current claude-code\n"
+                "(>=2.1.24x) auto-compacts pattern-unknown models at ~167K, so the run\n"
+                "would NOT be 1M. Pin the verified version: agent_version: 2.1.212.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Tool Search (claude-code only): `enable_tool_search: false` pins
+    # claude-code's native ENABLE_TOOL_SEARCH env var inside the agent
+    # container (ClaudeCodeFramework reads SWE_MILESTONE_ENABLE_TOOL_SEARCH).
+    # Third-party Anthropic-compatible endpoints that don't forward
+    # tool_reference blocks (e.g. Kimi's) require false; explicit pinning also
+    # removes claude-code's endpoint-dependent auto-detection from the trial.
+    enable_tool_search = cfg.get("enable_tool_search", None)
+    if enable_tool_search is not None:
+        from harness.e2e.agents.claude_code import validate_tool_search_setting
+        try:
+            enable_tool_search = validate_tool_search_setting(enable_tool_search)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if agent != "claude-code":
+            print(
+                "Error: enable_tool_search is currently supported only for agent: claude-code",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["SWE_MILESTONE_ENABLE_TOOL_SEARCH"] = enable_tool_search
+
+    # Per-trial endpoint override: `base_url` in the trial config wins over the
+    # host-level UNIFIED_BASE_URL from .env_private. The URL is not a secret,
+    # so it can live in a committed config; the API key never does — it stays
+    # in .env_private, either as the global UNIFIED_API_KEY or as a named
+    # variable the config selects via `api_key_env` (lets one .env_private
+    # hold keys for several endpoints side by side). Supports ${VAR} expansion
+    # (same as data_root) so the URL itself can also live in .env_private,
+    # e.g. `base_url: ${ZAI_BASE_URL}`.
+    base_url = cfg.get("base_url", None)
+    if base_url:
+        base_url = os.path.expandvars(str(base_url).strip())
+        # expandvars leaves unknown ${VAR} references literally in place —
+        # catch that instead of handing the agent a garbage endpoint.
+        if not base_url or "$" in base_url:
+            print(
+                f"Error: base_url '{cfg.get('base_url')}' references an unset "
+                "variable. Add it to .env_private (KEY=VALUE) or export it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["UNIFIED_BASE_URL"] = base_url
+    api_key_env = cfg.get("api_key_env", None)
+    if api_key_env:
+        api_key_env = str(api_key_env).strip()
+        _key = os.environ.get(api_key_env)
+        if not _key:
+            print(
+                f"Error: api_key_env names '{api_key_env}' but that variable is "
+                "not set. Add it to .env_private (KEY=VALUE) or export it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        os.environ["UNIFIED_API_KEY"] = _key
 
     # Validate
     if not data_root.exists():
@@ -408,8 +526,52 @@ def main():
         print(f"Error: no repos found in {data_root}", file=sys.stderr)
         sys.exit(1)
 
+    project_root = Path(__file__).resolve().parent.parent
     # Resolve trial name based on yaml + flags + existing trial dirs
     trial_name = resolve_trial_name(yaml_trial_name, repos, args.force, args.new)
+
+    # Resolve each FRESH repo policy exactly once. Resume repos deliberately do
+    # not consult live policy: run_e2e restores their trial-frozen binding.
+    runtime_policies: dict[str, ResolvedRuntimePolicy] = {}
+    gate_errors: list[str] = []
+    bypassed_errors: list[str] = []
+    for repo in repos:
+        trial_dir = repo / "e2e_trial" / trial_name
+        if not args.force and is_trial_completed(trial_dir):
+            continue
+        metadata_path = trial_dir / "trial_metadata.json"
+        if not args.force and trial_dir.exists() and metadata_path.exists():
+            continue
+        policy = resolve_runtime_policy(
+            repo.name,
+            project_root,
+            unprotected=args.unprotected,
+        )
+        runtime_policies[repo.name] = policy
+        errors = runtime_policy_coverage_errors(policy)
+        if policy.mode == RUNTIME_POLICY_MODE_UNPROTECTED:
+            bypassed_errors.extend(errors)
+        else:
+            gate_errors.extend(errors)
+
+    if gate_errors:
+        print("Quarantine coverage gate:", file=sys.stderr)
+        for error in gate_errors:
+            print(f"  - {error}", file=sys.stderr)
+        print(
+            "Refusing to launch. Add/fix quarantine_configs/<repo>.yaml "
+            "(see docs/quarantine.md) or pass --unprotected.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.unprotected and runtime_policies:
+        print(
+            "Quarantine coverage gate: --unprotected set for fresh workers; "
+            "scores may be tainted.",
+            file=sys.stderr,
+        )
+        for error in bypassed_errors:
+            print(f"  - {error}", file=sys.stderr)
 
     # Vertex AI wiring (before spawning workers; env is inherited by workers).
     # Each agent uses its OWN native Vertex support via ADC copied into the
@@ -427,9 +589,9 @@ def main():
         if not proj:
             print("Error: set vertex_project (no ADC quota_project_id found)", file=sys.stderr)
             sys.exit(1)
-        os.environ["EVOCLAW_VERTEX"] = "1"
-        os.environ["EVOCLAW_VERTEX_PROJECT"] = proj
-        os.environ["EVOCLAW_VERTEX_LOCATION"] = vertex_location
+        os.environ["SWE_MILESTONE_VERTEX"] = "1"
+        os.environ["SWE_MILESTONE_VERTEX_PROJECT"] = proj
+        os.environ["SWE_MILESTONE_VERTEX_LOCATION"] = vertex_location
         vertex_info = {"project": proj}
 
     mode_label = (
@@ -439,15 +601,25 @@ def main():
     )
 
     print("=" * 60)
-    print("  EvoClaw Run All  (fire-and-forget)")
+    print("  SWE-Milestone Run All  (fire-and-forget)")
     print("=" * 60)
     print(f"  Data root:    {data_root}")
     print(f"  Trial name:   {trial_name}")
     print(f"  Agent:        {agent}")
+    if agent_version:
+        print(f"  Agent version:{agent_version:>12}")
     print(f"  Model:        {model}")
     if vertex_info:
         print(f"  Vertex AI:    {vertex_location} direct/ADC, project={vertex_info['project']}")
     print(f"  Timeout:      {timeout}s")
+    print(
+        "  Build fails:  "
+        + (
+            "fail-closed"
+            if build_failure_fail_closed
+            else "score completed package/module reports"
+        )
+    )
     if milestones:
         print(f"  Milestones:   prefix {milestones} (dependency-closed)")
     print(f"  Repos:        {len(repos)}")
@@ -455,8 +627,7 @@ def main():
     print("=" * 60)
 
     # Generate collect config for monitor.sh
-    project_root = Path(__file__).resolve().parent.parent
-    log_dir = project_root / ".evoclaw"
+    log_dir = project_root / ".swe-milestone"
     log_dir.mkdir(parents=True, exist_ok=True)
     collect_config = generate_collect_config(
         config_dir=log_dir,
@@ -475,15 +646,18 @@ def main():
             skipped += 1
             continue
 
+        runtime_policy = runtime_policies.get(repo.name)
         cmd, mode = build_cmd(
             repo, agent, model, timeout, trial_name,
-            reasoning_effort, api_router, args.force,
-            milestones,
+            reasoning_effort, agent_version, args.force,
+            milestones, project_root, build_failure_fail_closed,
+            runtime_policy=runtime_policy,
+            skip_testbed_copy=args.skip_testbed_copy,
         )
-        # Per-repo quarantine: apply this repo's anti-cheat policy (if any) only
-        # to its own container, via the worker subprocess env (not global).
-        q_env = load_quarantine_env(repo.name, project_root)
-        worker_env = {**os.environ, **q_env}
+        # Fresh workers inherit env derived from the SAME resolved object that
+        # selected their image. Resume workers inherit no live managed state and
+        # restore the trial-frozen binding themselves.
+        worker_env = runtime_policy_subprocess_env(runtime_policy, os.environ)
         log_path = log_dir / f"{repo.name}.log"
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(log_path, "ab") as logf:
@@ -498,7 +672,16 @@ def main():
                 start_new_session=True,  # detach: survive shell exit
                 env=worker_env,
             )
-        q_marker = "  🔒 quarantine" if q_env else ""
+        q_marker = (
+            "  🔒 quarantine"
+            if runtime_policy is not None
+            and runtime_policy.mode != RUNTIME_POLICY_MODE_UNPROTECTED
+            and runtime_policy.env
+            else "  ⚠ unprotected"
+            if runtime_policy is not None
+            and runtime_policy.mode == RUNTIME_POLICY_MODE_UNPROTECTED
+            else ""
+        )
         print(f"\033[0;32m[LAUNCHED]\033[0m  {repo.name:<50}  PID={proc.pid}  ({mode}){q_marker}")
         launched += 1
 

@@ -37,6 +37,15 @@ dag_unlock:
     # Minimum ratio of none_to_pass tests that must pass (1.0 = 100%)
     none_to_pass: 1.0
 
+# Evaluation scoring policy
+evaluation:
+  # true (strict opt-in): any deterministic build/setup failure rejects the
+  # partial test universe and scores the milestone as an evaluation failure.
+  # false (compatibility/default): preserve the build diagnostics, but parse and score
+  # reports from packages/modules that completed. Runner timeouts and nonzero
+  # outer exits always remain fail-closed.
+  build_failure_fail_closed: false
+
 # Retry and timing configuration
 retry_and_timing:
   # Wait time (seconds) for tag hash to stabilize before starting evaluation
@@ -98,3 +107,16 @@ retry_and_timing:
   # claude processes where the session itself is healthy. Total attempts =
   # 1 + this. Set to 0 for legacy "one shot then fresh" behavior.
   resume_subprocess_retry_limit: 3
+
+  # Transient server-overload (HTTP 529) handling, distinct from a genuine quota
+  # rate-limit. A 529 with no parseable reset time triggers a fast EXPONENTIAL
+  # backoff retry (base → cap, doubling, ±20% jitter) instead of the rate-limit
+  # long-sleep. Genuine quotas (a real parsed reset time) still long-sleep.
+  # The harness gives up GRACEFULLY — preserving container, /testbed git tags,
+  # session jsonl and DAG state, resumable via `run_all.py --repos X` — only
+  # after `overload_giveup_seconds` of CONTINUOUS backoff with no successful
+  # turn in between (the accumulator resets to 0 on any successful agent turn).
+  # These are the built-in defaults (read via getattr); uncomment to override.
+  # overload_backoff_base_seconds: 20    # first backoff delay
+  # overload_backoff_cap_seconds: 300    # max single backoff (5 min)
+  # overload_giveup_seconds: 3600        # continuous-overload budget before ENDPOINT_UNAVAILABLE give-up (1h)

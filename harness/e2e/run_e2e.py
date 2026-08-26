@@ -19,30 +19,97 @@ Features:
 - Retry: Allow re-evaluation when tag changes after initial evaluation
 """
 
+from harness.e2e.env_guard import reject_legacy_env
 import argparse
 import fcntl
 import json
 import logging
 import os
 import queue
+import random
 import re
 import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Optional
 
 import yaml
 
-from harness.e2e.orchestrator import E2EOrchestrator
+from harness.e2e.orchestrator import E2EOrchestrator, SubmissionTagMoved
 from harness.e2e.agent_runner import E2EAgentRunner
+from harness.e2e.agents.claude_code import validate_claude_code_version
 from harness.e2e.log_parser import get_parser
+from harness.e2e.repo_config_binding import (
+    freeze_repo_config,
+    load_trial_repo_config_binding,
+    resolve_repo_config,
+)
+from harness.e2e.residue_prune import repo_config_has_residue_prune_policy
+from harness.prepare_repo.split_test_patches.test_detector import (
+    RustTestDetectionError,
+    ensure_ast_grep,
+)
+from harness.e2e.runtime_policy_binding import (
+    RUNTIME_POLICY_ENV_KEYS,
+    RUNTIME_POLICY_MODE_PROTECTED,
+    TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING,
+    RuntimePolicyBindingError,
+    freeze_runtime_policy,
+    load_trial_runtime_policy_binding,
+    resolve_runtime_policy,
+    runtime_policy_coverage_errors,
+    verify_expected_runtime_policy,
+)
 from harness.e2e.trial_lock import acquire_trial_lock
 
 logger = logging.getLogger("e2e.runner")
 orchestrator_logger = logging.getLogger("e2e.orchestrator")
+
+# #20: how many consecutive failed watcher iterations (at ~2s each) are
+# tolerated as transient before the watcher escalates to watcher_dead. One
+# minute of uninterrupted failure means docker/git is genuinely gone, not
+# hiccuping.
+WATCHER_MAX_CONSECUTIVE_ERRORS = 30
+
+
+def _activate_runtime_policy(binding) -> None:
+    """Atomically replace all harness-managed runtime-policy environment."""
+    env = dict(binding.env)
+    unexpected = set(env) - set(RUNTIME_POLICY_ENV_KEYS)
+    if unexpected:
+        raise RuntimePolicyBindingError(
+            f"runtime policy derived unmanaged environment keys: {sorted(unexpected)}"
+        )
+    for key in RUNTIME_POLICY_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.pop("SWE_MILESTONE_UNPROTECTED", None)
+    os.environ.update(env)
+    if binding.mode == "unprotected":
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+
+
+def _resolve_trial_relative_path(
+    trial_root: Path,
+    value: str,
+    *,
+    field_name: str,
+) -> Path:
+    """Resolve a persisted resume path without allowing trial-root escape."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError(f"{field_name} must be a safe relative POSIX path")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"unsafe {field_name}: {value!r}")
+    root = Path(trial_root).resolve()
+    resolved = root.joinpath(*relative.parts).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} escapes trial root: {value!r}") from exc
+    return resolved
 
 
 @dataclass
@@ -61,7 +128,10 @@ class DebounceState:
     milestone_id: str  # Milestone ID (e.g., "M001.1")
 
 
-def load_workspace_metadata(workspace_root: Path) -> dict:
+def load_workspace_metadata(
+    workspace_root: Path,
+    repo_config: Optional[dict] = None,
+) -> dict:
     """Load workspace metadata from metadata.json.
 
     Args:
@@ -82,7 +152,29 @@ def load_workspace_metadata(workspace_root: Path) -> dict:
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
 
-    # Validate required fields
+    # A migrated repository keeps the complete residue-prune policy and its
+    # source/test partition in repo_config.  Use those exact facts for capture,
+    # then freeze the same config into the trial.  This prevents live
+    # metadata.json drift from changing snapshot authority between milestones.
+    if repo_config_has_residue_prune_policy(repo_config):
+        missing_repo_fields = [
+            field for field in ("repo_src_dirs", "test_dirs")
+            if field not in repo_config
+        ]
+        if missing_repo_fields:
+            raise KeyError(
+                "Residue-prune repo config is missing capture field(s): "
+                + ", ".join(missing_repo_fields)
+            )
+        metadata["repo_src_dirs"] = repo_config["repo_src_dirs"]
+        metadata["test_dirs"] = repo_config["test_dirs"]
+        metadata["exclude_patterns"] = repo_config.get(
+            "exclude_patterns", repo_config.get("exclude", [])
+        )
+        for field in ("generated_patterns", "modifiable_test_patterns"):
+            metadata[field] = repo_config.get(field, [])
+
+    # Validate required capture fields after applying the pinned policy.
     required_fields = ["repo_src_dirs", "test_dirs", "exclude_patterns"]
     missing_fields = [f for f in required_fields if f not in metadata]
     if missing_fields:
@@ -96,7 +188,23 @@ def load_workspace_metadata(workspace_root: Path) -> dict:
     # Fallback to config YAML for optional patterns if not in metadata
     # workspace_root: DATA/harness_workspace/navidrome_navidrome_v0.57.0_v0.58.0/baseline_004_v4
     # config_path:    config/navidrome_navidrome_v0.57.0_v0.58.0.yaml
-    if "generated_patterns" not in metadata or "modifiable_test_patterns" not in metadata:
+    if (
+        repo_config is not None
+        and (
+            "generated_patterns" not in metadata
+            or "modifiable_test_patterns" not in metadata
+        )
+    ):
+        if "generated_patterns" not in metadata and "generated_patterns" in repo_config:
+            metadata["generated_patterns"] = repo_config["generated_patterns"]
+        if (
+            "modifiable_test_patterns" not in metadata
+            and "modifiable_test_patterns" in repo_config
+        ):
+            metadata["modifiable_test_patterns"] = repo_config[
+                "modifiable_test_patterns"
+            ]
+    elif "generated_patterns" not in metadata or "modifiable_test_patterns" not in metadata:
         config_name = workspace_root.parent.name  # e.g., navidrome_navidrome_v0.57.0_v0.58.0
         config_path = Path("config") / f"{config_name}.yaml"
         if config_path.exists():
@@ -211,6 +319,10 @@ class E2ETrialRunner:
         self.watcher_stop_event = threading.Event()
         self.agent_runner = None
         self._trial_lock_file = None  # File handle for trial-level process lock
+        # #20: distinguishes a watcher thread that finished its loop from one
+        # that died — is_alive() alone cannot tell them apart.
+        self._watcher_exited_clean = False
+        self._watcher_dead_emitted = False
 
         # Event queue for watcher -> main loop communication
         # Event format: (event_type, milestone_id, dag_status, eval_status, error_msg)
@@ -416,20 +528,47 @@ class E2ETrialRunner:
         }
         self._save_resume_retry_state(state)
 
+    def _emit_watcher_dead(self, error_msg: str) -> None:
+        """Queue the watcher_dead event exactly once (#20).
+
+        Called from the escalation point INSIDE the loop (before the raise has
+        to travel through ThreadPoolExecutor.__exit__, whose implicit
+        shutdown(wait=True) can block on a long-running evaluation worker) and
+        from the thread-level handler as a catch-all for anything else.
+        """
+        if self._watcher_dead_emitted:
+            return
+        self._watcher_dead_emitted = True
+        try:
+            self.eval_event_queue.put(("watcher_dead", None, None, None, error_msg))
+        except Exception:
+            logger.error("Failed to enqueue watcher_dead event", exc_info=True)
+
     def start_watcher_thread(self):
         """Start watcher in background thread.
 
         Note: setup_environment() is now called synchronously in run() before this.
         This thread only monitors for agent tags and runs evaluations.
         """
+        self._watcher_exited_clean = False
+        self._watcher_dead_emitted = False
 
         def watcher_loop():
             try:
                 logger.info("Watcher thread started (monitoring for tags)")
                 # Run watcher loop (non-blocking version)
                 self._run_watcher_loop()
+                self._watcher_exited_clean = True
             except Exception as e:
                 logger.error(f"Watcher thread died: {e}", exc_info=True)
+                # #20: the main loop must never keep waiting on a dead watcher.
+                # Before this event existed, a death here left the agent running
+                # with nobody evaluating its tags — the trial burned its whole
+                # no-progress budget on timeouts and exited with valid work
+                # unscored. Surface the death so the main loop aborts loudly;
+                # --resume-trial restarts the watcher and re-primes pending
+                # debounce/evaluations from resume_state.
+                self._emit_watcher_dead(str(e))
 
         self.watcher_thread = threading.Thread(target=watcher_loop, daemon=True)
         self.watcher_thread.start()
@@ -459,6 +598,7 @@ class E2ETrialRunner:
         pending_debounce = self.pending_debounce  # Use instance variable
         retry_counts: Dict[str, int] = {}  # mid -> retry count (for tag updates after eval)
         submission_failures: Dict[str, int] = {}  # mid -> submission failure count
+        tag_move_discards: Dict[str, int] = {}  # mid -> consecutive discarded captures (#20)
 
         # Initialize evaluated_hashes from orchestrator (for resume mode)
         # In fresh mode, _evaluated_hashes is empty; in resume mode, it contains previous hashes
@@ -503,6 +643,50 @@ class E2ETrialRunner:
 
                 return True
 
+            def submit_with_boundary(mid: str, tag: str, attempt: int, expected_hash: str) -> tuple[bool, bool]:
+                """Run _handle_submission behind the #20 exception boundary.
+
+                expected_hash is the commit this caller OBSERVED (debounce-
+                stable hash, or the scan hash on the retry path). Passing it is
+                what arms the before-capture freshness check: without it the
+                handler resolves the tag itself and compares that value against
+                a second read of the same tag, so a move between debounce and
+                pickup was undetectable — the handler captured the NEW commit
+                while the caller recorded the OLD hash as evaluated.
+
+                Returns (success, tag_moved). No exception may escape into the
+                watcher loop: before this boundary existed, a tag moving during
+                snapshot capture killed the watcher thread permanently while
+                the agent kept tagging milestones nobody evaluated (issue #20).
+
+                Policy for a moved tag: the orchestrator already discarded the
+                stale capture and recorded the audit entry; the OLD commit is
+                never evaluated. The caller just recycles the milestone so the
+                next scan re-enters debounce for the new commit. A move is an
+                expected race with a healthy agent, so it does NOT count toward
+                submission_failures.
+                """
+                try:
+                    ok = self.orchestrator._handle_submission(
+                        mid, tag, executor, pending_futures, attempt=attempt,
+                        expected_tag_hash=expected_hash,
+                    )
+                    return ok, False
+                except SubmissionTagMoved as moved:
+                    discards = tag_move_discards.get(mid, 0) + 1
+                    tag_move_discards[mid] = discards
+                    log = logger.error if discards >= 3 else logger.warning
+                    log(
+                        f"⚠️ {mid}: tag moved {moved.phase} "
+                        f"({(moved.old_commit or '?')[:12]} → {(moved.new_commit or '?')[:12]}); "
+                        f"capture discarded, waiting for the new commit to stabilize"
+                        + (f" — {discards} consecutive discarded captures" if discards >= 3 else "")
+                    )
+                    return False, True
+                except Exception:
+                    logger.error(f"{mid}: submission failed with unexpected error", exc_info=True)
+                    return False, False
+
             # === Resume priming: restore pending debounce / evaluations without re-scanning tags ===
             dropped_debounce: set[str] = set()
             if self._resume_pending_debounce:
@@ -535,17 +719,16 @@ class E2ETrialRunner:
                         except Exception:
                             tag_hash = ""
 
-                    first_seen_ts = payload.get("first_seen_ts", payload.get("first_seen"))
-                    last_updated_ts = payload.get("last_updated_ts", payload.get("last_updated"))
-                    if not isinstance(first_seen_ts, (int, float)):
-                        first_seen_ts = priming_now
-                    if not isinstance(last_updated_ts, (int, float)):
-                        last_updated_ts = priming_now
-
-                    # Clamp to "now" to avoid negative durations if clocks differ
-                    first_seen_ts = min(float(first_seen_ts), priming_now)
-                    last_updated_ts = min(float(last_updated_ts), priming_now)
-                    last_updated_ts = max(last_updated_ts, first_seen_ts)
+                    # Resume restarts BOTH debounce clocks at priming time. The
+                    # persisted timestamps describe a dead process's observation
+                    # window: keeping the old first_seen let max_debounce_wait
+                    # force-capture a commit that had only been stable for
+                    # seconds — e.g. a crash mid-recycle (#20) resumes with the
+                    # stale hash, the first iteration flips it to the new one,
+                    # and the ancient first_seen immediately triggers the forced
+                    # path. Restarting costs at most one extra debounce window.
+                    first_seen_ts = priming_now
+                    last_updated_ts = priming_now
 
                     with self._state_lock:
                         pending_debounce[mid] = DebounceState(
@@ -586,18 +769,47 @@ class E2ETrialRunner:
                         dropped_eval_keys.add(key)
                         continue
 
-                    snapshot_path = self.orchestrator.trial_root / snapshot_rel
+                    try:
+                        snapshot_path = _resolve_trial_relative_path(
+                            self.orchestrator.trial_root,
+                            snapshot_rel,
+                            field_name="resume snapshot_path",
+                        )
+                    except ValueError as exc:
+                        logger.warning("Resume priming: dropping %s: %s", key, exc)
+                        dropped_eval_keys.add(key)
+                        continue
                     if not snapshot_path.exists():
                         logger.warning(f"Resume priming: snapshot missing for {key}: {snapshot_path}")
                         dropped_eval_keys.add(key)
                         continue
 
-                    result_dir = (
-                        self.orchestrator.trial_root / result_rel
-                        if isinstance(result_rel, str) and result_rel
-                        else snapshot_path.parent
-                    )
+                    if isinstance(result_rel, str) and result_rel:
+                        try:
+                            result_dir = _resolve_trial_relative_path(
+                                self.orchestrator.trial_root,
+                                result_rel,
+                                field_name="resume result_dir",
+                            )
+                        except ValueError as exc:
+                            logger.warning("Resume priming: dropping %s: %s", key, exc)
+                            dropped_eval_keys.add(key)
+                            continue
+                    else:
+                        result_dir = snapshot_path.parent
                     result_dir.mkdir(parents=True, exist_ok=True)
+
+                    # A previous worker may have finished this evaluation after
+                    # its event loop stopped (late background eval). Runtime
+                    # fact check: a complete result on disk is ingested instead
+                    # of re-running the whole evaluation.
+                    if self._try_reconcile_finished_evaluation(mid, attempt, result_dir):
+                        tag_hash = payload.get("tag_hash")
+                        if isinstance(tag_hash, str) and tag_hash:
+                            evaluated_hashes[mid] = tag_hash
+                        if attempt > 0:
+                            retry_counts[mid] = max(retry_counts.get(mid, 0), attempt)
+                        continue
 
                     with self._state_lock:
                         self.running_evaluations.add((mid, attempt))
@@ -612,6 +824,34 @@ class E2ETrialRunner:
                         pass_to_pass_threshold=config.pass_to_pass_threshold,
                         none_to_pass_threshold=config.none_to_pass_threshold,
                         agent_attempt=attempt,
+                        build_failure_fail_closed=(
+                            self.orchestrator.build_failure_fail_closed
+                        ),
+                        repo_config_path=(
+                            self.orchestrator.repo_config_binding.path
+                            if self.orchestrator.repo_config_binding is not None
+                            else None
+                        ),
+                        repo_config_sha256=(
+                            self.orchestrator.repo_config_binding.sha256
+                            if self.orchestrator.repo_config_binding is not None
+                            else None
+                        ),
+                        runtime_policy_path=(
+                            self.orchestrator.runtime_policy_binding.path
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
+                        runtime_policy_sha256=(
+                            self.orchestrator.runtime_policy_binding.sha256
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
+                        runtime_policy_mode=(
+                            self.orchestrator.runtime_policy_binding.mode
+                            if self.orchestrator.runtime_policy_binding is not None
+                            else None
+                        ),
                     )
                     pending_futures[future] = (mid, attempt)
 
@@ -644,254 +884,311 @@ class E2ETrialRunner:
                 except Exception as e:
                     logger.warning(f"Resume priming: failed to cleanup stale resume_state entries: {e}")
 
+            # #20: one bad iteration (transient docker/git hiccup, or an
+            # unforeseen bug) must not kill the watcher silently. Transient
+            # errors self-heal across iterations; persistent ones escalate to
+            # the thread-level handler, which surfaces watcher_dead to the
+            # main loop instead of leaving the agent running unevaluated.
+            consecutive_loop_errors = 0
             while not self.watcher_stop_event.is_set():
-                now = time.time()
+                try:
+                    now = time.time()
 
-                # Step 1: Check for completed evaluations
-                done_futures = [f for f in pending_futures if f.done()]
-                for f in done_futures:
-                    mid, attempt = pending_futures.pop(f)
-                    # Remove from running evaluations tracking (thread-safe)
+                    # Step 1: Check for completed evaluations
+                    done_futures = [f for f in pending_futures if f.done()]
+                    for f in done_futures:
+                        mid, attempt = pending_futures.pop(f)
+                        # Remove from running evaluations tracking (thread-safe)
+                        with self._state_lock:
+                            self.running_evaluations.discard((mid, attempt))
+
+                        # Check if this evaluation was marked as stale (superseded by newer evaluation)
+                        if f in stale_futures:
+                            stale_futures.discard(f)
+                            logger.info(f"🗑️  {mid}: Discarding stale evaluation result (attempt {attempt})")
+                            continue
+
+                        try:
+                            result = f.result()
+                            # Unpack result tuple: (milestone_id, is_resolved, actual_passed, eval_res, error_msg)
+                            # - is_resolved: Whether milestone passed threshold checks (for DAG)
+                            # - actual_passed: Whether tests actually passed 100% (for eval_status)
+                            _, is_resolved, actual_passed, eval_res, err_msg = result
+                            # Pass to result processing - returns (dag_status, eval_status, error_msg)
+                            dag_status, eval_status, error_msg = self.orchestrator._process_evaluation_result(
+                                mid, is_resolved, actual_passed, eval_res, err_msg, attempt=attempt
+                            )
+                            # Notify main loop with dual-dimension status
+                            self.eval_event_queue.put(("eval_complete", mid, dag_status, eval_status, error_msg))
+                            if error_msg:
+                                logger.info(
+                                    f"Pushed eval_complete event for {mid}: dag={dag_status}, eval={eval_status} (error)"
+                                )
+                            else:
+                                logger.info(f"Pushed eval_complete event for {mid}: dag={dag_status}, eval={eval_status}")
+                        except Exception as e:
+                            logger.error(f"Error processing evaluation for {mid}: {e}")
+                            self.eval_event_queue.put(("eval_error", mid, "unlocked", "error", str(e)))
+
+                    # Check if done (thread-safe check of pending state)
+                    # Must ensure:
+                    # 1. DAG is complete (all milestones in terminal state)
+                    # 2. No pending evaluations (pending_futures)
+                    # 3. No pending debounce (tags waiting to stabilize)
+                    # 4. No running evaluations (important for final milestone in early unlock mode)
+                    # 5. No error evaluations that still need re-evaluation
                     with self._state_lock:
-                        self.running_evaluations.discard((mid, attempt))
-
-                    # Check if this evaluation was marked as stale (superseded by newer evaluation)
-                    if f in stale_futures:
-                        stale_futures.discard(f)
-                        logger.info(f"🗑️  {mid}: Discarding stale evaluation result (attempt {attempt})")
-                        continue
-
-                    try:
-                        result = f.result()
-                        # Unpack result tuple: (milestone_id, is_resolved, actual_passed, eval_res, error_msg)
-                        # - is_resolved: Whether milestone passed threshold checks (for DAG)
-                        # - actual_passed: Whether tests actually passed 100% (for eval_status)
-                        _, is_resolved, actual_passed, eval_res, err_msg = result
-                        # Pass to result processing - returns (dag_status, eval_status, error_msg)
-                        dag_status, eval_status, error_msg = self.orchestrator._process_evaluation_result(
-                            mid, is_resolved, actual_passed, eval_res, err_msg, attempt=attempt
+                        is_done = (
+                            dag.is_done() and not pending_futures and not pending_debounce and not self.running_evaluations
                         )
-                        # Notify main loop with dual-dimension status
-                        self.eval_event_queue.put(("eval_complete", mid, dag_status, eval_status, error_msg))
-                        if error_msg:
-                            logger.info(
-                                f"Pushed eval_complete event for {mid}: dag={dag_status}, eval={eval_status} (error)"
-                            )
-                        else:
-                            logger.info(f"Pushed eval_complete event for {mid}: dag={dag_status}, eval={eval_status}")
-                    except Exception as e:
-                        logger.error(f"Error processing evaluation for {mid}: {e}")
-                        self.eval_event_queue.put(("eval_error", mid, "unlocked", "error", str(e)))
-
-                # Check if done (thread-safe check of pending state)
-                # Must ensure:
-                # 1. DAG is complete (all milestones in terminal state)
-                # 2. No pending evaluations (pending_futures)
-                # 3. No pending debounce (tags waiting to stabilize)
-                # 4. No running evaluations (important for final milestone in early unlock mode)
-                # 5. No error evaluations that still need re-evaluation
-                with self._state_lock:
-                    is_done = (
-                        dag.is_done() and not pending_futures and not pending_debounce and not self.running_evaluations
-                    )
-                if is_done:
-                    # Check for error evaluations that need re-evaluation
-                    summary = self.orchestrator._load_summary_or_init()
-                    error_mids = [
-                        mid for mid, r in summary.get("results", {}).items()
-                        if r.get("eval_status") == "error" and mid not in evaluated_hashes
-                    ]
-                    if error_mids:
-                        logger.info(f"DAG done but {len(error_mids)} error evaluation(s) pending re-scan: {error_mids}")
-                    else:
-                        logger.info("All milestones processed and evaluated, watcher exiting")
-                        self.eval_event_queue.put(("watcher_done", None, None, None, None))
-                        break
-
-                # Step 2: Check pending debounce items
-                for mid in list(pending_debounce.keys()):
-                    state = pending_debounce[mid]
-                    current_hash = self.orchestrator._get_tag_hash(f"agent-impl-{mid}")
-
-                    if current_hash != state.hash:
-                        # Hash changed, update state
-                        logger.info(f"⏳ {mid}: Tag hash changed during debounce, resetting timer...")
-                        state.hash = current_hash
-                        state.last_updated = now
-                        try:
-
-                            def _mutate(summary: dict) -> None:
-                                rs = summary["resume_state"]
-                                rs["pending_debounce"][mid] = {
-                                    "tag": state.tag,
-                                    "tag_hash": current_hash,
-                                    "first_seen_ts": state.first_seen,
-                                    "last_updated_ts": now,
-                                }
-
-                            self.orchestrator._update_resume_state(_mutate)
-                        except Exception as e:
-                            logger.debug(f"Failed to persist debounce update for {mid}: {e}")
-                        continue
-
-                    time_since_last_update = now - state.last_updated
-                    time_since_first_seen = now - state.first_seen
-
-                    if time_since_last_update >= debounce_seconds:
-                        # Stable for debounce period, start evaluation
-                        with self._state_lock:
-                            del pending_debounce[mid]
-                            self.running_evaluations.add((mid, 0))
-                        logger.info(f"✓ {mid}: Debounce complete ({debounce_seconds}s stable), starting evaluation...")
-                        success = self.orchestrator._handle_submission(
-                            mid, state.tag, executor, pending_futures, attempt=0
-                        )
-                        if success:
-                            evaluated_hashes[mid] = current_hash
-                            retry_counts[mid] = 0
-                            submission_failures.pop(mid, None)  # Clear failure count on success
-                        else:
-                            # Submission failed (e.g., snapshot extraction error), clean up tracking
-                            with self._state_lock:
-                                self.running_evaluations.discard((mid, 0))
-                            submission_failures[mid] = submission_failures.get(mid, 0) + 1
-                            if submission_failures[mid] >= max_retries:
-                                # Max submission failures reached, mark as evaluated to skip future attempts
-                                evaluated_hashes[mid] = current_hash
-                                logger.error(f"⛔ {mid}: Max submission failures ({max_retries}) reached, giving up")
-                            else:
-                                # Will re-enter debounce on next scan (tag still exists, not in evaluated_hashes)
-                                logger.warning(
-                                    f"⚠️ {mid}: Submission failed ({submission_failures[mid]}/{max_retries}), "
-                                    f"will retry after re-debounce"
-                                )
-                    elif time_since_first_seen >= max_debounce_wait:
-                        # Max wait exceeded, force evaluation
-                        with self._state_lock:
-                            del pending_debounce[mid]
-                            self.running_evaluations.add((mid, 0))
-                        logger.warning(
-                            f"⚠️ {mid}: Max debounce wait ({max_debounce_wait}s) exceeded, forcing evaluation..."
-                        )
-                        success = self.orchestrator._handle_submission(
-                            mid, state.tag, executor, pending_futures, attempt=0
-                        )
-                        if success:
-                            evaluated_hashes[mid] = current_hash
-                            retry_counts[mid] = 0
-                            submission_failures.pop(mid, None)  # Clear failure count on success
-                        else:
-                            # Submission failed, clean up tracking
-                            with self._state_lock:
-                                self.running_evaluations.discard((mid, 0))
-                            submission_failures[mid] = submission_failures.get(mid, 0) + 1
-                            if submission_failures[mid] >= max_retries:
-                                # Max submission failures reached, mark as evaluated to skip future attempts
-                                evaluated_hashes[mid] = current_hash
-                                logger.error(f"⛔ {mid}: Max submission failures ({max_retries}) reached, giving up")
-                            else:
-                                # Will re-enter debounce on next scan
-                                logger.warning(
-                                    f"⚠️ {mid}: Submission failed ({submission_failures[mid]}/{max_retries}), "
-                                    f"will retry after re-debounce"
-                                )
-
-                # Step 3: Scan for new/changed tags
-                current_tags = self.orchestrator._get_container_tags()
-
-                for mid in dag.all_milestones:
-                    tag = f"agent-impl-{mid}"
-                    if tag not in current_tags:
-                        continue
-
-                    current_hash = self.orchestrator._get_tag_hash(tag)
-
-                    if mid in pending_debounce:
-                        # Already in debounce, handled above
-                        continue
-
-                    # Skip if already completed in DAG (for resume mode without hash),
-                    # UNLESS the previous evaluation errored (infrastructure failure) —
-                    # in that case, re-evaluate to get a proper result.
-                    if mid in dag.completed_milestones and mid not in evaluated_hashes:
+                    if is_done:
+                        # Check for error evaluations that need re-evaluation
                         summary = self.orchestrator._load_summary_or_init()
-                        prev_eval = summary.get("results", {}).get(mid, {}).get("eval_status")
-                        if prev_eval == "error":
-                            logger.info(f"🔄 {mid}: Previously errored (eval_status=error), will re-evaluate")
+                        error_mids = [
+                            mid for mid, r in summary.get("results", {}).items()
+                            if r.get("eval_status") == "error" and mid not in evaluated_hashes
+                        ]
+                        if error_mids:
+                            logger.info(f"DAG done but {len(error_mids)} error evaluation(s) pending re-scan: {error_mids}")
                         else:
-                            logger.info(f"⏭️  {mid}: Already completed in DAG, skipping evaluation")
-                            evaluated_hashes[mid] = current_hash  # Record hash to prevent re-checking
+                            logger.info("All milestones processed and evaluated, watcher exiting")
+                            self.eval_event_queue.put(("watcher_done", None, None, None, None))
+                            break
+
+                    # Step 2: Check pending debounce items
+                    for mid in list(pending_debounce.keys()):
+                        state = pending_debounce[mid]
+                        current_hash = self.orchestrator._get_tag_hash(f"agent-impl-{mid}")
+
+                        if current_hash != state.hash:
+                            # Hash changed, update state
+                            logger.info(f"⏳ {mid}: Tag hash changed during debounce, resetting timer...")
+                            state.hash = current_hash
+                            state.last_updated = now
+                            try:
+
+                                def _mutate(summary: dict) -> None:
+                                    rs = summary["resume_state"]
+                                    rs["pending_debounce"][mid] = {
+                                        "tag": state.tag,
+                                        "tag_hash": current_hash,
+                                        "first_seen_ts": state.first_seen,
+                                        "last_updated_ts": now,
+                                    }
+
+                                self.orchestrator._update_resume_state(_mutate)
+                            except Exception as e:
+                                logger.debug(f"Failed to persist debounce update for {mid}: {e}")
                             continue
 
-                    if mid not in evaluated_hashes:
-                        # First time seeing this tag, start debounce
-                        logger.info(f"🔍 {mid}: New tag detected, starting debounce ({debounce_seconds}s)...")
-                        with self._state_lock:
-                            pending_debounce[mid] = DebounceState(
-                                tag=tag,
-                                hash=current_hash,
-                                first_seen=now,
-                                last_updated=now,
-                                milestone_id=mid,
-                            )
-                        try:
+                        time_since_last_update = now - state.last_updated
+                        time_since_first_seen = now - state.first_seen
 
-                            def _mutate(summary: dict) -> None:
-                                rs = summary["resume_state"]
-                                rs["pending_debounce"][mid] = {
-                                    "tag": tag,
-                                    "tag_hash": current_hash,
-                                    "first_seen_ts": now,
-                                    "last_updated_ts": now,
-                                }
-
-                            self.orchestrator._update_resume_state(_mutate)
-                        except Exception as e:
-                            logger.debug(f"Failed to persist pending_debounce for {mid}: {e}")
-                    elif current_hash != evaluated_hashes[mid]:
-                        # Hash changed after evaluation - this is a RETRY
-                        current_retry_count = retry_counts.get(mid, 0)
-                        if current_retry_count >= max_retries:
-                            logger.warning(f"⛔ {mid}: Max retries ({max_retries}) exceeded, ignoring tag update")
-                            continue
-
-                        # Cancel any existing evaluation for this milestone before starting retry
-                        cancel_existing_evaluation(mid)
-
-                        # Start retry immediately (no debounce for retries)
-                        retry_counts[mid] = current_retry_count + 1
-                        attempt = retry_counts[mid]
-                        logger.info(
-                            f"🔄 {mid}: Tag updated after evaluation, starting retry {attempt}/{max_retries}..."
-                        )
-                        with self._state_lock:
-                            self.running_evaluations.add((mid, attempt))
-                        success = self.orchestrator._handle_submission(
-                            mid, tag, executor, pending_futures, attempt=attempt
-                        )
-                        if success:
-                            evaluated_hashes[mid] = current_hash
-                        else:
-                            # Submission failed, clean up tracking and revert retry count
+                        if time_since_last_update >= debounce_seconds:
+                            # Stable for debounce period, start evaluation
                             with self._state_lock:
-                                self.running_evaluations.discard((mid, attempt))
-                            retry_counts[mid] = current_retry_count  # Revert retry count
-                            logger.warning(f"⚠️ {mid}: Retry submission failed, cleaned up running_evaluations")
+                                del pending_debounce[mid]
+                                self.running_evaluations.add((mid, 0))
+                            logger.info(f"✓ {mid}: Debounce complete ({debounce_seconds}s stable), starting evaluation...")
+                            success, tag_moved = submit_with_boundary(mid, state.tag, 0, current_hash)
+                            if success:
+                                evaluated_hashes[mid] = current_hash
+                                retry_counts[mid] = 0
+                                submission_failures.pop(mid, None)  # Clear failure count on success
+                                tag_move_discards.pop(mid, None)
+                            elif tag_moved:
+                                # Expected race (#20), not a failure: the hash has
+                                # changed, so the next scan re-enters debounce for
+                                # the new commit (mid stays out of evaluated_hashes).
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, 0))
+                            else:
+                                # Submission failed (e.g., snapshot extraction error), clean up tracking
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, 0))
+                                submission_failures[mid] = submission_failures.get(mid, 0) + 1
+                                if submission_failures[mid] >= max_retries:
+                                    # Max submission failures reached, mark as evaluated to skip future attempts
+                                    evaluated_hashes[mid] = current_hash
+                                    logger.error(f"⛔ {mid}: Max submission failures ({max_retries}) reached, giving up")
+                                else:
+                                    # Will re-enter debounce on next scan (tag still exists, not in evaluated_hashes)
+                                    logger.warning(
+                                        f"⚠️ {mid}: Submission failed ({submission_failures[mid]}/{max_retries}), "
+                                        f"will retry after re-debounce"
+                                    )
+                        elif time_since_first_seen >= max_debounce_wait:
+                            # Max wait exceeded, force evaluation
+                            with self._state_lock:
+                                del pending_debounce[mid]
+                                self.running_evaluations.add((mid, 0))
+                            logger.warning(
+                                f"⚠️ {mid}: Max debounce wait ({max_debounce_wait}s) exceeded, forcing evaluation..."
+                            )
+                            success, tag_moved = submit_with_boundary(mid, state.tag, 0, current_hash)
+                            if success:
+                                evaluated_hashes[mid] = current_hash
+                                retry_counts[mid] = 0
+                                submission_failures.pop(mid, None)  # Clear failure count on success
+                                tag_move_discards.pop(mid, None)
+                            elif tag_moved:
+                                # Expected race (#20): recycle into a fresh debounce
+                                # round for the new commit, no failure charged.
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, 0))
+                            else:
+                                # Submission failed, clean up tracking
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, 0))
+                                submission_failures[mid] = submission_failures.get(mid, 0) + 1
+                                if submission_failures[mid] >= max_retries:
+                                    # Max submission failures reached, mark as evaluated to skip future attempts
+                                    evaluated_hashes[mid] = current_hash
+                                    logger.error(f"⛔ {mid}: Max submission failures ({max_retries}) reached, giving up")
+                                else:
+                                    # Will re-enter debounce on next scan
+                                    logger.warning(
+                                        f"⚠️ {mid}: Submission failed ({submission_failures[mid]}/{max_retries}), "
+                                        f"will retry after re-debounce"
+                                    )
 
+                    # Step 3: Scan for new/changed tags
+                    current_tags = self.orchestrator._get_container_tags()
+
+                    for mid in dag.all_milestones:
+                        tag = f"agent-impl-{mid}"
+                        if tag not in current_tags:
+                            continue
+
+                        current_hash = self.orchestrator._get_tag_hash(tag)
+
+                        if mid in pending_debounce:
+                            # Already in debounce, handled above
+                            continue
+
+                        # Skip if already completed in DAG (for resume mode without hash),
+                        # UNLESS the previous evaluation errored (infrastructure failure) —
+                        # in that case, re-evaluate to get a proper result.
+                        if mid in dag.completed_milestones and mid not in evaluated_hashes:
+                            summary = self.orchestrator._load_summary_or_init()
+                            prev_eval = summary.get("results", {}).get(mid, {}).get("eval_status")
+                            if prev_eval == "error":
+                                logger.info(f"🔄 {mid}: Previously errored (eval_status=error), will re-evaluate")
+                            else:
+                                logger.info(f"⏭️  {mid}: Already completed in DAG, skipping evaluation")
+                                evaluated_hashes[mid] = current_hash  # Record hash to prevent re-checking
+                                continue
+
+                        if mid not in evaluated_hashes:
+                            # First time seeing this tag, start debounce
+                            logger.info(f"🔍 {mid}: New tag detected, starting debounce ({debounce_seconds}s)...")
+                            with self._state_lock:
+                                pending_debounce[mid] = DebounceState(
+                                    tag=tag,
+                                    hash=current_hash,
+                                    first_seen=now,
+                                    last_updated=now,
+                                    milestone_id=mid,
+                                )
+                            try:
+
+                                def _mutate(summary: dict) -> None:
+                                    rs = summary["resume_state"]
+                                    rs["pending_debounce"][mid] = {
+                                        "tag": tag,
+                                        "tag_hash": current_hash,
+                                        "first_seen_ts": now,
+                                        "last_updated_ts": now,
+                                    }
+
+                                self.orchestrator._update_resume_state(_mutate)
+                            except Exception as e:
+                                logger.debug(f"Failed to persist pending_debounce for {mid}: {e}")
+                        elif current_hash != evaluated_hashes[mid]:
+                            # Hash changed after evaluation - this is a RETRY
+                            current_retry_count = retry_counts.get(mid, 0)
+                            if current_retry_count >= max_retries:
+                                logger.warning(f"⛔ {mid}: Max retries ({max_retries}) exceeded, ignoring tag update")
+                                continue
+
+                            # Cancel any existing evaluation for this milestone before starting retry
+                            cancel_existing_evaluation(mid)
+
+                            # Start retry immediately (no debounce for retries)
+                            retry_counts[mid] = current_retry_count + 1
+                            attempt = retry_counts[mid]
+                            logger.info(
+                                f"🔄 {mid}: Tag updated after evaluation, starting retry {attempt}/{max_retries}..."
+                            )
+                            with self._state_lock:
+                                self.running_evaluations.add((mid, attempt))
+                            success, tag_moved = submit_with_boundary(mid, tag, attempt, current_hash)
+                            if success:
+                                evaluated_hashes[mid] = current_hash
+                                tag_move_discards.pop(mid, None)
+                                submission_failures.pop(mid, None)
+                            elif tag_moved:
+                                # Expected race (#20): revert the retry count without
+                                # charging a failure; the next scan sees the newer
+                                # hash and starts a fresh retry for it.
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, attempt))
+                                retry_counts[mid] = current_retry_count
+                            else:
+                                # Submission failed, clean up tracking and revert retry count.
+                                # The failure DOES consume the shared submission budget:
+                                # without this, a persistently failing retry archive
+                                # relaunched every scan (~2s) forever, reaching neither
+                                # the retry limit nor watcher_dead (#20 review).
+                                with self._state_lock:
+                                    self.running_evaluations.discard((mid, attempt))
+                                retry_counts[mid] = current_retry_count  # Revert retry count
+                                submission_failures[mid] = submission_failures.get(mid, 0) + 1
+                                if submission_failures[mid] >= max_retries:
+                                    evaluated_hashes[mid] = current_hash
+                                    logger.error(
+                                        f"⛔ {mid}: Max submission failures ({max_retries}) reached "
+                                        f"on retry, giving up on this hash"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ {mid}: Retry submission failed "
+                                        f"({submission_failures[mid]}/{max_retries}), cleaned up running_evaluations"
+                                    )
+
+                except Exception as loop_exc:
+                    consecutive_loop_errors += 1
+                    logger.error(
+                        f"Watcher iteration failed ({consecutive_loop_errors}/{WATCHER_MAX_CONSECUTIVE_ERRORS}); "
+                        "retrying after sleep",
+                        exc_info=True,
+                    )
+                    if consecutive_loop_errors >= WATCHER_MAX_CONSECUTIVE_ERRORS:
+                        # Emit BEFORE raising: the raise still has to travel
+                        # through the executor's shutdown(wait=True), which can
+                        # block for as long as a running evaluation takes — the
+                        # main loop must learn about the death now, not then.
+                        self._emit_watcher_dead(
+                            f"{consecutive_loop_errors} consecutive iteration failures; last: {loop_exc}"
+                        )
+                        raise
+                else:
+                    consecutive_loop_errors = 0
                 time.sleep(2)
 
     def _drain_pending_events(self) -> str:
         """Drain any pending events from the queue without blocking.
 
         Returns:
-            "all_done" if watcher_done signal received, "continue" otherwise
+            "all_done" if watcher_done signal received, "watcher_dead" if the
+            watcher thread died (#20), "continue" otherwise
         """
         while True:
             try:
                 event = self.eval_event_queue.get_nowait()
                 result = self._process_queue_event(event)
-                if result == "all_done":
-                    return "all_done"
+                if result in ("all_done", "watcher_dead"):
+                    return result
             except queue.Empty:
                 return "continue"
 
@@ -925,7 +1222,76 @@ class E2ETrialRunner:
             logger.info("📬 Received watcher_done signal")
             return "all_done"
 
+        elif event_type == "watcher_dead":
+            error_msg = event[4] if len(event) > 4 else None
+            logger.error(f"📬 Watcher thread died: {error_msg}")
+            return "watcher_dead"
+
         return None
+
+    def _try_reconcile_finished_evaluation(
+        self, mid: str, attempt: int, result_dir: Path
+    ) -> bool:
+        """Ingest an already-finished evaluation from disk instead of re-running.
+
+        A prior worker can produce evaluation_result.json after its event loop
+        stopped consuming completions (late background eval past the wait
+        timeout), leaving a finished result on disk that summary.json never
+        registered — the resume pass would then re-run or, with the DAG already
+        done, silently mislabel the milestone as blocked.
+
+        Trust only runtime facts, fail closed: the file must exist, parse,
+        match the milestone, reconstruct, and be safe to score (results are
+        written atomically, so a parseable file is a finished one). Anything
+        less falls through to a normal re-evaluation. Ingestion goes through
+        ``_process_evaluation_result`` — the exact path the live watcher uses —
+        so DAG, summary, feedback, and filtered artifacts stay consistent.
+        """
+        from harness.e2e.evaluator import EvaluationResult
+        from harness.e2e.orchestrator import derive_resolution
+
+        result_path = result_dir / "evaluation_result.json"
+        try:
+            data = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or data.get("milestone_id") != mid:
+            logger.warning(
+                f"Resume priming: on-disk result at {result_path} does not "
+                f"match milestone {mid}; re-evaluating"
+            )
+            return False
+        if data.get("infrastructure_failure") or data.get("infra_invalid_reason"):
+            logger.info(
+                f"Resume priming: {mid} on-disk result is infra-flagged "
+                "(not safe to score); re-evaluating"
+            )
+            return False
+        try:
+            eval_res = EvaluationResult.from_result_dict(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                f"Resume priming: {mid} on-disk result incomplete ({exc}); re-evaluating"
+            )
+            return False
+
+        config = self.orchestrator.config
+        is_resolved, actual_passed = derive_resolution(
+            eval_res,
+            fail_to_pass_threshold=config.fail_to_pass_threshold,
+            pass_to_pass_threshold=config.pass_to_pass_threshold,
+            none_to_pass_threshold=config.none_to_pass_threshold,
+        )
+        eval_res.resolved = is_resolved
+        dag_status, eval_status, error_msg = self.orchestrator._process_evaluation_result(
+            mid, is_resolved, actual_passed, eval_res, None, attempt=attempt
+        )
+        self.eval_event_queue.put(("eval_complete", mid, dag_status, eval_status, error_msg))
+        logger.info(
+            f"♻️ Resume priming: reconciled finished evaluation for {mid} from "
+            f"disk (dag={dag_status}, eval={eval_status}); skipping re-run"
+        )
+        return True
 
     def _wait_for_evaluations(self, max_wait: int = None) -> str:
         """Wait for pending evaluations using event queue.
@@ -944,6 +1310,7 @@ class E2ETrialRunner:
             "all_done" - DAG completed AND all evaluations finished
             "agent_incomplete" - agent didn't complete all tasks (no pending work, but DAG not done)
             "timeout" - max wait time exceeded
+            "watcher_dead" - the watcher thread died and nobody evaluates tags (#20)
         """
         dag = self.orchestrator.dag
         config = self.orchestrator.config
@@ -953,9 +1320,18 @@ class E2ETrialRunner:
             max_wait = config.evaluation_timeout
 
         start_time = time.time()
+        # Late-eval harvest: after the primary wait expires we keep consuming
+        # completion events (bounded) instead of abandoning in-flight
+        # evaluations — their summary registration happens through this loop's
+        # normal consumers, so returning early silently drops finished results.
+        harvest_started: Optional[float] = None
+        harvest_grace = int(getattr(config, "eval_harvest_grace_seconds", 1800) or 0)
 
         # First, drain any pending events that accumulated while agent was running
-        if self._drain_pending_events() == "all_done":
+        drained = self._drain_pending_events()
+        if drained == "watcher_dead":
+            return "watcher_dead"
+        if drained == "all_done":
             # Even if watcher says done, verify DAG is actually complete
             if dag.is_done():
                 return "all_done"
@@ -965,6 +1341,19 @@ class E2ETrialRunner:
         # - pending_debounce: tags waiting for hash to stabilize
         # - running_evaluations: evaluations in progress (important for early unlock mode!)
         while True:
+            # #20 liveness backstop: the event can arrive after this method's
+            # initial drain, and the state checks below can return (new_tasks /
+            # agent_incomplete) with the death still queued — burning recovery
+            # rounds on a dead watcher. A thread that exited without setting
+            # _watcher_exited_clean is dead regardless of event delivery.
+            if (
+                self.watcher_thread is not None
+                and not self.watcher_thread.is_alive()
+                and not self._watcher_exited_clean
+            ):
+                self._drain_pending_events()  # consume the queued event, if any
+                return "watcher_dead"
+
             with self._state_lock:
                 has_pending = bool(dag.submitted_milestones or self.pending_debounce or self.running_evaluations)
 
@@ -1006,13 +1395,35 @@ class E2ETrialRunner:
             elapsed = time.time() - start_time
             remaining = max_wait - elapsed
             if remaining <= 0:
-                logger.warning(f"Timeout after {max_wait}s waiting for evaluations")
-                return "timeout"
+                with self._state_lock:
+                    in_flight = sorted(self.running_evaluations)
+                if not in_flight or harvest_grace <= 0:
+                    logger.warning(f"Timeout after {max_wait}s waiting for evaluations")
+                    return "timeout"
+                if harvest_started is None:
+                    harvest_started = time.time()
+                    logger.warning(
+                        f"⏳ Primary wait ({max_wait}s) exhausted with "
+                        f"{len(in_flight)} in-flight evaluation(s) {in_flight}; "
+                        f"harvesting completions for up to {harvest_grace}s"
+                    )
+                if time.time() - harvest_started >= harvest_grace:
+                    logger.warning(
+                        f"Harvest grace ({harvest_grace}s) exhausted; abandoning "
+                        f"in-flight evaluation(s) {in_flight} — results that "
+                        "finish on disk will be reconciled on the next resume"
+                    )
+                    return "timeout"
+                remaining = 5.0  # keep consuming completion events during harvest
 
             # Wait for event from watcher (with timeout)
             try:
                 event = self.eval_event_queue.get(timeout=min(5.0, remaining))
                 result = self._process_queue_event(event)
+                if result == "watcher_dead":
+                    # #20: nobody is left to evaluate tags — waiting further
+                    # only burns the no-progress budget on timeouts.
+                    return "watcher_dead"
                 if result == "all_done":
                     # Verify DAG is actually done AND all evaluations have finished
                     # This ensures we wait for the final milestone's evaluation to complete
@@ -1056,6 +1467,7 @@ class E2ETrialRunner:
         recover_count = 0
         no_progress_count = 0
         made_any_progress = False
+        watcher_died = False  # #20: set when the watcher thread dies mid-trial
         max_no_progress_attempts = config.max_no_progress_attempts
 
         # Track progress by monitoring DAG state changes
@@ -1107,8 +1519,15 @@ class E2ETrialRunner:
             timeout_ms=self.timeout_ms,
             prompt_version=self.prompt_version,
             reasoning_effort=self.reasoning_effort,
-            api_router=self.orchestrator.api_router,
         )
+
+        def invoke_agent(callable_):
+            # A model turn may have deleted its disposable cache or an old
+            # resumed container may predate the immutable Go split. Verify the
+            # exact shared runtime and reset only reproducible COW module state
+            # before every fresh/resume/recover subprocess.
+            self.orchestrator.container_setup.prepare_agent_invocation()
+            return callable_()
 
         # Capture initial state
         prev_state = get_dag_progress_state()
@@ -1129,6 +1548,20 @@ class E2ETrialRunner:
         resume_subprocess_retry_limit = int(getattr(config, "resume_subprocess_retry_limit", 0) or 0)
         recovery_wait_seconds = int(getattr(config, "recovery_wait_seconds", 60) or 0)
 
+        # Graceful HTTP-529 server-overload backoff config. Server overload is a
+        # TRANSIENT condition distinct from a genuine quota rate-limit: instead of
+        # a long sleep we exponentially back off (base → cap) and only give up,
+        # gracefully and resumably, once we've spent `giveup` continuous wall-clock
+        # seconds backing off without any successful agent turn in between.
+        overload_backoff_base = int(getattr(config, "overload_backoff_base_seconds", 20) or 20)
+        overload_backoff_cap = int(getattr(config, "overload_backoff_cap_seconds", 300) or 300)
+        overload_giveup_seconds = int(getattr(config, "overload_giveup_seconds", 3600) or 3600)
+        # Accumulated continuous-overload wall-clock seconds; reset to 0 on any
+        # successful agent turn so isolated overloads don't accumulate over hours.
+        overload_backoff_total = 0
+        # Current backoff step (the un-jittered delay to use on the NEXT overload).
+        overload_backoff_step = overload_backoff_base
+
         while not dag.is_done() and no_progress_count < max_no_progress_attempts:
             if first_run:
                 if resume_session_first:
@@ -1145,8 +1578,10 @@ class E2ETrialRunner:
                         logger.info(f"Attempting to resume previous agent session ({attempt_label})...")
                         orchestrator_logger.info(f"🔁 Agent resume {attempt_label}")
                         self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
-                        success = self.agent_runner.send_recover_message(
-                            has_new_tasks=True, timeout_ms=recover_timeout_ms
+                        success = invoke_agent(
+                            lambda: self.agent_runner.send_recover_message(
+                                has_new_tasks=True, timeout_ms=recover_timeout_ms
+                            )
                         )
                         if success:
                             break
@@ -1247,13 +1682,13 @@ class E2ETrialRunner:
                         except Exception as e:
                             logger.warning(f"Failed to invalidate persistent session: {e}")
                         orchestrator_logger.info("🚀 Agent started (fallback new session)")
-                        success = self.agent_runner.run()
+                        success = invoke_agent(self.agent_runner.run)
 
                     resume_session_first = False  # Only attempt once
                 else:
                     logger.info("Running agent (first run)...")
                     orchestrator_logger.info("🚀 Agent started (first run)")
-                    success = self.agent_runner.run()
+                    success = invoke_agent(self.agent_runner.run)
                 first_run = False
                 orchestrator_logger.info("Agent first run completed" + (" ✓" if success else " ✗ (failed)"))
             else:
@@ -1262,12 +1697,21 @@ class E2ETrialRunner:
                 )
                 orchestrator_logger.info(f"🔄 Agent recover message sent (recover #{recover_count})")
                 self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
-                success = self.agent_runner.send_recover_message(
-                    has_new_tasks=has_new_tasks, timeout_ms=recover_timeout_ms
+                success = invoke_agent(
+                    lambda: self.agent_runner.send_recover_message(
+                        has_new_tasks=has_new_tasks, timeout_ms=recover_timeout_ms
+                    )
                 )
                 orchestrator_logger.info(
                     f"Agent recover {recover_count} completed" + (" ✓" if success else " ✗ (failed)")
                 )
+
+            if success:
+                # A successful agent turn means the endpoint is healthy again;
+                # forget any accumulated continuous-overload time so isolated 529s
+                # spread across hours never add up to a spurious give-up.
+                overload_backoff_total = 0
+                overload_backoff_step = overload_backoff_base
 
             if not success:
                 # Check for fatal configuration errors - no point retrying
@@ -1317,6 +1761,49 @@ class E2ETrialRunner:
                         self.agent_runner.invalidate_persistent_session(reason="invalid_session")
                     except Exception as e:
                         logger.warning(f"Failed to invalidate persistent session: {e}")
+                # Transient server overload (HTTP 529): fast exponential backoff
+                # instead of a long rate-limit sleep. Only when there is NO parsed
+                # real reset time — a genuine quota with a parsed reset falls
+                # through to the rate-limit long-sleep below (CRITICAL #2).
+                if self.agent_runner._last_overload and not self.agent_runner._rate_limit_reset_seconds:
+                    # Give up gracefully once we've spent the whole continuous-overload
+                    # budget backing off without a single successful turn in between.
+                    if overload_backoff_total >= overload_giveup_seconds:
+                        logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        orchestrator_logger.warning(
+                            "🛑 ENDPOINT_UNAVAILABLE - gave up after %ds of continuous server "
+                            "overload; resume with run_all --repos when endpoint recovers",
+                            overload_backoff_total,
+                        )
+                        _set_last_run_summary("endpoint_unavailable")
+                        return False
+                    # Exponential step capped at the cap, with ±20% jitter so two
+                    # concurrent repos hitting 529 don't re-synchronize their retries.
+                    base_delay = min(overload_backoff_step, overload_backoff_cap)
+                    delay = max(1, int(base_delay * random.uniform(0.8, 1.2)))
+                    logger.warning(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)...",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    orchestrator_logger.info(
+                        "🌊 Server overload (HTTP 529) - backing off %ds (continuous %ds/%ds)",
+                        delay, overload_backoff_total, overload_giveup_seconds,
+                    )
+                    # Backoff waits must not count as "no progress" (mirror rate-limit).
+                    no_progress_count = max(0, no_progress_count - 1)
+                    # Best-effort credential refresh, but never skip the backoff.
+                    if self.agent_runner.refresh_container_credentials():
+                        logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                        orchestrator_logger.info("🔑 Credentials refreshed from host (overload backoff still required)")
+                    time.sleep(delay)
+                    overload_backoff_total += delay
+                    overload_backoff_step = min(overload_backoff_step * 2, overload_backoff_cap)
+                    # Session is still valid - resume it (overload is external, not a session problem).
+                    continue
                 # Check if this was a rate limit - sleep until reset
                 if self.agent_runner._last_rate_limit:
                     reset_secs = self.agent_runner._rate_limit_reset_seconds
@@ -1387,6 +1874,20 @@ class E2ETrialRunner:
             elif wait_result == "all_done":
                 logger.info("All evaluations complete!")
                 break
+            elif wait_result == "watcher_dead":
+                # #20: the watcher thread died (persistently failing iterations
+                # escalated, or an exception escaped its loop). Nobody evaluates
+                # tags anymore, so recovery rounds would only burn agent cost and
+                # the no-progress budget. Abort loudly; --resume-trial restarts
+                # the watcher and re-primes pending debounce/evaluations from
+                # resume_state.
+                watcher_died = True
+                logger.error(
+                    "⛔ Watcher thread died — aborting trial. Resume with:\n"
+                    "    python -m harness.e2e.run_e2e --resume-trial %s",
+                    self.orchestrator.trial_root,
+                )
+                break
             elif wait_result == "agent_incomplete":
                 # Agent didn't complete all milestones - try to recover
                 # No new tasks, but may have untagged commits to remind about
@@ -1418,7 +1919,11 @@ class E2ETrialRunner:
         # Stop watcher
         self.watcher_stop_event.set()
 
-        if dag.is_done():
+        # #20: a dead watcher means in-flight evaluation results were never
+        # processed into the summary, so a "done" DAG (early-unblock marks
+        # milestones complete before their evaluations land) must NOT be
+        # reported as a successful trial — resume reconciles the results.
+        if dag.is_done() and not watcher_died:
             _set_last_run_summary("all_done")
             logger.info("=" * 70)
             logger.info("E2E Trial COMPLETED")
@@ -1429,7 +1934,12 @@ class E2ETrialRunner:
             logger.info("=" * 70)
             return True
         else:
-            stop_reason = "no_progress_limit" if no_progress_count >= max_no_progress_attempts else "incomplete"
+            if watcher_died:
+                stop_reason = "watcher_dead"
+            elif no_progress_count >= max_no_progress_attempts:
+                stop_reason = "no_progress_limit"
+            else:
+                stop_reason = "incomplete"
             _set_last_run_summary(stop_reason)
             remaining = dag.all_milestones - dag.completed_milestones - dag.failed_milestones - dag.skipped_milestones
             logger.warning("=" * 70)
@@ -1753,19 +2263,88 @@ def _run_resume_mode(args):
 
     # Extract config from original metadata, allow CLI overrides
     metadata = trial_state.original_config
+    metadata_schema = metadata.get("trial_metadata_schema_version", 1)
+    runtime_policy_binding = None
+    if (
+        "runtime_policy_binding" in metadata
+        or (
+            isinstance(metadata_schema, int)
+            and not isinstance(metadata_schema, bool)
+            and metadata_schema
+            >= TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING
+        )
+    ):
+        runtime_policy_binding = load_trial_runtime_policy_binding(
+            trial_root,
+            metadata,
+            expected_repo_name=metadata.get("repo_name"),
+        )
+        _activate_runtime_policy(runtime_policy_binding)
+        logger.info(
+            "Resume: restored trial-pinned runtime policy %s (%s)",
+            runtime_policy_binding.sha256,
+            runtime_policy_binding.mode,
+        )
+    else:
+        # Explicit legacy compatibility only.  These results remain labelled
+        # legacy-live and are not promotion-grade.
+        from harness.e2e.quarantine import metadata_wants_unprotected
+
+        if metadata_wants_unprotected(metadata):
+            os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+            logger.info(
+                "Resume: legacy trial was launched --unprotected; keeping it open"
+            )
+        logger.warning(
+            "Resume: legacy trial has no pinned runtime policy; live policy "
+            "recovery is forensic-only and must not be mixed into a promotion"
+        )
     # --model override for resume (e.g., fix a wrong model after fatal error)
     if getattr(args, '_model_explicitly_set', False):
         logger.info(f"Overriding model: {metadata.get('model')} → {args.model}")
         metadata["model"] = args.model
+    requested_agent_version = metadata.get("requested_agent_version")
     workspace_root = Path(metadata["workspace_root"]).resolve()
+    _preflight_filter_lists(workspace_root)
 
-    # Load workspace metadata (needed for orchestrator)
-    workspace_metadata = load_workspace_metadata(workspace_root)
-    repo_src_dirs = workspace_metadata["repo_src_dirs"]
-    test_dirs = workspace_metadata["test_dirs"]
-    exclude_patterns = workspace_metadata["exclude_patterns"]
-    generated_patterns = workspace_metadata.get("generated_patterns", [])
-    modifiable_test_patterns = workspace_metadata.get("modifiable_test_patterns", [])
+    repo_config_binding = load_trial_repo_config_binding(
+        trial_root,
+        metadata,
+        expected_repo_name=metadata.get("repo_name"),
+    )
+    if repo_config_binding is None:
+        logger.warning(
+            "Resume: legacy trial has no pinned repository config; results are "
+            "forensic/legacy-unbound and must not be mixed into a pinned promotion"
+        )
+
+    # New trials persist the complete snapshot-authority filter.  Resume must
+    # not rebuild it from a live metadata.json, because a dataset edit between
+    # fresh and resume would otherwise change which submitted files exist in
+    # later snapshots.  Legacy trials retain their historical fallback.
+    if repo_config_binding is not None:
+        required_capture_fields = ("repo_src_dirs", "test_dirs", "exclude_patterns")
+        missing_capture_fields = [
+            field for field in required_capture_fields if field not in metadata
+        ]
+        if missing_capture_fields:
+            raise RuntimeError(
+                "Pinned trial metadata is missing snapshot capture field(s): "
+                + ", ".join(missing_capture_fields)
+            )
+        repo_src_dirs = metadata["repo_src_dirs"]
+        test_dirs = metadata["test_dirs"]
+        exclude_patterns = metadata["exclude_patterns"]
+        generated_patterns = metadata.get("generated_patterns", [])
+        modifiable_test_patterns = metadata.get("modifiable_test_patterns", [])
+        logger.info("Resume: using trial-persisted snapshot capture filter")
+    else:
+        workspace_metadata = load_workspace_metadata(workspace_root)
+        repo_src_dirs = workspace_metadata["repo_src_dirs"]
+        test_dirs = workspace_metadata["test_dirs"]
+        exclude_patterns = workspace_metadata["exclude_patterns"]
+        generated_patterns = workspace_metadata.get("generated_patterns", [])
+        modifiable_test_patterns = workspace_metadata.get("modifiable_test_patterns", [])
 
     # Resolve dag_path from original metadata or default
     dag_path_str = metadata.get("dag_path")
@@ -1806,8 +2385,11 @@ def _run_resume_mode(args):
         exclude_patterns=exclude_patterns,
         generated_patterns=generated_patterns,
         modifiable_test_patterns=modifiable_test_patterns,
-        api_router=metadata.get("api_router", metadata.get("drop_params", False)),
         reasoning_effort=metadata.get("reasoning_effort"),
+        agent_version=requested_agent_version,
+        build_failure_fail_closed=metadata.get("build_failure_fail_closed"),
+        repo_config_binding=repo_config_binding,
+        runtime_policy_binding=runtime_policy_binding,
     )
 
     # Prepare agent output directory (reuse existing)
@@ -1834,8 +2416,55 @@ def _run_resume_mode(args):
     sys.exit(0 if success else 1)
 
 
+def _preflight_filter_lists(workspace_root: Path) -> None:
+    """Refuse to start (or resume) a trial whose data workspace carries a
+    defective filter list.
+
+    ``test_results/<MID>/<MID>_filter_list.json`` entries are waivers applied
+    to every cell of the milestone; an id that is not in the classification's
+    bucket (or is listed twice, or under an unsupported schema version) would
+    lower ``pass_to_pass_required`` without removing an obligation
+    (``filter_evaluation_result`` subtracts a count). The evaluator also
+    refuses to write a filtered result for such a list, but that surfaces per
+    cell hours later; here it stops the run before any trial state exists.
+    """
+    from harness.e2e.evaluator import validate_workspace_filter_lists
+
+    errors = validate_workspace_filter_lists(Path(workspace_root))
+    if not errors:
+        return
+    for mid, errs in sorted(errors.items()):
+        for err in errs[:10]:
+            logger.error(f"filter list rejected: {err}")
+        if len(errs) > 10:
+            logger.error(f"filter list rejected: {mid}: ... {len(errs) - 10} more")
+    logger.error(
+        f"{len(errors)} filter list(s) under {workspace_root}/test_results are invalid; "
+        "fix the data (every listed id must be in its classification bucket, no duplicates, "
+        "version 1) before starting a trial"
+    )
+    sys.exit(1)
+
+
+def _preflight_ast_grep() -> None:
+    """Refuse to start a trial whose Rust evaluations would fail closed.
+
+    ast-grep is resolved next to the interpreter (with a PATH fallback), so
+    this only trips when the environment genuinely lacks ast-grep-cli — the
+    codex_gpt-5.6-sol_003/_004 launches surfaced that gap hours later, at
+    evaluation time, as 23 errored nushell cells.
+    """
+    try:
+        ensure_ast_grep()
+    except RustTestDetectionError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+
 def main():
+    reject_legacy_env()  # legacy EVOCLAW_* -> hard error with rename map
     setup_logging()
+    _preflight_ast_grep()
     parser = argparse.ArgumentParser(
         description="Run End-to-End Agent Trial (Continuous Task Queue Mode with Recovery)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1855,6 +2484,24 @@ Example:
     parser.add_argument("--repo-name", default=None, help="Repository name (required for fresh start)")
     parser.add_argument("--milestone-version", default="test_multi_stage_v2", help="Milestone version string")
     parser.add_argument("--image", default=None, help="Base docker image for agent (required for fresh start)")
+    parser.add_argument(
+        "--unprotected",
+        action="store_true",
+        help="Bypass the quarantine fail-closed guard (run a repo that has a "
+        "policy WITHOUT applying it — scores may be tainted). Normally you launch "
+        "via scripts/run_all.py, which applies the policy and runs the gate.",
+    )
+    parser.add_argument(
+        "--expected-runtime-policy-sha256",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--expected-runtime-policy-mode",
+        choices=["protected", "absent", "unprotected"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
     # Paths (required for fresh start, optional for resume)
     parser.add_argument(
@@ -1879,6 +2526,12 @@ Example:
         help="Agent framework to use (default: claude-code)",
     )
     parser.add_argument("--model", default="claude-sonnet-4-5-20250929", help="Claude model ID")
+    parser.add_argument(
+        "--agent-version",
+        type=validate_claude_code_version,
+        default=None,
+        help="Claude Code CLI version to install: an exact version (for example 2.1.158), stable, or latest.",
+    )
     parser.add_argument("--prompt-version", default="v2", help="Prompt template version (e.g., v1 or v2)")
     parser.add_argument(
         "--milestones",
@@ -1911,6 +2564,27 @@ Example:
         default=None,
         help="Path to e2e_config.yaml (default: search in workspace-root, then harness/e2e/)",
     )
+    build_failure_policy = parser.add_mutually_exclusive_group()
+    build_failure_policy.add_argument(
+        "--allow-partial-build-reports",
+        dest="build_failure_fail_closed",
+        action="store_false",
+        help=(
+            "On deterministic compilation/build failures, score reports from "
+            "packages/modules that completed. Timeouts and nonzero outer-runner "
+            "exits remain fail-closed."
+        ),
+    )
+    build_failure_policy.add_argument(
+        "--fail-closed-build-reports",
+        dest="build_failure_fail_closed",
+        action="store_true",
+        help=(
+            "Strict opt-in: reject partial reports after deterministic "
+            "compilation/build failures."
+        ),
+    )
+    parser.set_defaults(build_failure_fail_closed=None)
 
     # Trial naming
     parser.add_argument(
@@ -1930,20 +2604,6 @@ Example:
         "--remove-container",
         action="store_true",
         help="Remove container after trial completes (default: keep container running)",
-    )
-
-    parser.add_argument(
-        "--api-router",
-        action="store_true",
-        help="Deploy the vendored claude-code-router-py inside the container to "
-        "translate Anthropic Messages API to OpenAI format. Only applies to "
-        "claude-code agent.",
-    )
-
-    parser.add_argument(
-        "--drop-params",
-        action="store_true",
-        help="Deprecated: use --api-router instead.",
     )
 
     parser.add_argument(
@@ -1967,11 +2627,35 @@ Example:
 
     args = parser.parse_args()
 
+    if (args.expected_runtime_policy_sha256 is None) != (
+        args.expected_runtime_policy_mode is None
+    ):
+        parser.error(
+            "--expected-runtime-policy-sha256 and "
+            "--expected-runtime-policy-mode must be provided together"
+        )
+
+    # --unprotected: signal ContainerSetup NOT to recover quarantine from policy
+    # (operator explicitly wants an open baseline run) — covers fresh AND resume,
+    # both of which construct ContainerSetup (F2-b).
+    if getattr(args, "unprotected", False):
+        os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+
     # Track whether --model was explicitly provided (vs default)
     args._model_explicitly_set = '--model' in sys.argv
 
     # Handle resume mode
     if args.resume_trial:
+        if args.expected_runtime_policy_sha256 is not None:
+            parser.error(
+                "expected runtime-policy identity is fresh-worker-only; resume "
+                "uses the trial-frozen binding"
+            )
+        if args.agent_version:
+            parser.error(
+                "--agent-version cannot change an existing container during --resume-trial; "
+                "the version recorded by the original trial is reused"
+            )
         _run_resume_mode(args)
         return
 
@@ -1988,13 +2672,62 @@ Example:
 
     if missing_args:
         parser.error(f"the following arguments are required for fresh start: {', '.join(missing_args)}")
+    if args.agent_version and args.agent not in ("claude-code", "codex", "gemini-cli"):
+        parser.error(
+            "--agent-version is supported only with --agent claude-code, codex, or gemini-cli"
+        )
+
+    # Resolve the complete runtime policy once, before any container exists.
+    # This replaces any partial/stale inherited marker environment and gives a
+    # direct run_e2e launch the same policy as scripts/run_all.py.
+    project_root = Path(__file__).resolve().parent.parent.parent
+    resolved_runtime_policy = resolve_runtime_policy(
+        args.repo_name,
+        project_root,
+        unprotected=args.unprotected,
+    )
+    verify_expected_runtime_policy(
+        resolved_runtime_policy,
+        expected_sha256=args.expected_runtime_policy_sha256,
+        expected_mode=args.expected_runtime_policy_mode,
+    )
+    if resolved_runtime_policy.mode == RUNTIME_POLICY_MODE_PROTECTED:
+        policy_errors = runtime_policy_coverage_errors(resolved_runtime_policy)
+        if policy_errors:
+            for error in policy_errors:
+                logger.error(error)
+            raise RuntimePolicyBindingError(
+                "runtime policy failed quarantine coverage validation"
+            )
+    _activate_runtime_policy(resolved_runtime_policy)
+
+    from harness.e2e.quarantine import quarantine_guard_error_from_config
+
+    _guard = quarantine_guard_error_from_config(
+        args.repo_name,
+        (
+            resolved_runtime_policy.policy
+            if resolved_runtime_policy.source_path is not None
+            else None
+        ),
+        quarantine_active=bool(os.environ.get("SWE_MILESTONE_QUARANTINE")),
+        unprotected=args.unprotected,
+    )
+    if _guard:
+        logger.error(_guard)
+        sys.exit(1)
 
     # Setup Paths
     workspace_root = args.workspace_root.resolve()
+    _preflight_filter_lists(workspace_root)
+    resolved_repo_config = resolve_repo_config(args.repo_name, workspace_root)
 
     # Load workspace metadata (repo_src_dirs, test_dirs, exclude_patterns)
     # These fields are required and will raise an error if missing
-    workspace_metadata = load_workspace_metadata(workspace_root)
+    workspace_metadata = load_workspace_metadata(
+        workspace_root,
+        repo_config=dict(resolved_repo_config.config),
+    )
     repo_src_dirs = workspace_metadata["repo_src_dirs"]
     test_dirs = workspace_metadata["test_dirs"]
     exclude_patterns = workspace_metadata["exclude_patterns"]
@@ -2018,6 +2751,24 @@ Example:
     # Create e2e_trial directory for all trials
     e2e_trial_dir = workspace_root / "e2e_trial"
     e2e_trial_dir.mkdir(parents=True, exist_ok=True)
+
+    # Benchmark-version gate (docs/versioning.md): verify the data checkout
+    # (workspace_root lives inside the data repo) and the image tag against
+    # the pinned version BEFORE any trial state exists — an explicit-pin
+    # refusal must not leave behind a populated trial dir that blocks the
+    # retry. The verdicts are persisted into trial_metadata below so the
+    # version a score belongs to is recorded, not inferred.
+    from harness.e2e.data_version import (
+        check_data_version,
+        check_image_tag_consistency,
+    )
+
+    version_meta = check_data_version(Path(args.workspace_root), context="run_e2e")
+    image_check_meta = (
+        check_image_tag_consistency(str(args.image), context="run_e2e")
+        if args.image
+        else None
+    )
 
     # Generate next trial name with auto-incrementing suffix
     trial_base_name = args.trial_name if args.trial_name else "agent_run"
@@ -2107,6 +2858,16 @@ Example:
     logger.info(f"Trial artifacts path: {trial_root}")
     trial_root.mkdir(parents=True, exist_ok=True)
 
+    # Freeze the exact repository evaluation config before any milestone is
+    # captured.  Every worker and resume path consumes this byte-identical
+    # copy, so a live data-root YAML edit cannot switch semantics mid-trial.
+    repo_config_binding = freeze_repo_config(trial_root, resolved_repo_config)
+    runtime_policy_binding = freeze_runtime_policy(
+        trial_root,
+        resolved_runtime_policy,
+    )
+    _activate_runtime_policy(runtime_policy_binding)
+
     # Copy config and selected_milestone_ids to trial directory
     import shutil
 
@@ -2178,16 +2939,52 @@ Example:
     _tmp_framework = get_agent_framework(args.agent, **_framework_kwargs)
     effective_reasoning_effort = _tmp_framework.get_effective_reasoning_effort()
 
+    # Resolve once and persist so resume cannot silently change scoring policy
+    # when the workspace/default config changes later.
+    from harness.e2e.config import E2EConfig
+
+    effective_build_failure_fail_closed = args.build_failure_fail_closed
+    if effective_build_failure_fail_closed is None:
+        effective_build_failure_fail_closed = E2EConfig(trial_config_path).build_failure_fail_closed
+
     trial_metadata = {
+        "trial_metadata_schema_version": (
+            TRIAL_METADATA_SCHEMA_VERSION_WITH_RUNTIME_POLICY_BINDING
+        ),
         "trial_name": trial_name,
         "repo_name": args.repo_name,
         "milestone_version": args.milestone_version,
+        # Benchmark version this trial claims to run on (vX.Y, the image tag —
+        # docs/versioning.md), plus the verified state of the data checkout
+        # and of the image tag (a :latest fallback shows up here as a
+        # structured mismatch, not just a transient launch warning).
+        "benchmark_version": version_meta["benchmark_version"],
+        "data_version": version_meta["data_version"],
+        "image_tag_check": image_check_meta,
         "image": args.image,
         "model": args.model,
         "agent_name": args.agent,
+        # The requested selector is known before container startup; the actual
+        # numeric version is detected and filled after initialization.
+        "requested_agent_version": args.agent_version,
+        "agent_version": None,
+        # Filled from docker container inspect after launch. A full image ID,
+        # unlike the user-facing tag, cannot be silently retargeted.
+        "agent_image_id": None,
         "prompt_version": args.prompt_version,
         "timeout_seconds": args.timeout,
         "reasoning_effort": effective_reasoning_effort,
+        "build_failure_fail_closed": effective_build_failure_fail_closed,
+        # Native claude-code context-compaction window in tokens. Set from the
+        # trial config `auto_compact_window` (propagated via the
+        # SWE_MILESTONE_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
+        # display it. None when the config doesn't set it.
+        "auto_compact_window": os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW"),
+        # Native claude-code Tool Search pin ("true"/"false"/"auto"/"auto:N").
+        # Set from the trial config `enable_tool_search` (propagated via the
+        # SWE_MILESTONE_ENABLE_TOOL_SEARCH env var). None = config didn't set it,
+        # claude-code's own endpoint-dependent default applies.
+        "enable_tool_search": os.environ.get("SWE_MILESTONE_ENABLE_TOOL_SEARCH"),
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,
@@ -2197,7 +2994,11 @@ Example:
         "dag_path": str(dag_path),
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
-        "api_router": args.api_router or args.drop_params,
+        # Persist --unprotected so a resumed open baseline stays open (isn't
+        # silently re-hardened by ContainerSetup's policy recovery on resume).
+        "unprotected": bool(args.unprotected),
+        "repo_config_binding": repo_config_binding.to_metadata(trial_root),
+        "runtime_policy_binding": runtime_policy_binding.to_metadata(trial_root),
     }
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:
@@ -2221,8 +3022,11 @@ Example:
         exclude_patterns=exclude_patterns,  # Exclude patterns for SrcFileFilter
         generated_patterns=generated_patterns,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns=modifiable_test_patterns,  # Test files agent can modify
-        api_router=args.api_router or args.drop_params,
         reasoning_effort=args.reasoning_effort,
+        agent_version=args.agent_version,
+        build_failure_fail_closed=effective_build_failure_fail_closed,
+        repo_config_binding=repo_config_binding,
+        runtime_policy_binding=runtime_policy_binding,
     )
 
     # Prepare agent output directory
@@ -2246,7 +3050,38 @@ Example:
     )
 
     success = trial.run()
-    sys.exit(0 if success else 1)
+    _exit_after_thread_teardown(0 if success else 1)
+
+
+def _exit_after_thread_teardown(exit_code: int, join_budget_seconds: float = 120.0) -> None:
+    """Exit without letting stray non-daemon threads zombify the worker.
+
+    ThreadPoolExecutor workers are non-daemon and concurrent.futures registers
+    an atexit hook that joins them, so a plain sys.exit can hang the process
+    indefinitely on an abandoned in-flight evaluation (observed as workers
+    stuck in futex_wait for hours after "Cleanup complete"). Give stragglers a
+    bounded join, then force the exit — an abandoned evaluation either finished
+    its atomic result write (reconciled on next resume) or left nothing behind.
+    """
+    deadline = time.time() + join_budget_seconds
+    current = threading.current_thread()
+    for thread in threading.enumerate():
+        if thread is current or thread.daemon:
+            continue
+        thread.join(timeout=max(0.0, deadline - time.time()))
+    stragglers = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread is not current and not thread.daemon and thread.is_alive()
+    ]
+    if stragglers:
+        logger.warning(
+            f"Forcing exit (code {exit_code}) with {len(stragglers)} stuck "
+            f"non-daemon thread(s) after {join_budget_seconds:.0f}s: {stragglers}"
+        )
+        logging.shutdown()
+        os._exit(exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

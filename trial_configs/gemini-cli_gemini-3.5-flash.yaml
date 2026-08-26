@@ -1,19 +1,13 @@
-data_root: /data2/gangda/EvoClaw-data
+data_root: ${SWE_MILESTONE_DATA_ROOT}
 trial_name: gemini-cli_gemini-3.5-flash
 agent: gemini-cli
-
-# Vertex AI mode (Route B): gemini-cli talks to Vertex directly using ADC copied
-# into the container (no proxy). Auth is ADC — run once on the host:
-#   gcloud auth application-default login
-# Then:  python scripts/run_all.py --config trial_configs/gemini-cli_gemini-3.5-flash.yaml
-# See docs/vertex-ai.md.
+# Vertex mode (Route B): direct ADC auth, no proxy. See docs/vertex-ai.md.
 model: gemini-3.5-flash
 vertex_ai: true
-vertex_location: global          # gemini-3.5-flash is served in `global`, not regional
-
-# gemini-cli runs thinkingLevel HIGH (dynamic budget) by default and has no
-# graded levels — only thinking on/off — so "high" is its built-in and maximum
-# reasoning level. Set explicitly so it's recorded and shown in the monitor.
+vertex_location: global
+# gemini-cli has no graded levels; "high" is its built-in maximum, set for the record.
 reasoning_effort: high
-
 timeout: 18000
+
+# Uncomment to pin the gemini-cli version instead of installing latest.
+# agent_version: 0.51.0

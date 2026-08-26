@@ -138,6 +138,7 @@ class GinkgoSuiteResult:
     succeeded: bool
     run_time_ns: int = 0
     specs: List[GinkgoSpecResult] = field(default_factory=list)
+    special_failure_reasons: List[str] = field(default_factory=list)
 
     @property
     def elapsed(self) -> float:
@@ -1082,6 +1083,10 @@ def parse_ginkgo_json_report(
             package=default_package,
             succeeded=suite_data.get("SuiteSucceeded", False),
             run_time_ns=suite_data.get("RunTime", 0),
+            special_failure_reasons=[
+                str(r)
+                for r in (suite_data.get("SpecialSuiteFailureReasons") or [])
+            ],
         )
 
         # Parse spec reports (may be None for non-Ginkgo packages)
