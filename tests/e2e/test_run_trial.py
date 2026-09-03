@@ -237,3 +237,37 @@ def test_image_tag_is_inherited_by_the_worker():
     assert "SWE_MILESTONE_IMAGE_TAG" in rt._INHERITED_ENV
     assert "SWE_MILESTONE_DATA_VERSION_CHECK" in rt._INHERITED_ENV
     assert "SWE_MILESTONE_BENCHMARK_VERSION" in rt._INHERITED_ENV
+
+
+def test_missing_repo_marks_the_result_incomplete():
+    """A repo that produced no trial directory is an unknown, not a zero: averaging over the
+    survivors would report a plausible score for a trial that never covered its repo set."""
+    t = rt.TrialResult(api_version="1.3", benchmark_version="v", harness_sha="", data_commit="",
+                       data_root="/d", trial_name="t", model="m", agent_version="v", base_url="u",
+                       agent_env={}, started_at="s", finished_at="f",
+                       repos_requested=["a", "b"], repos_missing=["b"], complete=False)
+    d = t.to_dict()
+    assert d["complete"] is False and d["repos_missing"] == ["b"]
+    assert d["repos_requested"] == ["a", "b"]
+    ok = rt.TrialResult(api_version="1.3", benchmark_version="v", harness_sha="", data_commit="",
+                        data_root="/d", trial_name="t", model="m", agent_version="v", base_url="u",
+                        agent_env={}, started_at="s", finished_at="f")
+    assert ok.complete is True and ok.repos_missing == []
+
+
+def test_repo_result_records_its_launch_mode(tmp_path):
+    ws = _make_repo(tmp_path)
+    _write_trial(ws, {"M1": _result(True)})
+    assert rt.aggregate_repo(ws, "t_001", worker_rc=0).mode == "fresh"
+    assert rt.aggregate_repo(ws, "t_001", worker_rc=None, mode="resume").mode == "resume"
+
+
+def test_agent_version_is_unpinned_by_default():
+    """run_all omits --agent-version when the config omits it; the seam must not invent a pin."""
+    import inspect
+    assert inspect.signature(rt.run_trial).parameters["agent_version"].default is None
+    assert not hasattr(rt, "DEFAULT_AGENT_VERSION")
+
+
+def test_residue_prune_is_inherited():
+    assert "SWE_MILESTONE_RESIDUE_PRUNE" in rt._INHERITED_ENV

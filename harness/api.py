@@ -1045,10 +1045,16 @@ def run_trial(repos=None, **kwargs):
 
     Keyword arguments (see harness.e2e.run_trial.run_trial): data_root (a
     WRITABLE checkout at BENCHMARK_VERSION), trial_name, base_url, model
-    (default slime-actor), agent_version (default 2.1.193), agent_env (extra
-    container variables applied LAST), timeout_s (default 18000), milestones
-    (dependency-closed prefix), parallel, out_root, reasoning_effort,
-    unprotected, dry_run, aggregate_only.
+    (default slime-actor), agent (default claude-code), agent_version (unset =
+    the launcher's own behaviour: no pin), agent_env (extra container variables
+    applied LAST), timeout_s (default 18000), milestones (dependency-closed
+    prefix), parallel, out_root, reasoning_effort, auto_compact_window,
+    enable_tool_search, build_failure_fail_closed, unprotected, dry_run,
+    aggregate_only.
+
+    The result is marked `complete=False` with `repos_missing` listed when a
+    requested repo produced no trial directory: its macro average then covers
+    only the rest and is not a trial-level score.
 
     The result carries per-milestone raw counters (test_summary), per-repo
     counts with one name per meaning (n_milestones / n_selected / n_graded /

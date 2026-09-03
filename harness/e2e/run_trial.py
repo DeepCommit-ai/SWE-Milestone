@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent   # harness/e2e/run_trial.py -> repo root
 DEFAULT_MODEL = "slime-actor"
-DEFAULT_AGENT_VERSION = "2.1.193"
 DEFAULT_TIMEOUT_S = 18000          # the leaderboard trial timeout
 # Host variables a worker may inherit. Everything else is set explicitly.
 _INHERITED_ENV = (
@@ -63,6 +62,7 @@ _INHERITED_ENV = (
     # data/image version knobs are deliberate operator choices and they MOVE THE SCORE
     # (the tag selects which images the trial boots); keep them visible to the worker.
     "SWE_MILESTONE_DATA_VERSION_CHECK", "SWE_MILESTONE_BENCHMARK_VERSION", "SWE_MILESTONE_IMAGE_TAG",
+    "SWE_MILESTONE_RESIDUE_PRUNE",   # scoring override read by the evaluator
 )
 
 
@@ -107,6 +107,7 @@ class RepoResult:
     score: float
     recall: float
     precision: float
+    mode: str = "fresh"              # fresh | resume | completed | aggregate
     agent_exit: dict = field(default_factory=dict)   # {reason, wall_seconds, turns, cost_usd, worker_exit_code}
     official_summary: dict = field(default_factory=dict)  # compute_repo_summary verbatim (audit)
     milestones: List[MilestoneResult] = field(default_factory=list)
@@ -130,6 +131,9 @@ class TrialResult:
     macro: dict = field(default_factory=dict)
     micro: dict = field(default_factory=dict)
     mode: str = "run"                # run | resume | dry-run | aggregate-only
+    repos_requested: List[str] = field(default_factory=list)
+    repos_missing: List[str] = field(default_factory=list)   # requested but produced no result
+    complete: bool = True            # every requested repo produced a result
     result_path: str = ""            # where this JSON was written
     notes: List[str] = field(default_factory=list)
 
@@ -287,7 +291,8 @@ def _agent_exit(trial_dir: Path, worker_rc: Optional[int], graded_ids: List[str]
 
 
 # ───────────────────────────── aggregation ─────────────────────────────
-def aggregate_repo(ws: Path, trial_name: str, *, worker_rc: Optional[int] = None) -> RepoResult:
+def aggregate_repo(ws: Path, trial_name: str, *, worker_rc: Optional[int] = None,
+                   mode: str = "fresh") -> RepoResult:
     """One repo's TrialResult entry from the official aggregation code."""
     from harness.e2e import collect_results as cr  # noqa: PLC0415
 
@@ -399,6 +404,7 @@ def aggregate_repo(ws: Path, trial_name: str, *, worker_rc: Optional[int] = None
         score=float(official.get("score_reliable") or 0.0) / 100.0,
         recall=float(official.get("recall") or 0.0) / 100.0,
         precision=float(official.get("precision") or 0.0) / 100.0,
+        mode=mode,
         agent_exit=_agent_exit(trial_dir, worker_rc, graded_ids, summary, stats),
         official_summary={k: v for k, v in official.items() if k != "error"},
         milestones=milestones,
@@ -478,7 +484,7 @@ def _preflight(data_root: Path, repos: List[Path], policies: dict, *, launch: bo
 
 def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, base_url: str,
               model: str = DEFAULT_MODEL, agent: str = "claude-code",
-              agent_version: str = DEFAULT_AGENT_VERSION,
+              agent_version: Optional[str] = None,
               agent_env: Optional[Dict[str, str]] = None, timeout_s: int = DEFAULT_TIMEOUT_S,
               milestones: Optional[str] = None, parallel: int = 7, out_root: Optional[str] = None,
               reasoning_effort: Optional[str] = None, auto_compact_window: Optional[int] = None,
@@ -518,6 +524,12 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
     # exactly that reason; gating a resume would let a later policy edit strand a running trial.
     resuming = {repo.name: (repo / "e2e_trial" / trial_name / "trial_metadata.json").exists()
                 for repo in repo_paths}
+    # A trial whose DAG is already complete is not relaunched: run_all skips it and aggregates
+    # what is on disk, and relaunching one whose container was since removed fails resume
+    # validation for no reason.
+    completed = {repo.name: bool(resuming[repo.name])
+                 and run_all.is_trial_completed(repo / "e2e_trial" / trial_name)
+                 for repo in repo_paths}
     policies = {}
     for repo in repo_paths:
         policy = resolve_runtime_policy(repo.name, root, unprotected=unprotected)
@@ -544,14 +556,21 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
     mode = "aggregate-only" if aggregate_only else "dry-run" if dry_run else "run"
     plans: List[dict] = []
     for repo in repo_paths:
+        if completed.get(repo.name):
+            notes.append(f"{repo.name}: trial already complete; not relaunched")
+            continue
         policy = policies[repo.name]
         cmd, cmd_mode = run_all.build_cmd(
             repo, agent, model, int(timeout_s), trial_name,
             reasoning_effort, agent_version, False,
             milestones, root, bool(build_failure_fail_closed), runtime_policy=policy,
         )
+        # On a resume the worker restores the binding frozen in trial_metadata.json, so the LIVE
+        # policy must not be injected: run_all passes None for exactly this reason, and a policy
+        # edited after launch would otherwise strand a running trial.
         env = worker_env(data_root=data_root_p, base_url=base_url, model=model, trial_name=trial_name,
-                         repo_name=repo.name, agent_env=agent_env, policy=policy,
+                         repo_name=repo.name, agent_env=agent_env,
+                         policy=None if cmd_mode == "resume" else policy,
                          auto_compact_window=auto_compact_window, enable_tool_search=enable_tool_search)
         plans.append({"repo": repo.name, "cmd": cmd, "mode": cmd_mode, "env": env,
                       "image": image_for_runtime_policy(policy)})
@@ -585,19 +604,35 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
             t.join()
 
     repo_results: List[RepoResult] = []
+    missing: List[str] = []
     if not dry_run:
         for repo in repo_paths:
             trial_dir = repo / "e2e_trial" / trial_name
             if not trial_dir.exists():
-                notes.append(f"{repo.name}: no trial directory {trial_dir}")
+                # A repo that never produced a trial directory is NOT a zero, it is an unknown.
+                # Averaging over the survivors would report a plausible score for a trial that
+                # never covered its repo set, so it is recorded and the result is marked
+                # incomplete; the consumer decides whether to report or retry.
+                notes.append(f"{repo.name}: no trial directory {trial_dir} (worker rc="
+                             f"{worker_rcs.get(repo.name)})")
+                missing.append(repo.name)
                 continue
-            repo_results.append(aggregate_repo(repo, trial_name, worker_rc=worker_rcs.get(repo.name)))
+            repo_mode = ("completed" if completed.get(repo.name)
+                         else "aggregate" if aggregate_only
+                         else "resume" if resuming.get(repo.name) else "fresh")
+            repo_results.append(aggregate_repo(repo, trial_name, worker_rc=worker_rcs.get(repo.name),
+                                               mode=repo_mode))
     macro, micro = aggregate(repo_results)
+    if missing:
+        logger.error("run_trial: %d of %d requested repo(s) produced no result: %s. The macro "
+                     "average below covers only the rest and is NOT a trial-level score.",
+                     len(missing), len(repo_paths), ", ".join(missing))
     result = TrialResult(
         api_version=api.API_VERSION, benchmark_version=bench, harness_sha=_git(root, "rev-parse", "HEAD"),
         data_commit=data_commit, data_root=str(data_root_p), trial_name=trial_name, model=model,
         agent_version=agent_version, base_url=base_url, agent_env=agent_env, started_at=started,
         finished_at=_now(), repos=repo_results, macro=macro, micro=micro, mode=mode, notes=notes,
+        repos_requested=[r.name for r in repo_paths], repos_missing=missing, complete=not missing,
     )
     if dry_run:
         result.notes.append("dry-run: nothing launched")
