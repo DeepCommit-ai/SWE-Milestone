@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 #    consumer-built container (iptables allowlist + registry denies + offline
 #    package managers) and verifies it; allow_endpoints admits the policy server.
 #  - run_trial() is the CTE entry point: the official run_e2e per repo, official
-#    aggregation, one TrialResult.
+#    aggregation, one TrialResult. session_key() / repo_image() / discover_repos()
+#    are its companions, so a consumer never has to reach past this module.
 #  - Seam env names follow the harness rename: SWE_MILESTONE_DATA_ROOT,
 #    SWE_MILESTONE_EXEC_USER / _HOME. Any EVOCLAW_* variable is a hard error.
 API_VERSION = "1.3"
@@ -1056,6 +1057,31 @@ def run_trial(repos=None, **kwargs):
     harness sha, data commit, agent_env)."""
     from harness.e2e.run_trial import run_trial as _impl  # noqa: PLC0415
     return _impl(repos, **kwargs)
+
+
+def session_key(trial_name: str, repo_name: str) -> str:
+    """The per-repo API key a CTE trial gives its containers, which is also the session id the
+    policy endpoint sees (claude-code sends it as `x-api-key`). A consumer that wants to
+    pre-register those sessions needs the exact string; do not re-derive the format."""
+    from harness.e2e.run_trial import session_key as _impl  # noqa: PLC0415
+    return _impl(trial_name, repo_name)
+
+
+def repo_image(repo: str, *, unprotected: bool = False, project_root=None) -> str:
+    """The image the harness boots for `repo`: the repo-level offline closure under a protected
+    runtime policy, the plain base image otherwise. Ask this rather than formatting the name, so
+    a policy change cannot silently leave a consumer pre-pulling the wrong image."""
+    from harness.e2e.runtime_policy_binding import (  # noqa: PLC0415
+        image_for_runtime_policy, resolve_runtime_policy)
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    return image_for_runtime_policy(resolve_runtime_policy(repo, root, unprotected=unprotected))
+
+
+def discover_repos(data_root, repos=None) -> list:
+    """Repo directory names under `data_root`, filtered by substring the way the launcher does
+    (`scripts/run_all.py --repos`). Returns names, not paths."""
+    from harness.e2e.run_trial import _load_run_all  # noqa: PLC0415
+    return [p.name for p in _load_run_all().discover_repos(Path(data_root), list(repos) if repos else None)]
 
 
 def __getattr__(name: str):

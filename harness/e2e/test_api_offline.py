@@ -531,3 +531,15 @@ def test_evaluate_other_runtime_errors_propagate(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluator, "PatchEvaluator", Boom)
     with pytest.raises(RuntimeError, match="docker"):
         api.evaluate(tr, tmp_path / "a.tar", scratch=tmp_path / "s", data_root=str(root))
+
+
+def test_seam_exposes_the_cte_companions(tmp_path):
+    """A consumer must never have to import harness.e2e.* directly (the module docstring's
+    contract): everything the CTE lane needs is on harness.api."""
+    assert api.session_key("t_001", "repo_x") == "t_001/repo_x"
+    root = tmp_path / "data"
+    _make_tree(root)
+    assert api.discover_repos(root) == ["myrepo"]
+    assert api.discover_repos(root, ["nomatch"]) == []
+    img = api.repo_image("myrepo", unprotected=True, project_root=tmp_path)
+    assert img.startswith("swe-milestone/myrepo__base")
