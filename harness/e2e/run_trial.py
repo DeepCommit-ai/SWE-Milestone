@@ -60,8 +60,9 @@ _INHERITED_ENV = (
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
     "VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONUNBUFFERED",
-    # data-version escape hatches are deliberate operator choices; keep them visible
-    "SWE_MILESTONE_DATA_VERSION_CHECK", "SWE_MILESTONE_BENCHMARK_VERSION",
+    # data/image version knobs are deliberate operator choices and they MOVE THE SCORE
+    # (the tag selects which images the trial boots); keep them visible to the worker.
+    "SWE_MILESTONE_DATA_VERSION_CHECK", "SWE_MILESTONE_BENCHMARK_VERSION", "SWE_MILESTONE_IMAGE_TAG",
 )
 
 
@@ -129,6 +130,7 @@ class TrialResult:
     macro: dict = field(default_factory=dict)
     micro: dict = field(default_factory=dict)
     mode: str = "run"                # run | resume | dry-run | aggregate-only
+    result_path: str = ""            # where this JSON was written
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -159,6 +161,16 @@ def _git(path: Path, *args: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def session_key(trial_name: str, repo_name: str) -> str:
+    """The per-repo API key, which is also the policy endpoint's session id.
+
+    The worker exports it as UNIFIED_API_KEY; the harness maps that to ANTHROPIC_API_KEY and
+    claude-code sends it as the `x-api-key` header, which is what an Anthropic-compatible
+    adapter keys its sessions by. Exposed so a consumer can pre-register those sessions with
+    its own per-session settings instead of re-deriving the format."""
+    return f"{trial_name}/{repo_name}"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -175,8 +187,15 @@ def _parse_ts(value: Any) -> Optional[datetime]:
 
 
 def worker_env(*, data_root: Path, base_url: str, model: str, trial_name: str, repo_name: str,
-               agent_env: Optional[Dict[str, str]], policy, host_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """The explicit environment of one per-repo worker (see module docstring)."""
+               agent_env: Optional[Dict[str, str]], policy, host_env: Optional[Dict[str, str]] = None,
+               auto_compact_window: Optional[int] = None,
+               enable_tool_search: Optional[str] = None) -> Dict[str, str]:
+    """The explicit environment of one per-repo worker (see module docstring).
+
+    `auto_compact_window` / `enable_tool_search` are the two score-moving knobs `run_all.py`
+    exports from the trial config (SWE_MILESTONE_AUTO_COMPACT_WINDOW / _ENABLE_TOOL_SEARCH).
+    They are set here for the same reason: unset means claude-code's own default, which is
+    version dependent, so two trials that differ in them are not comparable."""
     from harness.e2e.runtime_policy_binding import runtime_policy_subprocess_env  # noqa: PLC0415
     src = os.environ if host_env is None else host_env
     base: Dict[str, str] = {k: src[k] for k in _INHERITED_ENV if k in src}
@@ -186,8 +205,12 @@ def worker_env(*, data_root: Path, base_url: str, model: str, trial_name: str, r
     base["PYTHONPATH"] = py
     base["SWE_MILESTONE_DATA_ROOT"] = str(data_root)
     base["UNIFIED_BASE_URL"] = base_url
-    base["UNIFIED_API_KEY"] = f"{trial_name}/{repo_name}"       # per-repo session key (x-api-key)
+    base["UNIFIED_API_KEY"] = session_key(trial_name, repo_name)   # per-repo session key (x-api-key)
     base["UNIFIED_DEFAULT_AGENT_MODEL"] = model                   # every class-based model slot
+    if auto_compact_window:
+        base["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(int(auto_compact_window))
+    if enable_tool_search is not None:
+        base["SWE_MILESTONE_ENABLE_TOOL_SEARCH"] = str(enable_tool_search)
     if agent_env:
         base["SWE_MILESTONE_AGENT_ENV"] = json.dumps({str(k): str(v) for k, v in agent_env.items()})
     assert not any(k.startswith("EVOCLAW_") for k in base)
@@ -349,7 +372,14 @@ def aggregate_repo(ws: Path, trial_name: str, *, worker_rc: Optional[int] = None
                 "total")},
             **common))
 
-    n_graded = int(official.get("graded") or len(graded_ids))
+    def _official(key, fallback):
+        """compute_repo_summary's value, or the locally counted one when it is absent.
+        `or` would be wrong: a legitimate 0 (no resolved cell, no infra-invalid cell) must not
+        fall back to the local count."""
+        value = official.get(key)
+        return fallback if value is None else int(value)
+
+    n_graded = _official("graded", len(graded_ids))
     image_ref = ""
     meta_path = trial_dir / "trial_metadata.json"
     if meta_path.exists():
@@ -361,10 +391,10 @@ def aggregate_repo(ws: Path, trial_name: str, *, worker_rc: Optional[int] = None
         repo=ws.name, image_ref=image_ref, trial_dir=str(trial_dir),
         n_milestones=len(csv_ids) if csv_ids else len(universe),
         n_selected=len(universe), n_graded=n_graded,
-        n_evaluated=int(official.get("evaluated") or n_evaluated),
+        n_evaluated=_official("evaluated", n_evaluated),
         n_submitted=n_submitted, n_unfinished=max(n_graded - n_submitted, 0),
-        n_infra_invalid=int(official.get("infra_invalid") or n_infra), n_scoring_blocked=n_blocked,
-        n_resolved=int(official.get("resolved") or n_resolved),
+        n_infra_invalid=_official("infra_invalid", n_infra), n_scoring_blocked=n_blocked,
+        n_resolved=_official("resolved", n_resolved),
         resolve_rate=float(official.get("resolve_pct") or 0.0) / 100.0,
         score=float(official.get("score_reliable") or 0.0) / 100.0,
         recall=float(official.get("recall") or 0.0) / 100.0,
@@ -406,7 +436,8 @@ def aggregate(repos: List[RepoResult]) -> tuple[dict, dict]:
 
 
 # ───────────────────────────── preflight + launch ─────────────────────────────
-def _preflight(data_root: Path, repos: List[Path], policies: dict, *, launch: bool) -> tuple[str, str, List[str]]:
+def _preflight(data_root: Path, repos: List[Path], policies: dict, *, launch: bool,
+               resuming: Optional[Dict[str, bool]] = None) -> tuple[str, str, List[str]]:
     """Fail loud before spending a container. Returns (benchmark_version, data_commit, notes)."""
     from harness.api import reject_legacy_env  # noqa: PLC0415
     from harness.e2e.data_version import check_data_version  # noqa: PLC0415
@@ -437,6 +468,8 @@ def _preflight(data_root: Path, repos: List[Path], policies: dict, *, launch: bo
             raise RuntimeError(f"run_trial: data_root must be a WRITABLE checkout (trial artifacts are "
                                f"written under <repo>/e2e_trial/): {data_root}")
         for repo in repos:
+            if resuming and resuming.get(repo.name):
+                continue     # a resume boots the image frozen in trial_metadata, not this one
             image = image_for_runtime_policy(policies[repo.name])
             if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
                 raise RuntimeError(f"run_trial: image not present locally: {image} (scripts/pull_images.sh)")
@@ -444,11 +477,13 @@ def _preflight(data_root: Path, repos: List[Path], policies: dict, *, launch: bo
 
 
 def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, base_url: str,
-              model: str = DEFAULT_MODEL, agent_version: str = DEFAULT_AGENT_VERSION,
+              model: str = DEFAULT_MODEL, agent: str = "claude-code",
+              agent_version: str = DEFAULT_AGENT_VERSION,
               agent_env: Optional[Dict[str, str]] = None, timeout_s: int = DEFAULT_TIMEOUT_S,
               milestones: Optional[str] = None, parallel: int = 7, out_root: Optional[str] = None,
-              reasoning_effort: Optional[str] = None, unprotected: bool = False,
-              dry_run: bool = False, aggregate_only: bool = False,
+              reasoning_effort: Optional[str] = None, auto_compact_window: Optional[int] = None,
+              enable_tool_search: Optional[str] = None, build_failure_fail_closed: bool = False,
+              unprotected: bool = False, dry_run: bool = False, aggregate_only: bool = False,
               project_root: Optional[Path] = None) -> TrialResult:
     """Run (or resume) the official trial for each repo and aggregate. See the module docstring.
 
@@ -456,6 +491,12 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
     milestones: optional dependency-closed prefix ('10' or '50%') for smoke runs.
     dry_run: preflight, build every worker command/env, launch nothing.
     aggregate_only: skip launching; aggregate an existing trial directory.
+
+    Every knob a leaderboard trial config carries and that MOVES THE SCORE is exposed here with
+    the launcher's own default, so a seam-launched trial can be made argument-identical to a
+    `scripts/run_all.py --config` trial: `agent`, `reasoning_effort`, `auto_compact_window`,
+    `enable_tool_search`, `build_failure_fail_closed`, `timeout_s`, `milestones`. What remains
+    deliberately different is the endpoint, the model id and `agent_env`, i.e. the policy itself.
     """
     from harness import api  # noqa: PLC0415
     from harness.e2e.runtime_policy_binding import (  # noqa: PLC0415
@@ -472,21 +513,31 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
         raise ValueError(f"run_trial: base_url must be a URL, got {base_url!r}")
     agent_env = {str(k): str(v) for k, v in (agent_env or {}).items()}
 
+    # A repo whose trial directory already exists RESUMES, and a resume replays the binding
+    # frozen into trial_metadata.json. run_all gates only fresh workers on the live policy for
+    # exactly that reason; gating a resume would let a later policy edit strand a running trial.
+    resuming = {repo.name: (repo / "e2e_trial" / trial_name / "trial_metadata.json").exists()
+                for repo in repo_paths}
     policies = {}
     for repo in repo_paths:
         policy = resolve_runtime_policy(repo.name, root, unprotected=unprotected)
         errors = runtime_policy_coverage_errors(policy)
-        if errors and policy.mode != RUNTIME_POLICY_MODE_UNPROTECTED:
+        if errors and policy.mode != RUNTIME_POLICY_MODE_UNPROTECTED and not resuming[repo.name]:
             raise RuntimeError(f"run_trial: quarantine coverage gate failed for {repo.name}: {errors}. "
                                f"Add quarantine_configs/{repo.name}.yaml or pass unprotected=True.")
         policies[repo.name] = policy
 
     launch = not (dry_run or aggregate_only)
-    bench, data_commit, notes = _preflight(data_root_p, repo_paths, policies, launch=launch)
+    bench, data_commit, notes = _preflight(data_root_p, repo_paths, policies, launch=launch,
+                                           resuming=resuming)
     started = _now()
-    out_dir = Path(out_root).expanduser().resolve() if out_root else data_root_p / "run_trial"
-    if launch:
+    # Never default inside the data checkout: that tree is a pinned git clone and the harness
+    # verifies its version, so writing run artifacts into it is a footgun.
+    out_dir = Path(out_root).expanduser().resolve() if out_root else Path(
+        os.environ.get("TMPDIR", "/tmp")) / "swe-milestone-run-trial"
+    if not dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
+    if launch:
         (out_dir / trial_name).mkdir(parents=True, exist_ok=True)
 
     worker_rcs: Dict[str, Optional[int]] = {r.name: None for r in repo_paths}
@@ -495,12 +546,13 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
     for repo in repo_paths:
         policy = policies[repo.name]
         cmd, cmd_mode = run_all.build_cmd(
-            repo, "claude-code", model, int(timeout_s), trial_name,
+            repo, agent, model, int(timeout_s), trial_name,
             reasoning_effort, agent_version, False,
-            milestones, root, False, runtime_policy=policy,
+            milestones, root, bool(build_failure_fail_closed), runtime_policy=policy,
         )
         env = worker_env(data_root=data_root_p, base_url=base_url, model=model, trial_name=trial_name,
-                         repo_name=repo.name, agent_env=agent_env, policy=policy)
+                         repo_name=repo.name, agent_env=agent_env, policy=policy,
+                         auto_compact_window=auto_compact_window, enable_tool_search=enable_tool_search)
         plans.append({"repo": repo.name, "cmd": cmd, "mode": cmd_mode, "env": env,
                       "image": image_for_runtime_policy(policy)})
         if cmd_mode == "resume" and launch:
@@ -554,11 +606,10 @@ def run_trial(repos: Optional[List[str]], *, data_root: str, trial_name: str, ba
             {k: v for k, v in p["env"].items() if k.startswith(("SWE_MILESTONE_", "UNIFIED_"))}) for p in plans)
     if not dry_run:
         try:
-            out = (out_dir / f"{trial_name}.trial_result.json") if launch else (
-                Path(out_root).expanduser().resolve() / f"{trial_name}.trial_result.json" if out_root else None)
-            if out is not None:
-                result.to_json(out)
-                logger.info("run_trial: wrote %s", out)
+            out = out_dir / f"{trial_name}.trial_result.json"
+            result.to_json(out)
+            result.result_path = str(out)
+            logger.info("run_trial: wrote %s", out)
         except OSError as exc:
             result.notes.append(f"could not write trial_result.json: {exc}")
     return result
@@ -572,7 +623,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--trial-name")
     ap.add_argument("--base-url")
     ap.add_argument("--model")
+    ap.add_argument("--agent")
     ap.add_argument("--agent-version")
+    ap.add_argument("--reasoning-effort")
+    ap.add_argument("--auto-compact-window", type=int)
+    ap.add_argument("--enable-tool-search")
+    ap.add_argument("--build-failure-fail-closed", action="store_true")
     ap.add_argument("--repos", nargs="*")
     ap.add_argument("--milestones")
     ap.add_argument("--timeout", type=int)
@@ -589,13 +645,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         import yaml  # noqa: PLC0415
         kw.update(yaml.safe_load(args.config.read_text()) or {})
     for key, val in (("data_root", args.data_root), ("trial_name", args.trial_name), ("base_url", args.base_url),
-                     ("model", args.model), ("agent_version", args.agent_version), ("milestones", args.milestones),
+                     ("model", args.model), ("agent", args.agent), ("agent_version", args.agent_version),
+                     ("milestones", args.milestones), ("reasoning_effort", args.reasoning_effort),
+                     ("auto_compact_window", args.auto_compact_window),
+                     ("enable_tool_search", args.enable_tool_search),
                      ("timeout_s", args.timeout), ("parallel", args.parallel), ("out_root", args.out_root)):
         if val is not None:
             kw[key] = val
     repos = args.repos if args.repos is not None else kw.pop("repos", None)
     if args.unprotected:
         kw["unprotected"] = True
+    if args.build_failure_fail_closed:
+        kw["build_failure_fail_closed"] = True
     if args.dry_run:
         kw["dry_run"] = True
     if args.aggregate_only:

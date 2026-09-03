@@ -175,3 +175,65 @@ def test_api_exports_run_trial_and_types():
     assert api.TrialResult is rt.TrialResult and api.MilestoneResult is rt.MilestoneResult
     with pytest.raises(AttributeError):
         api.__getattr__("NoSuchThing")
+
+
+# ───────────────────── equivalence knobs (2026-09-03 review) ─────────────────────
+def test_official_zero_is_not_replaced_by_the_local_count(tmp_path):
+    """A legitimately zero official value must win over the local tally; `or` would not."""
+    ws = _make_repo(tmp_path)
+    _write_trial(ws, {"M1": _result(False, f2p_ach=0, p2p_ach=6, p2p_failed=2)})
+    r = rt.aggregate_repo(ws, "t_001", worker_rc=0)
+    assert r.official_summary["resolved"] == 0
+    assert r.n_resolved == 0            # not the local count, not a fallback
+    assert r.n_infra_invalid == 0
+
+
+def test_worker_env_carries_the_score_moving_knobs(tmp_path):
+    from harness.e2e.runtime_policy_binding import resolve_runtime_policy
+    policy = resolve_runtime_policy("no_such_repo_x", tmp_path, unprotected=True)
+    host = {"PATH": "/usr/bin"}
+    env = rt.worker_env(data_root=Path("/data"), base_url="http://x:1", model="m", trial_name="t",
+                        repo_name="r", agent_env=None, policy=policy, host_env=host,
+                        auto_compact_window=200000, enable_tool_search="false")
+    assert env["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] == "200000"
+    assert env["SWE_MILESTONE_ENABLE_TOOL_SEARCH"] == "false"
+    bare = rt.worker_env(data_root=Path("/data"), base_url="http://x:1", model="m", trial_name="t",
+                         repo_name="r", agent_env=None, policy=policy, host_env=host)
+    assert "SWE_MILESTONE_AUTO_COMPACT_WINDOW" not in bare
+    assert "SWE_MILESTONE_ENABLE_TOOL_SEARCH" not in bare
+
+
+def test_run_trial_exposes_every_score_moving_knob():
+    import inspect
+    sig = inspect.signature(rt.run_trial).parameters
+    for knob in ("agent", "agent_version", "reasoning_effort", "auto_compact_window",
+                 "enable_tool_search", "build_failure_fail_closed", "timeout_s", "milestones"):
+        assert knob in sig, knob
+    assert sig["agent"].default == "claude-code"
+    assert sig["build_failure_fail_closed"].default is False   # run_all's own default
+
+
+def test_result_path_is_outside_the_data_tree(tmp_path, monkeypatch):
+    t = rt.TrialResult(api_version="1.3", benchmark_version="v", harness_sha="", data_commit="",
+                       data_root=str(tmp_path), trial_name="t", model="m", agent_version="v",
+                       base_url="u", agent_env={}, started_at="s", finished_at="f")
+    assert t.result_path == ""
+    p = t.to_json(tmp_path / "out" / "t.trial_result.json")
+    assert json.loads(p.read_text())["result_path"] == ""
+
+
+def test_session_key_is_the_endpoint_session_id(tmp_path):
+    from harness.e2e.runtime_policy_binding import resolve_runtime_policy
+    assert rt.session_key("cte_001", "navidrome_x") == "cte_001/navidrome_x"
+    policy = resolve_runtime_policy("no_such_repo_x", tmp_path, unprotected=True)
+    env = rt.worker_env(data_root=Path("/d"), base_url="http://x:1", model="m", trial_name="cte_001",
+                        repo_name="navidrome_x", agent_env=None, policy=policy,
+                        host_env={"PATH": "/usr/bin"})
+    assert env["UNIFIED_API_KEY"] == rt.session_key("cte_001", "navidrome_x")
+
+
+def test_image_tag_is_inherited_by_the_worker():
+    """SWE_MILESTONE_IMAGE_TAG selects which images the trial boots, so it must reach the worker."""
+    assert "SWE_MILESTONE_IMAGE_TAG" in rt._INHERITED_ENV
+    assert "SWE_MILESTONE_DATA_VERSION_CHECK" in rt._INHERITED_ENV
+    assert "SWE_MILESTONE_BENCHMARK_VERSION" in rt._INHERITED_ENV
