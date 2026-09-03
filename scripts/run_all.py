@@ -431,6 +431,17 @@ def main():
     auto_compact_window = cfg.get("auto_compact_window", None)
     if auto_compact_window:
         os.environ["SWE_MILESTONE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+    # Extra container env pinned by the trial config (`agent_env:` mapping),
+    # e.g. the context pins a self-served policy needs. Passed to the workers as
+    # SWE_MILESTONE_AGENT_ENV (JSON); ClaudeCodeFramework applies it last so it
+    # overrides the harness-derived values, and run_e2e records it in
+    # trial_metadata.agent_env.
+    agent_env = cfg.get("agent_env", None)
+    if agent_env:
+        if not isinstance(agent_env, dict):
+            print("Error: trial config 'agent_env' must be a mapping of VAR: value", file=sys.stderr)
+            sys.exit(1)
+        os.environ["SWE_MILESTONE_AGENT_ENV"] = json.dumps({str(k): str(v) for k, v in agent_env.items()})
     # Fail-loud guard: a trial that CLAIMS a full-window run ("-1m" in its name)
     # must use the probe-verified shape (2026-08-24, docs/running-trials.md):
     #   - agent_version pinned (2.1.212 verified: native default = no compaction

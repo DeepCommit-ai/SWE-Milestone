@@ -34,7 +34,21 @@ logger = logging.getLogger(__name__)
 #    evaluator requires, and captures build manifests through the overlay.
 #  - harden_container() truncates the work container's git history (anti-leak).
 #  - iter_task_records emits the released image ref pinned to BENCHMARK_VERSION.
-API_VERSION = "1.2"
+# 1.3: consumer-built sandboxes get the full pre-agent protection set.
+#  - harden_container() restores /testbed's ownership after the truncation, so it
+#    can run after the consumer created its agent user (a root-owned .git/logs/HEAD
+#    otherwise fails the agent's first commit with EACCES).
+#  - verify_masking() re-derives the masked set and checks every file is still
+#    root:000 (Rust: inline #[cfg(test)] gone). Call it LAST before the agent
+#    starts: any recursive chown of /testbed after mask_tests silently undoes it.
+#  - quarantine_container() applies the repo's anti-cheat network policy to a
+#    consumer-built container (iptables allowlist + registry denies + offline
+#    package managers) and verifies it; allow_endpoints admits the policy server.
+#  - run_trial() is the CTE entry point: the official run_e2e per repo, official
+#    aggregation, one TrialResult.
+#  - Seam env names follow the harness rename: SWE_MILESTONE_DATA_ROOT,
+#    SWE_MILESTONE_EXEC_USER / _HOME. Any EVOCLAW_* variable is a hard error.
+API_VERSION = "1.3"
 PROMPT_DIR = Path(__file__).parent / "e2e" / "prompt"
 # The node runtime Claude Code needs. go/java/rust testbed images ship none;
 # runtime_spec() bootstraps this static build when npm is absent.
@@ -131,6 +145,13 @@ class MaskReport:
     masked_src_files: int = 0
     skipped: bool = False
     reason: str = ""
+    # 1.3: the masked set itself, so verify_masking can check exactly what was
+    # applied (a Rust file whose inline tests were removed no longer maps back
+    # from its test names, so re-derivation alone under-checks).
+    masked_files: list = field(default_factory=list)        # [{path, kind}] kind: test | rust_src
+    failed_files: list = field(default_factory=list)        # mask attempted, failed
+    unmapped_tests: list = field(default_factory=list)      # unknown format, never masked
+    file_not_found_tests: list = field(default_factory=list)  # file absent in container (no leak)
 
 
 # ───────────────────────────── prompt / instruction ─────────────────────────
@@ -252,17 +273,158 @@ def mask_tests(container_name: str, task: TaskRecord, *, workdir: str = "/testbe
                                 src_filter=_src_filter_for(task), workdir=workdir, strict=strict)
     except TestMappingError as e:
         return MaskReport(skipped=True, reason=f"unmapped tests (new framework?): {e}")
+    failed = list(r.get("failed_files") or [])
+    masked_files = [{"path": path, "kind": kind}
+                    for path, kind in sorted((r.get("file_types") or {}).items())
+                    if path not in failed]
     return MaskReport(masked_test_files=r.get("masked_test_files", 0),
-                      masked_src_files=r.get("masked_src_files", 0))
+                      masked_src_files=r.get("masked_src_files", 0),
+                      masked_files=masked_files, failed_files=failed,
+                      unmapped_tests=list(r.get("unmapped_tests") or []),
+                      file_not_found_tests=list(r.get("file_not_found_tests") or []))
+
+
+@dataclass
+class MaskVerifyReport:
+    ok: bool
+    checked: int = 0
+    violations: list = field(default_factory=list)   # [{path, kind, mode, owner, reason}]
+    skipped: bool = False
+    reason: str = ""
+
+
+def verify_masking(container_name: str, task: TaskRecord, *, report: Optional[MaskReport] = None,
+                   workdir: str = "/testbed") -> MaskVerifyReport:
+    """Post-condition check for mask_tests, to be run LAST before the agent starts.
+
+    mask_tests is `chown root:root` + `chmod 000` on the graded test files, and an
+    in-place removal of the root-level inline test regions of Rust sources. Any
+    later recursive chown of /testbed silently undoes the first kind: the file
+    becomes agent-owned with mode 000 and the agent can `chmod +r` it. A consumer
+    whose sandbox setup chowns /testbed (slime's ensure_agent_user does) must call
+    this after the last such step and abort on ok == False.
+
+    Pass the MaskReport that mask_tests returned: its masked_files is the exact
+    applied set, and its failed/unmapped tests are reported as violations (they
+    were never masked). Without a report the set is re-derived from the task with
+    the same mapping mask_tests uses; that path cannot see a Rust file whose
+    inline tests are already gone (nothing to map), so it under-checks Rust.
+
+    Checks: test files must be root-owned with mode 000; Rust sources must have
+    no root-level test regions left according to the official detector."""
+    import subprocess  # noqa: PLC0415
+    from harness.e2e.test_masking import _map_tests_to_files, detect_file_type  # noqa: PLC0415
+    from harness.utils.rust_test_filter import (  # noqa: PLC0415
+        RustTestFilterError, _read_file_from_container, find_test_ranges_from_content)
+
+    violations: list = []
+    if report is not None:
+        if report.skipped:
+            return MaskVerifyReport(ok=True, skipped=True, reason=report.reason or "mask_tests skipped")
+        expected = [(f["path"], f["kind"]) for f in report.masked_files]
+        for path in report.failed_files:
+            violations.append({"path": path, "kind": "", "mode": "", "owner": "",
+                               "reason": "mask_tests failed on this file"})
+        for t in report.unmapped_tests:
+            violations.append({"path": "", "kind": "test", "mode": "", "owner": "",
+                               "reason": f"unmapped test never masked: {t}"})
+    else:
+        test_names = [str(t) for t in task.fail_to_pass]
+        for nt in (task.source_spec.get("new_tests") or []):
+            test_names.append(nt.get("test_id") if isinstance(nt, dict) else str(nt))
+        test_names = [t for t in test_names if t]
+        if not test_names:
+            return MaskVerifyReport(ok=True, skipped=True, reason="no fail_to_pass/new_tests to mask")
+        src_filter = _src_filter_for(task)
+        file_to_tests, unmapped, _not_found, _methods = _map_tests_to_files(
+            container_name, test_names, src_filter, workdir)
+        expected = [(path, detect_file_type(path, src_filter)) for path in sorted(file_to_tests)]
+        for t in unmapped:
+            violations.append({"path": "", "kind": "test", "mode": "", "owner": "",
+                               "reason": f"unmapped test never masked: {t}"})
+
+    for path, kind in expected:
+        if kind == "rust_src":
+            content = _read_file_from_container(container_name, path)
+            if content is None:
+                violations.append({"path": path, "kind": kind, "mode": "", "owner": "",
+                                   "reason": "cannot read masked Rust source"})
+                continue
+            try:
+                ranges = find_test_ranges_from_content(content, path, only_root_level=True,
+                                                       reject_nested=False)
+            except RustTestFilterError as exc:
+                violations.append({"path": path, "kind": kind, "mode": "", "owner": "",
+                                   "reason": f"test detection failed: {exc}"})
+                continue
+            if ranges:
+                violations.append({"path": path, "kind": kind, "mode": "", "owner": "",
+                                   "reason": f"{len(ranges)} inline test region(s) still present"})
+            continue
+        r = subprocess.run(["docker", "exec", "-w", workdir, container_name,
+                            "stat", "-c", "%a %U", path],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            violations.append({"path": path, "kind": kind, "mode": "", "owner": "",
+                               "reason": f"stat failed: {(r.stderr or r.stdout).strip()}"})
+            continue
+        parts = (r.stdout or "").split()
+        mode, owner = (parts + ["", ""])[:2]
+        if mode != "0" or owner != "root":
+            violations.append({"path": path, "kind": kind, "mode": mode, "owner": owner,
+                               "reason": "expected root:000 (mask undone or never applied)"})
+    ok = not violations
+    if not ok:
+        logger.error("verify_masking: %d violation(s) on %s: %s", len(violations), container_name,
+                     "; ".join(f"{v['path'] or v['reason']}" for v in violations[:5]))
+    return MaskVerifyReport(ok=ok, checked=len(expected), violations=violations)
+
+
 
 
 # ───────────────────────────── grading ─────────────────────────────────────
-# The EvoClaw-data tree (classification / test_config / metadata / config /
+# The SWE-Milestone-data tree (classification / test_config / metadata / config /
 # filter_list) lives on the box; grading reads it directly so ALL judging logic
 # stays official — no reimplementation, no materialization. Point at it with
-# EVOCLAW_DATA_ROOT (default ~/worksapce/EvoClaw-data). The consumer is
+# SWE_MILESTONE_DATA_ROOT (default ~/workspace/SWE-Milestone-data). The consumer is
 # responsible for a version self-check (tree commit ↔ parquet source_commit).
-EVOCLAW_DATA_ROOT = os.environ.get("EVOCLAW_DATA_ROOT") or str(Path.home() / "workspace" / "EvoClaw-data")
+#
+# Naming rule: the harness renamed EVOCLAW_* to SWE_MILESTONE_* on 2026-07-08 as a
+# clean break (harness.e2e.env_guard hard-exits run_e2e/run_all on any legacy
+# name). The seam applies the same rule at call time: a legacy name raises with
+# the rename hint, it is never aliased silently.
+DATA_ROOT_ENV = "SWE_MILESTONE_DATA_ROOT"
+DEFAULT_DATA_ROOT = str(Path.home() / "workspace" / "SWE-Milestone-data")
+EXEC_USER_ENV = "SWE_MILESTONE_EXEC_USER"
+EXEC_HOME_ENV = "SWE_MILESTONE_EXEC_HOME"
+_LEGACY_ENV_PREFIX = "EVOCLAW_"
+
+
+def reject_legacy_env() -> None:
+    """Raise if any legacy EVOCLAW_* variable is set (same rule as harness.e2e.env_guard)."""
+    legacy = sorted(k for k in os.environ if k.startswith(_LEGACY_ENV_PREFIX))
+    if legacy:
+        hint = ", ".join(f"{k} -> SWE_MILESTONE_{k[len(_LEGACY_ENV_PREFIX):]}" for k in legacy)
+        raise RuntimeError(
+            "legacy EVOCLAW_* environment variables are not supported by harness.api "
+            f"(renamed to SWE_MILESTONE_* on 2026-07-08, no silent aliasing): {hint}")
+
+
+def resolve_data_root() -> Path:
+    """The data tree root: SWE_MILESTONE_DATA_ROOT, else the default path."""
+    reject_legacy_env()
+    return Path(os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT)
+
+
+def exec_user() -> str:
+    """The in-container user the snapshot/verify paths exec as (default fakeroot)."""
+    reject_legacy_env()
+    return os.environ.get(EXEC_USER_ENV) or "fakeroot"
+
+
+def exec_home() -> str:
+    reject_legacy_env()
+    return os.environ.get(EXEC_HOME_ENV) or f"/home/{exec_user()}"
 
 
 def _repo_dir(task: TaskRecord, root: Optional[Path] = None) -> str:
@@ -344,6 +506,8 @@ def _normalize_eval(d: dict) -> dict:
         "infra_invalid_reason": infra_reason,
         "infrastructure_failure": infra_failure,
         "eval_status": eval_status,
+        "scored_failure_reason": str(d.get("scored_failure_reason") or ""),
+        "error": str(d.get("error") or ""),
         "resolved": bool(d.get("resolved", False)),
         "n_f2p_fixed": n_fixed,
         "n_f2p_inscope": n_fixed + len(f2p.get("failure", []) or []),
@@ -353,6 +517,41 @@ def _normalize_eval(d: dict) -> dict:
         "total_tests": int(summ.get("total", 0) or 0),
         "passed_tests": int(summ.get("passed", 0) or 0),
     }
+
+
+def _zero_report_cell(milestone: str, message: str) -> dict:
+    """The cell dict for a run that produced no test report, classified by the OFFICIAL
+    rule (collect_results.is_zero_test_build_failure on the runner's diagnostic):
+    build-failure evidence -> a scored failure (0, stays in the denominator);
+    no evidence -> infra-invalid (unknown score, retry). Same shape the CTE
+    orchestrator's `error` cell takes after collect_results annotates it."""
+    from harness.e2e.collect_results import is_zero_test_build_failure  # noqa: PLC0415
+    cell = {
+        "milestone_id": milestone,
+        "resolved": False,
+        "eval_status": "error",
+        "error": message,
+        "error_message": message,
+        "patch_successfully_applied": True,
+        "test_summary": {"total": 0, "passed": 0},
+        "tests_status": {},
+        "scoring_blocked": False,
+    }
+    if is_zero_test_build_failure(cell):
+        cell["scored_failure_reason"] = "build-failure-with-zero-tests"
+        cell["eval_status"] = "failed"
+        cell["infra_invalid"] = False
+        cell["infra_invalid_reason"] = ""
+        cell["patch_status"] = {"compilation_success": False}
+        logger.warning("evaluate: %s produced no test report; build-failure evidence found -> "
+                       "scored failure (0)", milestone)
+    else:
+        cell["infra_invalid"] = True
+        cell["infra_invalid_reason"] = "zero-tests-without-build-evidence"
+        cell["eval_status"] = "infra-invalid"
+        logger.error("evaluate: %s produced no test report and no build-failure evidence -> "
+                     "infra-invalid (retry)", milestone)
+    return cell
 
 
 def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
@@ -367,7 +566,7 @@ def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
     import json  # noqa: PLC0415
     from harness.e2e.evaluator import PatchEvaluator, generate_filtered_evaluation  # noqa: PLC0415
 
-    root = Path(data_root or EVOCLAW_DATA_ROOT)
+    root = Path(data_root) if data_root else resolve_data_root()
     repo = _repo_dir(task, root)
     milestone = _milestone_id(task)
     ws = root / repo
@@ -381,9 +580,21 @@ def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
     ev = PatchEvaluator(workspace_root=ws, milestone_id=milestone,
                         patch_file=Path(artifact), baseline_classification=classification,
                         output_dir=scratch)
-    result = ev.evaluate()                      # official: container -> apply -> tests -> compare
-
     raw_path = scratch / "evaluation_result.json"
+    try:
+        result = ev.evaluate()                  # official: container -> apply -> tests -> compare
+    except RuntimeError as exc:
+        # The official test runner raises when a submission produced NO test report at
+        # all ("No valid test report files generated"; typically the graded tests do
+        # not compile against the agent's tree). The CTE orchestrator records that as
+        # an `error` cell and collect_results scores it 0 in the denominator when the
+        # message carries build-failure evidence, or flags it infra-invalid otherwise.
+        # Mirror that here instead of aborting the sample: an agent that broke the build
+        # did not solve the milestone, and it must not be retried as if docker had died.
+        if not str(exc).startswith("No valid test report files generated"):
+            raise
+        raw_path.write_text(json.dumps(_zero_report_cell(milestone, str(exc))))
+        return _normalize_eval(json.loads(raw_path.read_text()))
     raw_path.write_text(json.dumps(result.to_dict()))
     filtered = generate_filtered_evaluation(raw_path, ws, milestone)   # official flaky filter_list pass
     # None has two meanings and the raw file distinguishes them: benign (this milestone
@@ -400,8 +611,10 @@ def evaluate(task: TaskRecord, artifact: Path, *, scratch: Path,
 # host-side `docker exec` against the live work container — no orchestrator / managed-
 # container coupling, so the training stack can call it directly after the agent run.
 def _fakeroot_exec(container_name: str) -> list[str]:
-    """The `docker exec` prefix the official snapshot path uses (git as fakeroot in /testbed)."""
-    return ["docker", "exec", "--user", "fakeroot", "-e", "HOME=/home/fakeroot",
+    """The `docker exec` prefix the official snapshot path uses: git as the agent user in
+    /testbed. The user is `fakeroot` on harness-built containers; a consumer whose sandbox
+    creates a different user sets SWE_MILESTONE_EXEC_USER (and _HOME) instead of patching."""
+    return ["docker", "exec", "--user", exec_user(), "-e", f"HOME={exec_home()}",
             "-w", "/testbed", container_name]
 
 
@@ -421,10 +634,27 @@ def harden_container(container_name: str, *, main_branch: str = "main") -> str:
     to extract_snapshot(baseline=...) so the manifest overlay diffs against the
     real BASE rather than an inferred one.
 
+    Ownership: the truncation runs as root and rewrites .git (index, HEAD, config,
+    packed-refs, logs, packs). If the consumer already created its agent user and
+    chowned /testbed to it, those root-owned files break the agent's first commit
+    ("unable to append to '.git/logs/HEAD': Permission denied"). So the owner of
+    /testbed is recorded first and restored on .git afterwards; the call order
+    relative to the agent-user creation then does not matter. It never chowns the
+    working tree, so a mask applied before it (root:000) survives — but keep the
+    documented order anyway: harden, then mask_tests, then quarantine, then
+    verify_masking, and no chown after that.
+
     Raises RuntimeError on any failure: a container whose history was not truncated
     must not run an agent."""
     import subprocess  # noqa: PLC0415
     from harness.e2e.container_setup import ContainerSetup  # noqa: PLC0415
+
+    owner = subprocess.run(_root_exec(container_name) + ["stat", "-c", "%u:%g", "/testbed"],
+                           capture_output=True, text=True)
+    if owner.returncode != 0 or not owner.stdout.strip():
+        detail = (owner.stderr or owner.stdout or "stat failed").strip()
+        raise RuntimeError(f"harden_container: cannot stat /testbed on {container_name}: {detail}")
+    owner_ids = owner.stdout.strip()
 
     script = ContainerSetup.truncate_history_script(main_branch=main_branch)
     r = subprocess.run(_root_exec(container_name) + ["/bin/sh", "-c", script],
@@ -440,8 +670,117 @@ def harden_container(container_name: str, *, main_branch: str = "main") -> str:
         detail = (head.stderr or head.stdout or "no HEAD").strip()
         raise RuntimeError(f"harden_container: could not read the baseline commit on "
                            f"{container_name}: {detail}")
-    logger.info("harden_container: %s history truncated; baseline=%s", container_name, baseline)
+    # Restore ownership of everything the truncation touched (.git only; the
+    # working tree is never written by the script).
+    restore = subprocess.run(_root_exec(container_name) + ["chown", "-R", owner_ids, "/testbed/.git"],
+                             capture_output=True, text=True)
+    if restore.returncode != 0:
+        detail = (restore.stderr or restore.stdout or "chown failed").strip()
+        raise RuntimeError(f"harden_container: could not restore ownership {owner_ids} on "
+                           f"{container_name}:/testbed/.git: {detail}")
+    logger.info("harden_container: %s history truncated; baseline=%s; .git owner restored to %s",
+                container_name, baseline, owner_ids)
     return baseline
+
+
+@dataclass
+class QuarantineReport:
+    ok: bool
+    repo: str = ""
+    mode: str = ""                    # protected | unprotected | absent
+    policy_sha256: str = ""
+    denied_hosts: list = field(default_factory=list)      # registry hosts verified unreachable
+    allowed_endpoints: list = field(default_factory=list)  # consumer endpoints verified reachable
+    env: dict = field(default_factory=dict)                # the agent-process env to carry (quarantine_agent_env)
+    reason: str = ""
+
+
+def quarantine_container(container_name: str, task: TaskRecord, *,
+                         allow_endpoints: Optional[list] = None,
+                         project_root: Optional[Path] = None,
+                         unprotected: bool = False) -> QuarantineReport:
+    """Anti-cheat network lockdown for a consumer-built work container.
+
+    Applies the repo's runtime policy (quarantine_configs/<repo>.yaml) exactly as
+    the official launcher does: iptables allowlist (loopback, established, the
+    container's resolver, the harness whitelist minus the policy's denied
+    registries and CIDRs, plus `allow_endpoints` port-scoped), /etc/hosts
+    poisoning of code hosting and mirror domains, package managers forced
+    offline against the image-baked closures, sudo revoked, then the official
+    verification (OUTPUT policy DROP, github.com blocked, every denied registry
+    unreachable, every allowed endpoint reachable). Also runs the official
+    runtime-environment gate (sealed Go toolchain/proxy, cache access, Maven
+    offline smoke) so a broken closure fails here, not as a silent zero.
+
+    Requirements: the container was started with `--cap-add=NET_ADMIN`; the
+    agent user (SWE_MILESTONE_EXEC_USER, default fakeroot) exists and owns
+    /testbed; harden_container ran before this; mask_tests may run before or
+    after (this call never chowns the working tree); verify_masking runs LAST.
+
+    `allow_endpoints`: `host:port` / `ip:port` / URL entries the agent must
+    reach (the policy server, e.g. 172.17.0.1:18001). Refused if one resolves
+    into a denied CIDR. `unprotected=True` is the explicit escape for a repo
+    without a policy (scores may be tainted; recorded in the report).
+
+    Returns the report; raises RuntimeError on any failure (fail closed). The
+    returned `env` is the environment the AGENT PROCESS must carry (the offline
+    switches); inject it into the agent's session, it is not applied here."""
+    import subprocess  # noqa: PLC0415
+    from harness.e2e.agents.base import quarantine_agent_env  # noqa: PLC0415
+    from harness.e2e.container_setup import ContainerSetup  # noqa: PLC0415
+    from harness.e2e.runtime_policy_binding import (  # noqa: PLC0415
+        RUNTIME_POLICY_ENV_KEYS, RUNTIME_POLICY_MODE_PROTECTED, RUNTIME_POLICY_MODE_UNPROTECTED,
+        resolve_runtime_policy, runtime_policy_coverage_errors)
+
+    reject_legacy_env()
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    repo = _repo_dir(task, resolve_data_root())
+    policy = resolve_runtime_policy(repo, root, unprotected=unprotected)
+    errors = runtime_policy_coverage_errors(policy)
+    if policy.mode != RUNTIME_POLICY_MODE_UNPROTECTED and (errors or policy.mode != RUNTIME_POLICY_MODE_PROTECTED):
+        detail = "; ".join(errors) if errors else f"no quarantine_configs/{repo}.yaml"
+        raise RuntimeError(
+            f"quarantine_container: refusing to prepare {repo} without an anti-cheat policy "
+            f"({detail}). Add the policy (docs/quarantine.md) or pass unprotected=True.")
+    if policy.mode == RUNTIME_POLICY_MODE_UNPROTECTED:
+        logger.warning("quarantine_container: %s runs UNPROTECTED (explicit); scores may be tainted", repo)
+
+    image = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}}", container_name],
+                           capture_output=True, text=True)
+    if image.returncode != 0 or not image.stdout.strip():
+        raise RuntimeError(f"quarantine_container: cannot inspect {container_name}: "
+                           f"{(image.stderr or image.stdout).strip()}")
+
+    endpoints = [str(e) for e in (allow_endpoints or []) if str(e).strip()]
+    # The policy env is process-global for the harness code paths; scope it to
+    # this call and restore afterwards so a consumer process can prepare
+    # containers for different repos back to back.
+    saved = {k: os.environ.get(k) for k in list(RUNTIME_POLICY_ENV_KEYS) + ["SWE_MILESTONE_UNPROTECTED"]}
+    try:
+        for k in RUNTIME_POLICY_ENV_KEYS:
+            os.environ.pop(k, None)
+        os.environ.pop("SWE_MILESTONE_UNPROTECTED", None)
+        os.environ.update(policy.env)
+        if policy.mode == RUNTIME_POLICY_MODE_UNPROTECTED:
+            os.environ["SWE_MILESTONE_UNPROTECTED"] = "1"
+        setup = ContainerSetup(container_name=container_name, image_name=image.stdout.strip(),
+                               repo_name=repo, agent_user=exec_user())
+        setup.allow_endpoints = endpoints
+        if policy.mode == RUNTIME_POLICY_MODE_PROTECTED:
+            setup.verify_runtime_environment()   # sealed Go, cache access, Maven smoke (official gate)
+        setup.lock_network()                     # includes verify_network_lockdown (fail closed)
+        denied = [d.strip() for d in os.environ.get("SWE_MILESTONE_DENY_DOMAINS", "").split(",") if d.strip()]
+        agent_env = quarantine_agent_env(exec_home())
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    logger.info("quarantine_container: %s locked (%s, policy %s); %d denied host(s), %d allowed endpoint(s)",
+                container_name, policy.mode, policy.sha256[:12], len(denied), len(endpoints))
+    return QuarantineReport(ok=True, repo=repo, mode=policy.mode, policy_sha256=policy.sha256,
+                            denied_hosts=denied, allowed_endpoints=endpoints, env=agent_env)
 
 
 def _snapshot_sidecar_payload(*, tag: str, snapshot_file: Path, manifest_overlay,
@@ -697,6 +1036,36 @@ def extract_snapshot(container_name: str, task: TaskRecord, *, dest: Path,
     return dest
 
 
+# ───────────────────────────── CTE: the official trial per repo ─────────────────────────────
+def run_trial(repos=None, **kwargs):
+    """Continuous Task Evaluation for an external policy: run the OFFICIAL trial
+    (harness.e2e.run_e2e) for each repo in parallel against `base_url`, then
+    aggregate with the official collect_results code into one TrialResult.
+
+    Keyword arguments (see harness.e2e.run_trial.run_trial): data_root (a
+    WRITABLE checkout at BENCHMARK_VERSION), trial_name, base_url, model
+    (default slime-actor), agent_version (default 2.1.193), agent_env (extra
+    container variables applied LAST), timeout_s (default 18000), milestones
+    (dependency-closed prefix), parallel, out_root, reasoning_effort,
+    unprotected, dry_run, aggregate_only.
+
+    The result carries per-milestone raw counters (test_summary), per-repo
+    counts with one name per meaning (n_milestones / n_selected / n_graded /
+    n_evaluated / n_submitted / n_unfinished), the harness's own summary for
+    audit, macro and micro aggregates, and provenance (benchmark_version,
+    harness sha, data commit, agent_env)."""
+    from harness.e2e.run_trial import run_trial as _impl  # noqa: PLC0415
+    return _impl(repos, **kwargs)
+
+
+def __getattr__(name: str):
+    # Lazy re-exports of the CTE result contract (keeps `import harness.api` cheap).
+    if name in ("TrialResult", "RepoResult", "MilestoneResult"):
+        from harness.e2e import run_trial as _rt  # noqa: PLC0415
+        return getattr(_rt, name)
+    raise AttributeError(f"module 'harness.api' has no attribute {name!r}")
+
+
 def _capture_filter(src_filter) -> dict:
     """The filter config the sidecar records (Go exact-replay provenance)."""
     return {
@@ -874,3 +1243,11 @@ def iter_task_records(data_root, repos=None, *, framework=None, f2p_strict: bool
                     logger.warning("iter_task_records: skip %s/%s (%s)", repo, mid, e)
                     continue
                 raise
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if _sys.argv[1:2] == ["run-trial"]:
+        from harness.e2e.run_trial import main as _main
+        _sys.exit(_main(_sys.argv[2:]))
+    _sys.exit("usage: python -m harness.api run-trial [--config <yaml>] [--data-root ..] [--trial-name ..] [--base-url ..]")

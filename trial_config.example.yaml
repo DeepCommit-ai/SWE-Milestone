@@ -56,6 +56,14 @@ timeout: 18000
 # Values: true | false | auto | auto:N (N = percent of context window).
 # enable_tool_search: false
 
+# Extra container environment (claude-code only), applied LAST so it overrides
+# the harness-derived values. Meant for a self-served policy behind an
+# Anthropic-compatible adapter that needs its own context pins (the RL seam's
+# run_trial passes the same mapping). Recorded in trial_metadata.agent_env.
+# agent_env:
+#   CLAUDE_CODE_MAX_CONTEXT_TOKENS: 75536
+#   CLAUDE_CODE_AUTO_COMPACT_WINDOW: 65536
+
 # Per-trial endpoint (all agents). Overrides the host-level UNIFIED_BASE_URL
 # from .env_private for this trial. base_url supports ${VAR} expansion (same
 # as data_root), so the URL can be a literal or live in .env_private; the API

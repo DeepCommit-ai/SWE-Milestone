@@ -333,3 +333,201 @@ def test_harden_container_raises_when_the_container_is_unreachable():
     import pytest
     with pytest.raises(RuntimeError):
         api.harden_container("swe_milestone_no_such_container_zzz")
+
+
+# ───────────────────────── api 1.3: seam naming, agent env, quarantine helpers ─────────────────────────
+import os
+import pytest
+
+
+def test_api_version_is_1_3():
+    assert api.API_VERSION == "1.3"
+
+
+def test_legacy_evoclaw_env_is_rejected(monkeypatch):
+    monkeypatch.setenv("EVOCLAW_DATA_ROOT", "/nowhere")
+    with pytest.raises(RuntimeError, match="EVOCLAW_DATA_ROOT -> SWE_MILESTONE_DATA_ROOT"):
+        api.resolve_data_root()
+    with pytest.raises(RuntimeError):
+        api.exec_user()
+
+
+def test_data_root_and_exec_user_read_new_names(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("EVOCLAW_"):
+            monkeypatch.delenv(k)
+    monkeypatch.setenv("SWE_MILESTONE_DATA_ROOT", "/data/tree")
+    monkeypatch.setenv("SWE_MILESTONE_EXEC_USER", "agent")
+    monkeypatch.delenv("SWE_MILESTONE_EXEC_HOME", raising=False)
+    assert str(api.resolve_data_root()) == "/data/tree"
+    assert api.exec_user() == "agent"
+    assert api.exec_home() == "/home/agent"
+    assert api._fakeroot_exec("c1")[:5] == ["docker", "exec", "--user", "agent", "-e"]
+    monkeypatch.delenv("SWE_MILESTONE_EXEC_USER")
+    assert api.exec_user() == "fakeroot" and api.exec_home() == "/home/fakeroot"
+
+
+def test_slime_actor_pricing_is_zero():
+    from harness.e2e.pricing import resolve_pricing
+    p = resolve_pricing("slime-actor")
+    assert p["input"] == 0.0 and p["output"] == 0.0 and p["cache_read"] == 0.0
+
+
+def test_parse_agent_env_and_override_order():
+    from harness.e2e.agents.claude_code import apply_agent_env_overrides, parse_agent_env
+    assert parse_agent_env(None) == {} and parse_agent_env("  ") == {}
+    ov = parse_agent_env('{"CLAUDE_CODE_AUTO_COMPACT_WINDOW": 100000, "ANTHROPIC_MODEL": "slime-actor"}')
+    assert ov == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000", "ANTHROPIC_MODEL": "slime-actor"}
+    base = ["-e", "ANTHROPIC_BASE_URL=http://x", "-e", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000"]
+    out = apply_agent_env_overrides(base, ov)
+    assert out == ["-e", "ANTHROPIC_BASE_URL=http://x", "-e", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000",
+                   "-e", "ANTHROPIC_MODEL=slime-actor"]
+    for bad in ("[1]", '{"lower": 1}', '{"K": [1]}', "{not json"):
+        with pytest.raises(ValueError):
+            parse_agent_env(bad)
+
+
+def test_framework_applies_agent_env_last(monkeypatch):
+    from harness.e2e.agents.claude_code import ClaudeCodeFramework
+    monkeypatch.setenv("UNIFIED_API_KEY", "k")
+    monkeypatch.setenv("UNIFIED_BASE_URL", "http://172.17.0.1:18001")
+    monkeypatch.setenv("SWE_MILESTONE_AUTO_COMPACT_WINDOW", "200000")
+    monkeypatch.setenv("SWE_MILESTONE_AGENT_ENV", '{"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "64000", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "75536"}')
+    ev = ClaudeCodeFramework().get_container_env_vars()
+    pairs = dict(x.split("=", 1) for x in ev[1::2])
+    assert pairs["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "64000"
+    assert pairs["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "75536"
+    assert ev[1::2].count("CLAUDE_CODE_AUTO_COMPACT_WINDOW=64000") == 1
+    assert not any(x.startswith("CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000") for x in ev[1::2])
+
+
+def test_quarantine_agent_env_is_keyed_by_home(monkeypatch):
+    from harness.e2e.agents.base import quarantine_agent_env
+    for k in ("SWE_MILESTONE_PIP_OFFLINE", "SWE_MILESTONE_CARGO_OFFLINE", "SWE_MILESTONE_MAVEN_OFFLINE",
+              "SWE_MILESTONE_NPM_OFFLINE", "SWE_MILESTONE_GO_OFFLINE", "SWE_MILESTONE_GO_TOOLCHAIN"):
+        monkeypatch.delenv(k, raising=False)
+    assert quarantine_agent_env("/home/agent") == {}
+    monkeypatch.setenv("SWE_MILESTONE_GO_OFFLINE", "1")
+    monkeypatch.setenv("SWE_MILESTONE_GO_TOOLCHAIN", "go1.24.5")
+    e = quarantine_agent_env("/home/agent")
+    assert e["GOMODCACHE"] == "/home/agent/.cache/evoclaw-gomodcache"
+    assert e["GOBIN"] == "/home/agent/go/bin" and e["PATH"].startswith("/home/agent/go/bin:")
+    assert e["GOLANG_VERSION"] == "1.24.5" and e["GOTOOLCHAIN"] == "local"
+    assert quarantine_agent_env("/home/fakeroot")["GOCACHE"] == "/home/fakeroot/.cache/go-build"
+
+
+def test_container_setup_agent_user_defaults_and_rekey():
+    from harness.e2e.container_setup import ContainerSetup
+    cs = ContainerSetup.__new__(ContainerSetup)
+    assert cs.agent_user == "fakeroot" and cs.agent_home == "/home/fakeroot" and list(cs.allow_endpoints) == []
+    script = "install -d -o fakeroot -g 0 /home/fakeroot/.cache/x\nchown fakeroot:0 /home/fakeroot/go"
+    assert cs._for_agent_user(script) == script
+    cs.agent_user, cs.agent_home = "agent", "/home/agent"
+    assert cs._for_agent_user(script) == "install -d -o agent -g 0 /home/agent/.cache/x\nchown agent:0 /home/agent/go"
+
+
+def test_endpoint_accept_rules():
+    from harness.e2e.container_setup import _split_host_port, endpoint_accept_rules
+    assert _split_host_port("172.17.0.1:18001") == ("172.17.0.1", 18001)
+    assert _split_host_port("http://172.17.0.1:18001/v1") == ("172.17.0.1", 18001)
+    assert _split_host_port("https://api.example.com") == ("api.example.com", 443)
+    with pytest.raises(ValueError):
+        _split_host_port("nonsense")
+    resolver = lambda h: {"policy.internal": ["10.9.8.7"], "cdn.example": ["104.16.1.1"]}[h]
+    rules = endpoint_accept_rules(["", "http://172.17.0.1:18001", "policy.internal:9000",
+                                   "https://api.anthropic.com"],
+                                  deny_cidrs=["104.16.0.0/12"], whitelisted_hosts={"api.anthropic.com"},
+                                  resolver=resolver)
+    assert rules == [("172.17.0.1", 18001), ("10.9.8.7", 9000)]
+    with pytest.raises(RuntimeError, match="denied CIDR"):
+        endpoint_accept_rules(["cdn.example:443"], deny_cidrs=["104.16.0.0/12"], whitelisted_hosts=set(),
+                              resolver=resolver)
+    with pytest.raises(RuntimeError, match="cannot resolve"):
+        import socket
+        def boom(h):
+            raise socket.gaierror("nope")
+        endpoint_accept_rules(["missing.host:1"], deny_cidrs=[], whitelisted_hosts=set(), resolver=boom)
+
+
+def test_mask_report_and_verify_masking_skip(tmp_path):
+    rep = api.MaskReport(skipped=True, reason="nothing to mask")
+    assert rep.masked_files == [] and rep.failed_files == []
+    v = api.verify_masking("no-such-container", TaskRecord(instance_id="r__M1", docker_image="i", problem_statement=""), report=rep)
+    assert v.ok and v.skipped and v.checked == 0
+    v2 = api.verify_masking("no-such-container", TaskRecord(instance_id="r__M1", docker_image="i", problem_statement=""))
+    assert v2.ok and v2.skipped  # no fail_to_pass / new_tests -> nothing to verify
+
+
+def test_verify_masking_reports_failed_and_unmapped_from_report(monkeypatch):
+    rep = api.MaskReport(masked_test_files=0, masked_src_files=0, masked_files=[],
+                         failed_files=["tests/a_test.go"], unmapped_tests=["weird::format"])
+    v = api.verify_masking("no-such-container", TaskRecord(instance_id="r__M1", docker_image="i", problem_statement="", fail_to_pass=["x"]), report=rep)
+    assert not v.ok and len(v.violations) == 2
+    reasons = {x["reason"] for x in v.violations}
+    assert any("mask_tests failed" in r for r in reasons) and any("unmapped" in r for r in reasons)
+
+
+def test_quarantine_report_shape():
+    q = api.QuarantineReport(ok=True, repo="r", mode="protected", policy_sha256="ab" * 32)
+    assert q.denied_hosts == [] and q.allowed_endpoints == [] and q.env == {}
+
+
+def test_evaluate_zero_report_build_failure_is_scored_zero(tmp_path, monkeypatch):
+    """A submission whose graded tests do not compile produces no test report: the
+    official runner raises. Mirror the CTE orchestrator: a scored 0, not an abort."""
+    import harness.e2e.evaluator as evaluator
+    root = tmp_path / "data"
+    _make_tree(root)
+    (root / "myrepo" / "test_results" / "M001").mkdir(parents=True, exist_ok=True)
+    tr = next(t for t in api.iter_task_records(root) if t.instance_id.endswith("__M001"))
+
+    class Boom:
+        def __init__(self, **kw):
+            pass
+
+        def evaluate(self):
+            raise RuntimeError("No valid test report files generated under /x\nFirst fatal error (eval_default.log):\n"
+                               "error[E0599]: no method named `min_depth` found for struct `WalkBuilder`")
+
+    monkeypatch.setattr(evaluator, "PatchEvaluator", Boom)
+    out = api.evaluate(tr, tmp_path / "a.tar", scratch=tmp_path / "s", data_root=str(root))
+    assert out["resolved"] is False and out["total_tests"] == 0
+    assert out["infra_invalid"] is False and out["scoring_blocked"] is False
+    assert out["scored_failure_reason"] == "build-failure-with-zero-tests" and "min_depth" in out["error"]
+    assert json.loads((tmp_path / "s" / "evaluation_result.json").read_text())["eval_status"] == "failed"
+
+
+def test_evaluate_zero_report_without_evidence_is_infra_invalid(tmp_path, monkeypatch):
+    import harness.e2e.evaluator as evaluator
+    root = tmp_path / "data"
+    _make_tree(root)
+    tr = next(t for t in api.iter_task_records(root) if t.instance_id.endswith("__M001"))
+
+    class Boom:
+        def __init__(self, **kw):
+            pass
+
+        def evaluate(self):
+            raise RuntimeError("No valid test report files generated under /x")
+
+    monkeypatch.setattr(evaluator, "PatchEvaluator", Boom)
+    out = api.evaluate(tr, tmp_path / "a.tar", scratch=tmp_path / "s", data_root=str(root))
+    assert out["infra_invalid"] is True and out["eval_status"] == "infra-invalid"
+
+
+def test_evaluate_other_runtime_errors_propagate(tmp_path, monkeypatch):
+    import harness.e2e.evaluator as evaluator
+    root = tmp_path / "data"
+    _make_tree(root)
+    tr = next(t for t in api.iter_task_records(root) if t.instance_id.endswith("__M001"))
+
+    class Boom:
+        def __init__(self, **kw):
+            pass
+
+        def evaluate(self):
+            raise RuntimeError("docker: Error response from daemon")
+
+    monkeypatch.setattr(evaluator, "PatchEvaluator", Boom)
+    with pytest.raises(RuntimeError, match="docker"):
+        api.evaluate(tr, tmp_path / "a.tar", scratch=tmp_path / "s", data_root=str(root))

@@ -351,8 +351,88 @@ exit $?
 """
 
 
+def _split_host_port(endpoint: str) -> tuple[str, int]:
+    """'host:port' / 'ip:port' / 'http(s)://host[:port]/...' -> (host, port)."""
+    from urllib.parse import urlparse  # noqa: PLC0415
+    ep = endpoint.strip()
+    if "://" in ep:
+        u = urlparse(ep)
+        host = (u.hostname or "").strip()
+        port = u.port or (443 if u.scheme == "https" else 80)
+    else:
+        host, sep, port_s = ep.rpartition(":")
+        if not sep or not host or not port_s.isdigit():
+            raise ValueError(f"endpoint must be host:port or a URL, got {endpoint!r}")
+        port = int(port_s)
+    if not host or not (1 <= port <= 65535):
+        raise ValueError(f"invalid endpoint {endpoint!r}")
+    return host, port
+
+
+def endpoint_accept_rules(
+    endpoints: list[str],
+    *,
+    deny_cidrs: list[str],
+    whitelisted_hosts: set[str],
+    resolver=None,
+) -> list[tuple[str, int]]:
+    """(ip, port) accept rules for the LLM/policy endpoints of a lockdown.
+
+    A hostname already in the static whitelist needs no rule (its IPs are
+    accepted on every port by the domain pass). Anything else is admitted on
+    its port only: an IP literal directly, a hostname through the host-side
+    resolver. An address inside a denied CIDR is refused outright instead of
+    being accepted (the SNI tunnel is the sanctioned path for those hosts).
+    Fails closed on an unresolvable host: a silent miss would let the trial
+    start with the model unreachable."""
+    import ipaddress  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+
+    def _resolve(host: str) -> list[str]:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET)
+        return sorted({sa[0] for _f, _t, _p, _c, sa in infos})
+
+    resolve = resolver or _resolve
+    nets = []
+    for c in deny_cidrs:
+        try:
+            nets.append(ipaddress.ip_network(c, strict=False))
+        except ValueError:
+            pass
+    rules: list[tuple[str, int]] = []
+    for ep in endpoints:
+        if not ep or not ep.strip():
+            continue
+        host, port = _split_host_port(ep)
+        if host.lower() in whitelisted_hosts:
+            continue
+        try:
+            ips = [str(ipaddress.ip_address(host))]
+        except ValueError:
+            try:
+                ips = resolve(host)
+            except (socket.gaierror, OSError) as exc:
+                raise RuntimeError(f"cannot resolve endpoint host {host!r}: {exc}") from exc
+            if not ips:
+                raise RuntimeError(f"endpoint host {host!r} resolved to no IPv4 address")
+        for ip in ips:
+            if any(ipaddress.ip_address(ip) in n for n in nets):
+                raise RuntimeError(
+                    f"endpoint {ep} resolves into a denied CIDR ({ip}); refusing to accept it "
+                    f"through the quarantine (use the SNI tunnel for CDN-shared hosts)")
+            if (ip, port) not in rules:
+                rules.append((ip, port))
+    return rules
+
+
 class ContainerSetup:
     """Docker container initialization with fakeroot user and Claude credentials."""
+
+    # Instance defaults for objects built without __init__ (tests) and for the
+    # harness's own containers: the agent user is fakeroot, no extra endpoints.
+    agent_user: str = "fakeroot"
+    agent_home: str = "/home/fakeroot"
+    allow_endpoints: tuple = ()
 
     def __init__(
         self,
@@ -366,6 +446,7 @@ class ContainerSetup:
         agent_version: Optional[str] = None,
         repo_name: Optional[str] = None,
         runtime_policy_binding: Optional[RuntimePolicyBinding] = None,
+        agent_user: str = "fakeroot",
     ):
         """Initialize container setup.
 
@@ -394,6 +475,15 @@ class ContainerSetup:
         self._framework: AgentFramework = get_agent_framework(agent_framework_name, **framework_kwargs)
         self.repo_name = repo_name
         self.runtime_policy_binding = runtime_policy_binding
+        # The unprivileged in-container user the agent runs as. The harness
+        # creates `fakeroot` in its own init script; a consumer-built sandbox
+        # (harness.api.quarantine_container) names its own user, and every
+        # lock/verify step keyed on the agent user follows this field.
+        self.agent_user = agent_user
+        self.agent_home = "/root" if agent_user == "root" else f"/home/{agent_user}"
+        # Extra `host:port` / `ip:port` endpoints the lockdown must admit (the
+        # policy server of an RL consumer). Verified reachable after the lock.
+        self.allow_endpoints: list[str] = []
         self.resolved_image_id: Optional[str] = None
         # SNI-pinned tunnel sidecar (anti-cheat method A). Started when this
         # repo's quarantine would CIDR-block the trial's LLM endpoint (a
@@ -430,6 +520,12 @@ class ContainerSetup:
                     f"Quarantine env recovered from policy for "
                     f"'{repo_name or _repo_from_image(image_name)}' (env-less launch path)"
                 )
+
+    def _for_agent_user(self, script: str) -> str:
+        """Re-key a fakeroot-authored container script on the configured agent user."""
+        if self.agent_user == "fakeroot":
+            return script
+        return script.replace("/home/fakeroot", self.agent_home).replace("fakeroot", self.agent_user)
 
     def _verify_bound_runtime_policy_env(self) -> None:
         """Fail closed if process env no longer matches the trial binding."""
@@ -973,7 +1069,7 @@ from pathlib import Path
 
 cache_paths = {cache_paths!r}
 maven_repo = {maven_repo!r}
-fake_user = pwd.getpwnam("fakeroot")
+fake_user = pwd.getpwnam({self.agent_user!r})
 uid, gid = fake_user.pw_uid, fake_user.pw_gid
 fake_groups = set(os.getgrouplist(fake_user.pw_name, gid))
 
@@ -1142,6 +1238,7 @@ chmod 0444 __GO_SHELL_ENV__
 '''
         script = script.replace("__GO_FILE_PROXY__", GO_OFFLINE_FILE_PROXY)
         script = script.replace("__GO_SHELL_ENV__", GO_OFFLINE_SHELL_ENV)
+        script = self._for_agent_user(script)
         result = subprocess.run(
             ["docker", "exec", self.container_name, "sh", "-c", script],
             capture_output=True,
@@ -1200,6 +1297,7 @@ for path in "$module" /home/fakeroot/.cache/go-build \
   fi
 done
 '''
+        script = self._for_agent_user(script)
         result = subprocess.run(
             [
                 "docker", "exec", self.container_name, "sh", "-c", script,
@@ -1251,20 +1349,22 @@ test -r __GO_SHELL_ENV__
 test ! -w __GO_SHELL_ENV__
 '''
         script = script.replace("__GO_SHELL_ENV__", GO_OFFLINE_SHELL_ENV)
+        script = self._for_agent_user(script)
+        _h = self.agent_home
         env = [
-            "-e", "HOME=/home/fakeroot",
+            "-e", f"HOME={_h}",
             "-e", f"GOPROXY={GO_OFFLINE_FILE_PROXY}",
             "-e", "GONOPROXY=none",
             "-e", "GOSUMDB=off",
             "-e", "GOTOOLCHAIN=local",
             "-e", "GOFLAGS=-buildvcs=false",
-            "-e", "GOENV=/home/fakeroot/.cache/evoclaw-goenv/env",
+            "-e", f"GOENV={_h}/.cache/evoclaw-goenv/env",
             "-e", f"BASH_ENV={GO_OFFLINE_SHELL_ENV}",
-            "-e", "GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache",
-            "-e", "GOCACHE=/home/fakeroot/.cache/go-build",
-            "-e", "GOBIN=/home/fakeroot/go/bin",
+            "-e", f"GOMODCACHE={_h}/.cache/evoclaw-gomodcache",
+            "-e", f"GOCACHE={_h}/.cache/go-build",
+            "-e", f"GOBIN={_h}/go/bin",
             "-e", (
-                "PATH=/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
+                f"PATH={_h}/go/bin:/usr/local/go/bin:/go/bin:"
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             ),
         ]
@@ -1275,7 +1375,7 @@ test ! -w __GO_SHELL_ENV__
             env.extend(["-e", f"GOLANG_VERSION={expected}"])
         result = subprocess.run(
             [
-                "docker", "exec", "--user", "fakeroot", *env,
+                "docker", "exec", "--user", self.agent_user, *env,
                 self.container_name, "sh", "-c", script,
             ],
             capture_output=True,
@@ -1292,16 +1392,16 @@ test ! -w __GO_SHELL_ENV__
         required = {
             "executable=/usr/local/go/bin/go",
             "goroot=/usr/local/go",
-            "gomodcache=/home/fakeroot/.cache/evoclaw-gomodcache",
-            "gocache=/home/fakeroot/.cache/go-build",
+            f"gomodcache={_h}/.cache/evoclaw-gomodcache",
+            f"gocache={_h}/.cache/go-build",
             f"goproxy={GO_OFFLINE_FILE_PROXY}",
             "gotoolchain=local",
             "goflags=-buildvcs=false",
-            "goenv=/home/fakeroot/.cache/evoclaw-goenv/env",
+            f"goenv={_h}/.cache/evoclaw-goenv/env",
             f"bash_env={GO_OFFLINE_SHELL_ENV}",
             "bash_go=/usr/local/go/bin/go",
             f"bash_goproxy={GO_OFFLINE_FILE_PROXY}",
-            "bash_goenv=/home/fakeroot/.cache/evoclaw-goenv/env",
+            f"bash_goenv={_h}/.cache/evoclaw-goenv/env",
             "bash_goflags=-buildvcs=false",
         }
         missing = sorted(item for item in required if item not in output.splitlines())
@@ -1339,7 +1439,7 @@ test ! -w __GO_SHELL_ENV__
         logger.info("Disposable Go module cache reset before agent invocation")
 
     def _verify_quarantine_cache_access(self) -> None:
-        """Fail fast when fakeroot cannot consume an image-baked cache."""
+        """Fail fast when the agent user cannot consume an image-baked cache."""
         cache_paths = _configured_cache_paths()
         maven_repo = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL", "").strip()
         go_offline = bool(os.environ.get("SWE_MILESTONE_GO_OFFLINE"))
@@ -1366,9 +1466,9 @@ test ! -w __GO_SHELL_ENV__
                     "docker",
                     "exec",
                     "--user",
-                    "fakeroot",
+                    self.agent_user,
                     "-e",
-                    "HOME=/home/fakeroot",
+                    f"HOME={self.agent_home}",
                     self.container_name,
                     "/bin/sh",
                     "-c",
@@ -1387,10 +1487,10 @@ test ! -w __GO_SHELL_ENV__
                     or "path missing, empty, or permission denied"
                 )
                 raise RuntimeError(
-                    "Configured offline cache is not usable by fakeroot: "
+                    f"Configured offline cache is not usable by {self.agent_user}: "
                     f"{cache_path} ({detail})"
                 )
-            logger.info(f"Offline cache is usable by fakeroot: {cache_path}")
+            logger.info(f"Offline cache is usable by {self.agent_user}: {cache_path}")
 
     def _verify_maven_offline_smoke(self) -> None:
         """Load Maven extensions and config-selected plugin engines offline."""
@@ -1414,9 +1514,9 @@ test ! -w __GO_SHELL_ENV__
                 "docker",
                 "exec",
                 "--user",
-                "fakeroot",
+                self.agent_user,
                 "-e",
-                "HOME=/home/fakeroot",
+                f"HOME={self.agent_home}",
                 "-w",
                 self.workdir,
                 self.container_name,
@@ -1675,9 +1775,9 @@ echo "Git history truncated successfully"
                 "docker",
                 "exec",
                 "--user",
-                "fakeroot",
+                self.agent_user,
                 "-e",
-                "HOME=/home/fakeroot",
+                f"HOME={self.agent_home}",
                 "-w",
                 "/testbed",
                 self.container_name,
@@ -1958,6 +2058,19 @@ echo "Git history truncated successfully"
                 continue
             accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
 
+        # Endpoint accepts: the trial's LLM endpoint when its host is not in the
+        # static whitelist (an IP literal or a self-served policy behind an
+        # Anthropic-compatible adapter), plus any consumer-declared endpoints.
+        # Port-scoped, deny-CIDR checked, never a hostname the agent controls.
+        endpoint_rules = endpoint_accept_rules(
+            [self._framework.get_network_endpoint_url() or ""] + list(self.allow_endpoints),
+            deny_cidrs=_deny_cidrs,
+            whitelisted_hosts=set(WHITELISTED_DOMAINS),
+        )
+        for ip, port in endpoint_rules:
+            accept_lines.append(f"iptables -A OUTPUT -d {ip} -p tcp --dport {port} -j ACCEPT")
+        if endpoint_rules:
+            logger.info(f"  Endpoint accepts: {sorted(f'{ip}:{port}' for ip, port in endpoint_rules)}")
         accept_block = "\n".join(accept_lines)
 
         iptables_script = f"""set -e
@@ -2045,29 +2158,30 @@ echo "/etc/hosts poisoned with {len(_poison)} domains"
             raise RuntimeError("Go-offline policy did not resolve to the local file proxy")
         _go_extra = ""
         _go_shell_extra = ""
+        _home = self.agent_home
         if _go_offline:
-            _go_extra = """
+            _go_extra = f"""
 GONOPROXY=none
 GOSUMDB=off
 GOTOOLCHAIN=local
 GOFLAGS=-buildvcs=false
-GOENV=/home/fakeroot/.cache/evoclaw-goenv/env
+GOENV={_home}/.cache/evoclaw-goenv/env
 BASH_ENV={GO_OFFLINE_SHELL_ENV}
-GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache
-GOCACHE=/home/fakeroot/.cache/go-build
-GOBIN=/home/fakeroot/go/bin
+GOMODCACHE={_home}/.cache/evoclaw-gomodcache
+GOCACHE={_home}/.cache/go-build
+GOBIN={_home}/go/bin
 """
-            _go_shell_extra = """
+            _go_shell_extra = f"""
 export GONOPROXY=none
 export GOSUMDB=off
 export GOTOOLCHAIN=local
 export GOFLAGS=-buildvcs=false
-export GOENV=/home/fakeroot/.cache/evoclaw-goenv/env
+export GOENV={_home}/.cache/evoclaw-goenv/env
 export BASH_ENV={GO_OFFLINE_SHELL_ENV}
-export GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache
-export GOCACHE=/home/fakeroot/.cache/go-build
-export GOBIN=/home/fakeroot/go/bin
-export PATH=/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:$PATH
+export GOMODCACHE={_home}/.cache/evoclaw-gomodcache
+export GOCACHE={_home}/.cache/go-build
+export GOBIN={_home}/go/bin
+export PATH={_home}/go/bin:/usr/local/go/bin:/go/bin:$PATH
 """
         go_env_script = f"""
 # Configure Go module fetching (quarantine-aware)
@@ -2078,9 +2192,9 @@ GONOSUMDB=*
 {_go_extra}
 EOF
 
-# Also set for fakeroot's shell profile
-mkdir -p /home/fakeroot
-cat >> /home/fakeroot/.bashrc << 'EOF'
+# Also set for the agent user's shell profile
+mkdir -p {_home}
+cat >> {_home}/.bashrc << 'EOF'
 export GOPROXY={_goproxy}
 export GONOSUMCHECK=*
 export GONOSUMDB=*
@@ -2103,7 +2217,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
                 self.container_name,
                 "/bin/sh",
                 "-c",
-                "rm -f /etc/sudoers.d/fakeroot && echo 'sudoers removed'",
+                f"rm -f /etc/sudoers.d/{self.agent_user} && echo 'sudoers removed'",
             ],
             capture_output=True,
             text=True,
@@ -2121,7 +2235,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
 
         logger.info("Network lockdown applied successfully")
 
-    def _url_reachable_in_container(self, url: str, user: str = "fakeroot") -> bool:
+    def _url_reachable_in_container(self, url: str, user: Optional[str] = None) -> bool:
         """True if `url`'s host:port is reachable (TCP) from inside the container.
 
         Uses python3 (guaranteed present by init) rather than curl, so the
@@ -2148,6 +2262,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
             "except Exception:\n"
             "    print('BLOCK')\n"
         )
+        user = user or self.agent_user
         try:
             result = subprocess.run(
                 [
@@ -2169,7 +2284,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         return _interpret_probe(result.returncode, result.stdout)
 
     def _tls_handshake_reachable_in_container(
-        self, connect_host: str, port: int, sni: str, user: str = "fakeroot"
+        self, connect_host: str, port: int, sni: str, user: Optional[str] = None
     ) -> bool:
         """True if a TLS handshake to connect_host:port with `sni` completes.
 
@@ -2179,6 +2294,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         registry SNI does NOT (the forwarder drops it). Certs are not verified —
         a completed ServerHello is proof the connection was relayed.
         """
+        user = user or self.agent_user
         probe = (
             "import sys, socket, ssl\n"
             "host, port, sni = sys.argv[1], int(sys.argv[2]), sys.argv[3]\n"
@@ -2274,15 +2390,15 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
                 f"iptables output: {policy_result.stdout}"
             )
 
-        # Verify a blocked domain is unreachable (as fakeroot, 3s timeout)
+        # Verify a blocked domain is unreachable (as the agent user, 3s timeout)
         curl_result = subprocess.run(
             [
                 "docker",
                 "exec",
                 "--user",
-                "fakeroot",
+                self.agent_user,
                 "-e",
-                "HOME=/home/fakeroot",
+                f"HOME={self.agent_home}",
                 self.container_name,
                 "curl",
                 "-s",
@@ -2390,9 +2506,9 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
                 "docker",
                 "exec",
                 "--user",
-                "fakeroot",
+                self.agent_user,
                 "-e",
-                "HOME=/home/fakeroot",
+                f"HOME={self.agent_home}",
                 self.container_name,
                 "sudo",
                 "-n",
@@ -2402,10 +2518,25 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
             text=True,
         )
         if sudo_result.returncode == 0:
-            raise RuntimeError("Network lockdown verification failed: fakeroot still has sudo access")
+            raise RuntimeError(f"Network lockdown verification failed: {self.agent_user} still has sudo access")
 
         # SNI tunnel (if active): endpoint relays, registry-SNI detour blocked.
         self._verify_sni_tunnel()
+
+        # Consumer-declared endpoints must be reachable through the lock: a
+        # policy server the agent cannot reach yields a session that produces a
+        # plausible zero, which is exactly the class of failure this gate exists
+        # to turn into an error.
+        for ep in self.allow_endpoints:
+            host, port = _split_host_port(ep)
+            if not self._url_reachable_in_container(f"http://{host}:{port}"):
+                raise RuntimeError(
+                    f"Network lockdown verification failed: allowed endpoint {ep} is not "
+                    f"reachable from the container (host-side listener down, or the docker "
+                    f"bridge blocks container->host traffic on this machine)"
+                )
+        if self.allow_endpoints:
+            logger.info(f"  Allowed endpoints reachable: {self.allow_endpoints}")
 
         logger.info("  Lockdown verified: github.com blocked, sudo revoked, OUTPUT policy DROP")
         return True
@@ -2413,7 +2544,7 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
     def docker_exec(
         self,
         cmd: list[str],
-        user: str = "fakeroot",
+        user: Optional[str] = None,
         check: bool = True,
         capture_output: bool = True,
     ) -> subprocess.CompletedProcess:
@@ -2421,13 +2552,14 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
 
         Args:
             cmd: Command to execute
-            user: User to run as (default: fakeroot)
+            user: User to run as (default: the agent user)
             check: If True, raise on non-zero exit
             capture_output: If True, capture stdout/stderr
 
         Returns:
             CompletedProcess result
         """
+        user = user or self.agent_user
         docker_cmd = [
             "docker",
             "exec",

@@ -260,3 +260,35 @@ Code talks to Vertex directly.
 separate pipeline in the sibling `analysis/` repo — see
 `analysis/docs/dashboard_migration.md` (migrate → register → refresh → build,
 plus the PYTHONPATH pitfall that silently under-reports cost).
+
+## Self-served policy behind an Anthropic-compatible adapter
+
+An RL stack that serves its own model (piston's `PistonAnthropicAdapter` in
+front of an SGLang engine, model id `slime-actor`) is a third-party endpoint
+from claude-code's point of view, with three differences from a hosted provider:
+
+| Concern | Hosted provider (Z.AI, Moonshot, ...) | Self-served policy |
+|---|---|---|
+| endpoint | a whitelisted domain (`WHITELISTED_DOMAINS`) | an IP:port on the docker bridge gateway (`http://172.17.0.1:18001`); the lockdown admits it port-scoped from `UNIFIED_BASE_URL` |
+| model id | a priced id in `pricing.py` | `slime-actor`, priced at zero (an unknown id would silently take the claude-sonnet default) |
+| context regime | the endpoint's own window | pinned by the consumer through `agent_env` (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, the `*_MODEL` slots) |
+| session identity | one key per trial | the adapter keys sessions by the API key the container sends (`x-api-key`), so `run_trial` gives every repo its own key value `<trial>/<repo>` |
+| agent version | any pin | `2.1.193`: the first version where `CLAUDE_CODE_MAX_CONTEXT_TOKENS` applies to a custom model id; `latest` would silently change the regime |
+
+The CTE entry point is `harness.api.run_trial` (`python -m harness.api
+run-trial --config <yaml>`): it builds each repo's command with the launcher's
+own `build_cmd`, runs `harness.e2e.run_e2e` per repo in parallel with an
+explicit worker environment (no inherited `EVOCLAW_*` or stray
+`SWE_MILESTONE_*` knobs), and aggregates with `collect_results` into one
+`TrialResult` (per-milestone raw counters, per-repo counts with one name per
+meaning, the harness's own summary for audit, macro and micro aggregates,
+provenance). `--dry-run` prints the commands and environments without
+launching; `--aggregate-only` re-aggregates an existing trial.
+
+The ITE (per-milestone) counterpart for a consumer-built sandbox is the
+pre-agent sequence in `harness/api.py`: create the agent user, then
+`harden_container` (git history truncation, ownership restored),
+`mask_tests`, `quarantine_container` (the repo's anti-cheat policy applied and
+verified, the adapter endpoint admitted through `allow_endpoints`), and
+`verify_masking` last. Any recursive chown of `/testbed` after `mask_tests`
+undoes the mask silently; `verify_masking` is the guard.

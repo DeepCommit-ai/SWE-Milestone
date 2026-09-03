@@ -40,7 +40,7 @@ import yaml
 
 from harness.e2e.orchestrator import E2EOrchestrator, SubmissionTagMoved
 from harness.e2e.agent_runner import E2EAgentRunner
-from harness.e2e.agents.claude_code import validate_claude_code_version
+from harness.e2e.agents.claude_code import parse_agent_env, validate_claude_code_version
 from harness.e2e.log_parser import get_parser
 from harness.e2e.repo_config_binding import (
     freeze_repo_config,
@@ -2980,6 +2980,9 @@ Example:
         # SWE_MILESTONE_AUTO_COMPACT_WINDOW env var); recorded here so the monitor can
         # display it. None when the config doesn't set it.
         "auto_compact_window": os.environ.get("SWE_MILESTONE_AUTO_COMPACT_WINDOW"),
+        # Consumer-pinned container env (harness/api.run_trial agent_env / trial
+        # config agent_env:), applied last by ClaudeCodeFramework; None when unset.
+        "agent_env": parse_agent_env(os.environ.get("SWE_MILESTONE_AGENT_ENV")) or None,
         # Native claude-code Tool Search pin ("true"/"false"/"auto"/"auto:N").
         # Set from the trial config `enable_tool_search` (propagated via the
         # SWE_MILESTONE_ENABLE_TOOL_SEARCH env var). None = config didn't set it,

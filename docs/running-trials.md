@@ -94,6 +94,14 @@ Two forms for `trial_name`:
 > container and the agent talks to Vertex directly (no proxy). You set
 > neither `UNIFIED_API_KEY` nor `UNIFIED_BASE_URL`. See [`vertex-ai.md`](./vertex-ai.md).
 
+> **Extra container env (`agent_env`, claude-code only):** a mapping of
+> variables injected into the agent container after every harness-derived
+> variable, so a pinned value wins (for example the context pins a self-served
+> policy needs: `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`).
+> Recorded in `trial_metadata.json` as `agent_env`. The RL seam's CTE entry point
+> (`harness.api.run_trial`) passes the same mapping; see
+> [`adding-a-model.md`](./adding-a-model.md#self-served-policy-behind-an-anthropic-compatible-adapter).
+
 ---
 
 ## Resume / Force / New

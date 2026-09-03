@@ -28,6 +28,50 @@ def validate_agent_cli_version(value: Optional[str], *, agent_label: str) -> Opt
     )
 
 
+def quarantine_agent_env(agent_home: str = "/home/fakeroot") -> Dict[str, str]:
+    """The environment the AGENT PROCESS must carry under quarantine.
+
+    Derived from the runtime-policy env (SWE_MILESTONE_*_OFFLINE, MAVEN_REPO_LOCAL,
+    GO_TOOLCHAIN) in this process. Go's writable caches live under the agent's
+    home, hence the parameter; the module download cache is the image-baked
+    file:// proxy. Returned as an ordered mapping; the docker ``-e`` form is
+    :meth:`AgentFramework.get_quarantine_env_vars`."""
+    env: Dict[str, str] = {}
+    if os.environ.get("SWE_MILESTONE_PIP_OFFLINE"):
+        env["PIP_NO_INDEX"] = "1"
+        env["PIP_FIND_LINKS"] = "/wheelhouse"
+    if os.environ.get("SWE_MILESTONE_CARGO_OFFLINE"):
+        env["CARGO_NET_OFFLINE"] = "true"
+    if os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
+        expected_go = os.environ.get("SWE_MILESTONE_GO_TOOLCHAIN", "").removeprefix("go")
+        home = agent_home.rstrip("/") or "/home/fakeroot"
+        env["GOPROXY"] = GO_OFFLINE_FILE_PROXY
+        env["GONOPROXY"] = "none"
+        env["GOSUMDB"] = "off"
+        env["GOTOOLCHAIN"] = "local"
+        env["GOFLAGS"] = "-buildvcs=false"
+        env["GOENV"] = f"{home}/.cache/evoclaw-goenv/env"
+        env["BASH_ENV"] = GO_OFFLINE_SHELL_ENV
+        env["GOMODCACHE"] = f"{home}/.cache/evoclaw-gomodcache"
+        env["GOCACHE"] = f"{home}/.cache/go-build"
+        env["GOBIN"] = f"{home}/go/bin"
+        env["PATH"] = (f"{home}/go/bin:/usr/local/go/bin:/go/bin:"
+                       "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        if expected_go:
+            env["GOLANG_VERSION"] = expected_go
+    if os.environ.get("SWE_MILESTONE_MAVEN_OFFLINE"):
+        margs = "-o"
+        repo_local = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL")
+        if repo_local:
+            # The image's populated cache lives under root's home; the
+            # agent runs as fakeroot, whose own ~/.m2 starts empty.
+            margs += f" -Dmaven.repo.local={repo_local}"
+        env["MAVEN_ARGS"] = margs
+    if os.environ.get("SWE_MILESTONE_NPM_OFFLINE"):
+        env["npm_config_offline"] = "true"
+    return env
+
+
 class AgentFramework(ABC):
     """Abstract base class for agent framework implementations.
 
@@ -192,43 +236,14 @@ class AgentFramework(ABC):
         their own image-baked caches. The local-only Go contract is also sealed
         in a root-owned BASH_ENV and written into the container profiles, since
         login shells can override a bare docker ``-e``. See docs/quarantine.md.
-        """
+
+        The harness runs the agent as fakeroot; the dict form lives in
+        :func:`quarantine_agent_env` so a consumer-built sandbox with another
+        agent user (harness.api.quarantine_container) gets the same contract
+        keyed by its own home."""
         env: List[str] = []
-        if os.environ.get("SWE_MILESTONE_PIP_OFFLINE"):
-            env += ["-e", "PIP_NO_INDEX=1", "-e", "PIP_FIND_LINKS=/wheelhouse"]
-        if os.environ.get("SWE_MILESTONE_CARGO_OFFLINE"):
-            env += ["-e", "CARGO_NET_OFFLINE=true"]
-        if os.environ.get("SWE_MILESTONE_GO_OFFLINE"):
-            expected_go = os.environ.get("SWE_MILESTONE_GO_TOOLCHAIN", "").removeprefix("go")
-            go_path = (
-                "/home/fakeroot/go/bin:/usr/local/go/bin:/go/bin:"
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            )
-            env += [
-                "-e", f"GOPROXY={GO_OFFLINE_FILE_PROXY}",
-                "-e", "GONOPROXY=none",
-                "-e", "GOSUMDB=off",
-                "-e", "GOTOOLCHAIN=local",
-                "-e", "GOFLAGS=-buildvcs=false",
-                "-e", "GOENV=/home/fakeroot/.cache/evoclaw-goenv/env",
-                "-e", f"BASH_ENV={GO_OFFLINE_SHELL_ENV}",
-                "-e", "GOMODCACHE=/home/fakeroot/.cache/evoclaw-gomodcache",
-                "-e", "GOCACHE=/home/fakeroot/.cache/go-build",
-                "-e", "GOBIN=/home/fakeroot/go/bin",
-                "-e", f"PATH={go_path}",
-            ]
-            if expected_go:
-                env += ["-e", f"GOLANG_VERSION={expected_go}"]
-        if os.environ.get("SWE_MILESTONE_MAVEN_OFFLINE"):
-            margs = "-o"
-            repo_local = os.environ.get("SWE_MILESTONE_MAVEN_REPO_LOCAL")
-            if repo_local:
-                # The image's populated cache lives under root's home; the
-                # agent runs as fakeroot, whose own ~/.m2 starts empty.
-                margs += f" -Dmaven.repo.local={repo_local}"
-            env += ["-e", f"MAVEN_ARGS={margs}"]
-        if os.environ.get("SWE_MILESTONE_NPM_OFFLINE"):
-            env += ["-e", "npm_config_offline=true"]
+        for key, value in quarantine_agent_env("/home/fakeroot").items():
+            env += ["-e", f"{key}={value}"]
         return env
 
     def get_effective_reasoning_effort(self) -> Optional[str]:

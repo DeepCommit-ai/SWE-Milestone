@@ -1,10 +1,11 @@
 """Claude Code agent framework implementation."""
 
+import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
 from harness.e2e.model_aliases import resolve_model_alias
@@ -32,6 +33,57 @@ def parse_claude_code_version(output: str) -> Optional[str]:
     """Extract the numeric version from ``claude --version`` output."""
     match = _CLAUDE_CODE_VERSION_RE.search(output or "")
     return match.group(1) if match else None
+
+
+_AGENT_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def parse_agent_env(raw: Optional[str]) -> Dict[str, str]:
+    """Parse SWE_MILESTONE_AGENT_ENV (a JSON object of str -> str) strictly.
+
+    A malformed value is a hard error: a silently dropped context pin would run
+    the trial under a different compaction regime than the one recorded."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SWE_MILESTONE_AGENT_ENV is not valid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("SWE_MILESTONE_AGENT_ENV must be a JSON object of KEY -> value")
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        if not isinstance(k, str) or not _AGENT_ENV_KEY_RE.match(k):
+            raise ValueError(f"SWE_MILESTONE_AGENT_ENV: invalid variable name {k!r}")
+        if v is None or isinstance(v, (dict, list)):
+            raise ValueError(f"SWE_MILESTONE_AGENT_ENV: {k} must be a scalar, got {type(v).__name__}")
+        out[k] = str(v)
+    return out
+
+
+def apply_agent_env_overrides(env_vars: List[str], overrides: Dict[str, str]) -> List[str]:
+    """Return the `-e KEY=VALUE` list with `overrides` applied (last write wins,
+    one entry per key). `env_vars` is the flat ["-e", "K=V", ...] docker form."""
+    merged: Dict[str, str] = {}
+    order: List[str] = []
+    i = 0
+    while i < len(env_vars):
+        if env_vars[i] == "-e" and i + 1 < len(env_vars):
+            key, _, value = env_vars[i + 1].partition("=")
+            if key not in merged:
+                order.append(key)
+            merged[key] = value
+            i += 2
+        else:
+            i += 1
+    for key, value in overrides.items():
+        if key not in merged:
+            order.append(key)
+        merged[key] = value
+    out: List[str] = []
+    for key in order:
+        out.extend(["-e", f"{key}={merged[key]}"])
+    return out
 
 
 def validate_tool_search_setting(value) -> Optional[str]:
@@ -328,6 +380,14 @@ class ClaudeCodeFramework(AgentFramework):
         # Quarantine mode: force pip to the offline wheelhouse (shared base
         # helper so gemini-cli & co. get the same treatment).
         env_vars.extend(self.get_quarantine_env_vars())
+        # Consumer-pinned agent environment (harness/api.run_trial `agent_env`,
+        # trial config `agent_env:`): SWE_MILESTONE_AGENT_ENV is a JSON object of
+        # extra container variables. Applied LAST and de-duplicated so a pinned
+        # value (e.g. CLAUDE_CODE_AUTO_COMPACT_WINDOW, the *_MODEL slots) wins
+        # over the harness-derived one. Recorded in trial_metadata.agent_env.
+        overrides = parse_agent_env(os.environ.get("SWE_MILESTONE_AGENT_ENV"))
+        if overrides:
+            env_vars = apply_agent_env_overrides(env_vars, overrides)
         return env_vars
 
     def get_container_mounts(self) -> List[str]:

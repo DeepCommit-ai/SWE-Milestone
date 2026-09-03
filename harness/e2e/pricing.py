@@ -34,6 +34,17 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
         "cache_write_5m": 12.50,   # 1.25x input
         "cache_write_1h": 20.0,    # 2.0x input
     },
+    # Self-served RL policy behind piston's Anthropic-compatible adapter (CTE eval
+    # column, harness/api.run_trial). No billing; an unknown id would otherwise
+    # silently take the claude-sonnet default and fabricate a cost.
+    "slime-actor": {
+        "input": 0.0,
+        "output": 0.0,
+        "cache_read": 0.0,
+        "cache_write": 0.0,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0,
+    },
     "claude-sonnet": {
         "input": 3.0,
         "output": 15.0,

@@ -642,7 +642,64 @@ def _mask_test_files(
             failed_files.append(file_path)
             logger.error(f"Failed to chmod test file: {file_path}")
 
+    masked = [f for f in test_files if f not in failed_files]
+    if masked:
+        _hide_masked_files_from_git(container_name, masked, workdir)
+
     return masked_count, failed_files
+
+
+def _hide_masked_files_from_git(
+    container_name: str,
+    masked_files: list[str],
+    workdir: str = "/testbed",
+) -> None:
+    """Keep the agent's git flow working with root:000 files in the tree.
+
+    A masked file the agent cannot read breaks its own `git add -A` / `git
+    commit` ("open(<file>): Permission denied ... unable to index file"), so it
+    can never reach the submission tag. Tracked masked files are marked
+    `skip-worktree` (git treats them as unchanged and never reads them);
+    untracked ones are listed in `.git/info/exclude`. Both are index/metadata
+    edits done as root, so the index ownership is restored afterwards for the
+    agent user that owns .git. Best-effort per file: a failure here is logged
+    and leaves the mask in place (the mask is the security property; this is
+    the usability follow-up)."""
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["docker", "exec", "--user", "root", "-w", workdir, container_name] + cmd,
+            capture_output=True, text=True,
+        )
+
+    git = ["git", "-c", "safe.directory=*"]
+    owner = _run(["stat", "-c", "%u:%g", ".git/index"])
+    index_owner = owner.stdout.strip() if owner.returncode == 0 else ""
+    tracked: list[str] = []
+    untracked: list[str] = []
+    for f in masked_files:
+        r = _run(git + ["ls-files", "--error-unmatch", "--", f])
+        (tracked if r.returncode == 0 else untracked).append(f)
+    if tracked:
+        r = _run(git + ["update-index", "--skip-worktree", "--"] + tracked)
+        if r.returncode != 0:
+            logger.warning(f"skip-worktree failed for masked files: {(r.stderr or r.stdout).strip()}")
+        else:
+            logger.info(f"Marked {len(tracked)} masked tracked file(s) skip-worktree")
+    if untracked:
+        lines = "\n".join("/" + f.lstrip("/") for f in untracked)
+        r = _run(["sh", "-c", f"mkdir -p .git/info && printf '%s\n' {_sq(lines)} >> .git/info/exclude"])
+        if r.returncode != 0:
+            logger.warning(f"could not exclude untracked masked files: {(r.stderr or r.stdout).strip()}")
+        else:
+            logger.info(f"Excluded {len(untracked)} masked untracked file(s) via .git/info/exclude")
+    if index_owner:
+        _run(["chown", index_owner, ".git/index"])
+        _run(["sh", "-c", f"[ -f .git/info/exclude ] && chown {index_owner} .git/info .git/info/exclude || true"])
+
+
+def _sq(value: str) -> str:
+    """POSIX single-quote for embedding in `sh -c`."""
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 def _verify_file_exists(
