@@ -543,3 +543,19 @@ def test_seam_exposes_the_cte_companions(tmp_path):
     assert api.discover_repos(root, ["nomatch"]) == []
     img = api.repo_image("myrepo", unprotected=True, project_root=tmp_path)
     assert img.startswith("swe-milestone/myrepo__base")
+
+
+def test_graded_milestones_subtracts_the_non_graded_list(tmp_path):
+    """`list_milestones` is the SELECTED set; the board's denominator is that minus non-graded."""
+    root = tmp_path / "data"
+    _make_tree(root)
+    assert api.list_milestones(root, "myrepo") == ["M001", "M002"]
+    assert api.graded_milestones(root, "myrepo") == ["M001", "M002"]
+    (root / "myrepo" / "non-graded_milestone_ids.txt").write_text("M002\n")
+    assert api.graded_milestones(root, "myrepo") == ["M001"]
+    assert api.list_milestones(root, "myrepo") == ["M001", "M002"]   # unchanged
+
+
+def test_benchmark_version_matches_the_image_tag():
+    from harness.e2e.image_version import DEFAULT_IMAGE_TAG
+    assert api.benchmark_version() == str(DEFAULT_IMAGE_TAG)

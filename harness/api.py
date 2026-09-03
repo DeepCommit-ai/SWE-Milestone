@@ -1067,6 +1067,23 @@ def session_key(trial_name: str, repo_name: str) -> str:
     return _impl(trial_name, repo_name)
 
 
+def benchmark_version() -> str:
+    """The data/image version this harness checkout grades against (the tag its images carry and
+    the tag it verifies a data checkout against)."""
+    from harness.e2e.image_version import DEFAULT_IMAGE_TAG  # noqa: PLC0415
+    return str(DEFAULT_IMAGE_TAG)
+
+
+def graded_milestones(data_root, repo: str) -> list:
+    """The milestones a trial of `repo` is SCORED over: the selected set minus the repo's
+    non-graded list. This is the denominator every ratio on the board uses, so it is not the
+    same as `list_milestones` (which is the selected set) and must not be re-derived."""
+    from harness.e2e.collect_results import load_non_graded_milestones  # noqa: PLC0415
+    root = Path(data_root)
+    non_graded = load_non_graded_milestones(root / repo)
+    return [m for m in list_milestones(root, repo) if m not in non_graded]
+
+
 def repo_image(repo: str, *, unprotected: bool = False, project_root=None) -> str:
     """The image the harness boots for `repo`: the repo-level offline closure under a protected
     runtime policy, the plain base image otherwise. Ask this rather than formatting the name, so
