@@ -3,10 +3,15 @@
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import List, Optional
 
-from harness.e2e.agents.base import AgentFramework, register_framework
+from harness.e2e.agents.base import (
+    AgentFramework,
+    register_framework,
+    validate_agent_cli_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,7 @@ class GeminiFramework(AgentFramework):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         include_directories: Optional[List[str]] = None,
+        agent_version: Optional[str] = None,
         **kwargs,  # Accept and ignore extra params like reasoning_effort
     ):
         """Initialize Gemini framework.
@@ -76,21 +82,25 @@ class GeminiFramework(AgentFramework):
             base_url: Base URL. If not provided, uses UNIFIED_BASE_URL env var.
             include_directories: Extra directories for --include-directories.
                 E2E mode passes ["/e2e_workspace"]; mstone mode passes nothing.
+            agent_version: Exact gemini-cli version to pin, or ``latest``.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self._include_directories = include_directories or []
-        # Vertex AI mode (run_all.py sets EVOCLAW_VERTEX when vertex_ai: true).
+        self._agent_version = validate_agent_cli_version(
+            agent_version, agent_label="gemini-cli"
+        )
+        # Vertex AI mode (run_all.py sets SWE_MILESTONE_VERTEX when vertex_ai: true).
         # In this mode the `model` is the exact Vertex publisher id, so the
         # "-preview" alias rewrite below must be skipped (Vertex has no
         # "gemini-3.5-flash-preview"; the bridge registers the bare id).
-        self._vertex = bool(os.environ.get("EVOCLAW_VERTEX"))
+        self._vertex = bool(os.environ.get("SWE_MILESTONE_VERTEX"))
         # Route B (direct Vertex): gemini-cli's built-in Vertex mode talks native
         # Gemini to Vertex via ADC — no LiteLLM bridge (the bridge double-prefixes
         # SSE and breaks gemini-cli's stream parser). run_all.py supplies these.
-        self._vertex_project = os.environ.get("EVOCLAW_VERTEX_PROJECT")
-        self._vertex_location = os.environ.get("EVOCLAW_VERTEX_LOCATION", "global")
+        self._vertex_project = os.environ.get("SWE_MILESTONE_VERTEX_PROJECT")
+        self._vertex_location = os.environ.get("SWE_MILESTONE_VERTEX_LOCATION", "global")
         # gemini-cli runs thinkingLevel HIGH (dynamic budget, thinkingBudget=-1)
         # by default and only exposes a thinking on/off toggle — there are no
         # graded levels and no CLI/settings knob to set one in this version. So
@@ -99,6 +109,21 @@ class GeminiFramework(AgentFramework):
         # stays on at the model's native HIGH. Recorded for reporting/parity.
         _eff = (kwargs.get("reasoning_effort") or "high").lower()
         self._reasoning_effort = "high" if _eff in ("high", "xhigh", "max") else _eff
+
+    def get_requested_version(self) -> Optional[str]:
+        return self._agent_version
+
+    def get_version_command(self) -> List[str]:
+        return ["gemini", "--version"]
+
+    def parse_version_output(self, output: str) -> Optional[str]:
+        match = re.search(r"\b(\d+\.\d+\.\d+)\b", output or "")
+        return match.group(1) if match else None
+
+    def version_matches_request(self, actual_version: str) -> bool:
+        if self._agent_version in (None, "latest"):
+            return True
+        return actual_version == self._agent_version
 
     def get_container_mounts(self) -> List[str]:
         """Return Docker volume mount arguments for Gemini.
@@ -237,21 +262,31 @@ try:
             raise Exception("Node.js installation failed")
 
     # Check if gemini is already installed and working
+    import re as _re
+    requested_version = __GEMINI_AGENT_VERSION__
     gemini_path = shutil.which('gemini')
     if gemini_path:
         success, version, _ = run_cmd(['gemini', '--version'])
-        if success:
-            print(f"Gemini CLI already installed: {version}")
-        else:
+        if not success:
             # Gemini exists but doesn't work (probably wrong Node version)
             print("Reinstalling Gemini CLI...")
             run_cmd(['npm', 'uninstall', '-g', '@google/gemini-cli'])
             gemini_path = None
+        elif requested_version == 'latest':
+            gemini_path = None  # explicit request to re-resolve the newest release
+        elif requested_version:
+            m = _re.search(r'\\b(\\d+\\.\\d+\\.\\d+)\\b', version)
+            if not m or m.group(1) != requested_version:
+                print(f"Gemini CLI {version} != requested {requested_version}; reinstalling...")
+                gemini_path = None
+        if gemini_path:
+            print(f"Gemini CLI already installed: {version}")
 
     # Install Gemini CLI if needed
     if not gemini_path:
-        print("Installing Gemini CLI via npm...")
-        success, stdout, stderr = run_cmd(['npm', 'install', '-g', '@google/gemini-cli'])
+        pkg = '@google/gemini-cli' + (f'@{requested_version}' if requested_version else '')
+        print(f"Installing Gemini CLI via npm ({pkg})...")
+        success, stdout, stderr = run_cmd(['npm', 'install', '-g', pkg])
         if success:
             print("Gemini CLI installed successfully")
         else:
@@ -345,7 +380,11 @@ __ADC_BLOCK__
         # otherwise API-key auth ("gemini-api-key").
         auth_type = "vertex-ai" if self._vertex else "gemini-api-key"
         adc_block = _GEMINI_ADC_COPY if self._vertex else ""
-        return script.replace("__AUTH_TYPE__", auth_type).replace("__ADC_BLOCK__", adc_block)
+        return (
+            script.replace("__AUTH_TYPE__", auth_type)
+            .replace("__ADC_BLOCK__", adc_block)
+            .replace("__GEMINI_AGENT_VERSION__", repr(self._agent_version))
+        )
 
     def build_run_command(
         self,

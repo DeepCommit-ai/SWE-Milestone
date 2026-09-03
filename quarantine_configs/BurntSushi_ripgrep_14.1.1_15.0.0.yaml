@@ -1,0 +1,59 @@
+# Quarantine (anti-cheat) policy — ripgrep 14.1.1 → 15.0.0
+#
+# CONFIRMED CHEAT (claude-code_fable-5_001, 2026-06-10): curl'd its own
+# workspace crates at post-baseline versions from static.crates.io
+# (grep-printer-0.3.1, ignore-0.4.26, …) and copied them in verbatim.
+# crates.io rides the same Fastly ranges as PyPI, so the deny_cidrs are
+# identical to scikit's. Cargo runs offline against the image's pre-baked
+# registry cache (workspace crates are path deps — never in the cache).
+
+ecosystem: [cargo]
+
+deny_domains:
+  - crates.io
+  - static.crates.io
+  - index.crates.io
+
+deny_cidrs:
+  - 151.101.0.0/16     # Fastly (fronts crates.io/static.crates.io)
+  - 146.75.0.0/16      # Fastly
+
+cargo_offline: true
+
+# The image cache must never contain ripgrep's own workspace crates (any
+# version — they are path deps, so any registry copy is answer material).
+cache_forbid_globs:
+  - /usr/local/cargo/registry/cache/*/grep-*.crate
+  - /usr/local/cargo/registry/cache/*/globset-[0-9]*.crate
+  - /usr/local/cargo/registry/cache/*/ignore-[0-9]*.crate
+  - /usr/local/cargo/registry/cache/*/ripgrep-[0-9]*.crate
+  - /usr/local/cargo/registry/src/*/grep-*
+  - /usr/local/cargo/registry/src/*/globset-[0-9]*
+  - /usr/local/cargo/registry/src/*/ignore-[0-9]*
+  - /usr/local/cargo/registry/src/*/ripgrep-[0-9]*
+
+# The exact URL shape of the observed cheat — must fail to connect.
+verify_fetch_urls:
+  - https://static.crates.io/crates/grep-printer/grep-printer-0.3.1.crate
+  - https://crates.io/api/v1/crates/ignore
+
+closure:
+  cache_paths:
+    - /usr/local/cargo/registry/cache
+  offline_build: "cargo build --offline"
+  # extra_vendor_crates: crate specs that appear in the golden Cargo.lock of
+  # milestone testbeds but are NOT pulled in by `cargo vendor` of those testbeds
+  # (because the testbed src doesn't declare them yet — the SRS task asks the
+  # agent to add them).  A synthetic workspace containing these exact deps is
+  # included as --sync in the vendor step so they land in /opt/vendor before the
+  # agent needs them at eval time.
+  #
+  # arbitrary 1.4.2 + derive_arbitrary 1.4.2: FR5 of maintenance_fixes_1_sub-01
+  # adds `arbitrary` as a dev-dep (or optional feature dep) to
+  # crates/globset/Cargo.toml.  The golden Cargo.lock already pins 1.4.2 (no
+  # source line → local path dep).  cargo vendor of the current testbed src
+  # (0.4.15, no arbitrary) never fetches it, so cargo test --offline after the
+  # agent implements FR5 fails with "not found in vendored sources".
+  extra_vendor_crates:
+    - "arbitrary = \"=1.4.2\""
+    - "derive_arbitrary = \"=1.4.2\""

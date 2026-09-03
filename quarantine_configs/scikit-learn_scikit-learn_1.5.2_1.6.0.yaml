@@ -2,14 +2,16 @@
 #
 # Repo-intrinsic, configured ONCE per repo. Auto-on: the mere presence of this
 # file makes run_all.py apply the policy to this repo's container (no trial-
-# config flag). To run an UNPROTECTED baseline for this repo, move this file
-# aside temporarily. See docs/quarantine.md.
+# config flag). To run an UNPROTECTED baseline pass --unprotected to run_all.py
+# (moving this file aside would trip the coverage gate). See docs/quarantine.md.
 #
 # Why: scikit-learn cheated by `pip download scikit-learn==1.6.0` — pulling its
 # own target-version source from PyPI. Block PyPI at the network layer (domain +
 # the Fastly CDN range it rides; the domain alone is insufficient, raw curl still
 # reached the wheel) and force pip offline against a vetted dependency closure
 # that excludes scikit-learn by construction.
+
+ecosystem: [pip]
 
 # Registry domains denied at the iptables layer (excluded from the whitelist).
 deny_domains:
@@ -22,14 +24,23 @@ deny_cidrs:
   - 151.101.0.0/16     # Fastly (fronts PyPI/pythonhosted)
   - 146.75.0.0/16      # Fastly
 
-# Offline pip dependency closure. Built by scripts/build_quarantine_wheelhouse.py
-# in the clean base image. The host base lives in EVOCLAW_WHEELHOUSE_DIR
-# (set once in .env_private) so this committed file carries no host path.
-pip_wheelhouse: ${EVOCLAW_WHEELHOUSE_DIR}/sk_wheelhouse
+# Offline pip dependency closure. Baked into base-offline:latest at /wheelhouse
+# by scripts/build_offline_closure.py (B-aware closure builder). The wheelhouse
+# is self-contained in the image — no host path required.
+# (pip_wheelhouse: host-path key removed; wheelhouse is in-image)
 
-# Fail closed at startup if the wheelhouse ships the repo's own package (any
-# version/alias) — guarantees the offline index can't serve the answer.
+# Fail closed at BUILD TIME if the wheelhouse ships the repo's own package (any
+# version/alias) — audited by scripts/build_offline_closure.py audit_wheelhouse_self_exclusion.
 wheelhouse_forbid:
   - scikit-learn
   - scikit_learn
   - sklearn
+
+# The exact channel of the original confirmed cheat — must fail to connect.
+verify_fetch_urls:
+  - https://pypi.org/simple/scikit-learn/
+  - https://files.pythonhosted.org/
+
+closure:
+  cache_paths: []
+  offline_build: "pip install --no-index -f /wheelhouse -r /tmp/union_reqs.txt"

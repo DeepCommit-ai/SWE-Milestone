@@ -1,0 +1,21 @@
+data_root: ${SWE_MILESTONE_DATA_ROOT}
+trial_name: codex_gpt-5.6-sol
+agent: codex
+model: gpt-5.6-sol
+timeout: 18000
+reasoning_effort: max
+
+# Auth: OAuth (ChatGPT) file mode. The harness mounts host ~/.codex/auth.json
+# into the container automatically WHEN UNIFIED_API_KEY is unset. So for this
+# trial do NOT export UNIFIED_API_KEY / UNIFIED_BASE_URL, and leave base_url /
+# api_key_env unset here — any of those flips codex into API-key mode.
+#
+# Service tier: standard (NOT the "fast"/priority 1.5x tier). The harness
+# generates a clean config.toml (only web_search=disabled + openai_base_url),
+# so no priority/fast tier is enabled — nothing extra to set.
+#
+# reasoning_effort=max is a gpt-5.6-sol level (low|medium|high|xhigh|max|ultra;
+# the model default is "low", so it MUST be set explicitly here).
+
+# Uncomment to pin the codex CLI version instead of installing latest.
+# agent_version: 0.144.5

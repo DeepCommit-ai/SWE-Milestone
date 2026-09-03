@@ -1,0 +1,17 @@
+data_root: ${SWE_MILESTONE_DATA_ROOT}
+trial_name: claude-code_glm-5.2-1m
+agent: claude-code
+# Z.AI bigmodel Anthropic-compatible endpoint (ZAI_BASE_URL / ZAI_API_KEY in .env_private).
+base_url: ${ZAI_BASE_URL}
+api_key_env: ZAI_API_KEY
+model: glm-5.2
+default_agent_model: glm-5.2
+reasoning_effort: max
+timeout: 18000
+# 1M-context variant. Historical: this config relied on claude-code 2.1.212's
+# native default (no compaction for unknown models; measured up to 920K). On
+# >=2.1.24x that default compacts at ~167K — declare auto_compact_window
+# explicitly (see claude-code_glm-5.3-1m.yaml) for any future 1M run.
+
+# Uncomment to pin the claude-code CLI version instead of installing latest.
+# agent_version: 2.1.210

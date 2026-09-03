@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Set, Optional
 from dataclasses import dataclass
 
+try:
+    from .test_detector import resolve_ast_grep
+except ImportError:  # direct script execution (python verify_test_separation.py)
+    from test_detector import resolve_ast_grep
+
 
 @dataclass
 class Hunk:
@@ -192,7 +197,7 @@ def _find_test_ranges_with_ast_grep(content: str, file_path: str) -> List[Tuple[
         # Pattern 1: Match test modules by name convention (mod tests { ... })
         # This is the most common pattern and ast-grep can match it accurately
         result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "mod tests { $$$BODY }", "--lang", "rust", "--json", temp_path],
+            [resolve_ast_grep(), "run", "--pattern", "mod tests { $$$BODY }", "--lang", "rust", "--json", temp_path],
             capture_output=True,
             text=True,
             timeout=30,
@@ -222,7 +227,7 @@ def _find_test_ranges_with_ast_grep(content: str, file_path: str) -> List[Tuple[
         # Pattern 2: Find #[cfg(test)] attributes and their associated items
         # for cases where the module is not named "tests"
         result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "#[cfg(test)]", "--lang", "rust", "--json", temp_path],
+            [resolve_ast_grep(), "run", "--pattern", "#[cfg(test)]", "--lang", "rust", "--json", temp_path],
             capture_output=True,
             text=True,
             timeout=10,
@@ -247,7 +252,7 @@ def _find_test_ranges_with_ast_grep(content: str, file_path: str) -> List[Tuple[
                         mod_name = mod_match.group(1)
                         result2 = subprocess.run(
                             [
-                                "ast-grep",
+                                resolve_ast_grep(),
                                 "run",
                                 "--pattern",
                                 f"mod {mod_name} {{ $$$BODY }}",
@@ -327,7 +332,7 @@ def find_test_code_ranges(file_path: str) -> List[Tuple[int, int, str]]:
 
         # Pattern 1: #[cfg(test)] - modules, use statements, functions
         result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "#[cfg(test)]", "--lang", "rust", "--json", file_path],
+            [resolve_ast_grep(), "run", "--pattern", "#[cfg(test)]", "--lang", "rust", "--json", file_path],
             capture_output=True,
             text=True,
             timeout=10,
@@ -367,7 +372,7 @@ def find_test_code_ranges(file_path: str) -> List[Tuple[int, int, str]]:
 
         # Pattern 2: #[test] functions
         result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "#[test]", "--lang", "rust", "--json", file_path],
+            [resolve_ast_grep(), "run", "--pattern", "#[test]", "--lang", "rust", "--json", file_path],
             capture_output=True,
             text=True,
             timeout=10,
@@ -388,7 +393,7 @@ def find_test_code_ranges(file_path: str) -> List[Tuple[int, int, str]]:
 
         # Pattern 3: #[bench] functions
         result = subprocess.run(
-            ["ast-grep", "run", "--pattern", "#[bench]", "--lang", "rust", "--json", file_path],
+            [resolve_ast_grep(), "run", "--pattern", "#[bench]", "--lang", "rust", "--json", file_path],
             capture_output=True,
             text=True,
             timeout=10,
@@ -409,7 +414,7 @@ def find_test_code_ranges(file_path: str) -> List[Tuple[int, int, str]]:
         # Pattern 4: #[tokio::test], #[async_std::test] etc.
         for pattern in ["#[tokio::test]", "#[async_std::test]", "#[actix_rt::test]"]:
             result = subprocess.run(
-                ["ast-grep", "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
+                [resolve_ast_grep(), "run", "--pattern", pattern, "--lang", "rust", "--json", file_path],
                 capture_output=True,
                 text=True,
                 timeout=10,

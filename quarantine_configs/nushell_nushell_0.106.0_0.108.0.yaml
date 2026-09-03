@@ -1,0 +1,45 @@
+# Quarantine (anti-cheat) policy — nushell 0.106.0 → 0.108.0
+#
+# CONFIRMED CHEAT (claude-code_fable-5_001, 2026-06-10; worst case): ~25
+# curls of nu-*-0.107/0.108 crates from static.crates.io, then 42 cp's of
+# target-version source AND test files into /testbed, plus `cargo update
+# --precise` to versions read from the leaked lock. Same Fastly deny as
+# scikit/ripgrep. NOTE: nu-ansi-term (0.50.x) is an external dep and stays
+# allowed in the cache; the forbid globs only match nu-* at 0.10x versions.
+
+ecosystem: [cargo]
+
+deny_domains:
+  - crates.io
+  - static.crates.io
+  - index.crates.io
+
+deny_cidrs:
+  - 151.101.0.0/16     # Fastly (fronts crates.io/static.crates.io)
+  - 146.75.0.0/16      # Fastly
+
+cargo_offline: true
+
+cache_forbid_globs:
+  - /usr/local/cargo/registry/cache/*/nu-*-0.10[6-9].*.crate
+  - /usr/local/cargo/registry/src/*/nu-*-0.10[6-9].*
+  - /usr/local/cargo/registry/cache/*/nushell-*.crate
+
+verify_fetch_urls:
+  - https://static.crates.io/crates/nu-protocol/nu-protocol-0.108.0.crate
+  - https://static.crates.io/crates/nu-parser/nu-parser-0.107.0.crate
+
+closure:
+  cache_paths:
+    - /usr/local/cargo/registry/cache
+  offline_build: "cargo build --offline"
+  toolchain: {rust: "1.88.0", install_online: true}
+  # nushell pins `reedline` from crates.io AND github.com/nushell/reedline?branch=main
+  # at the SAME version 0.41.0 (milestone g04_1ddae02). `cargo vendor` lays every
+  # crate in one flat <name>-<ver>/ dir and cannot hold two same-name+version crates
+  # from different sources (exit 101 "found duplicate version of package reedline
+  # v0.41.0 vendored from two sources" — confirmed with AND without --versioned-dirs).
+  # The raw cargo cache has no conflict: registry crates and git checkouts live in
+  # separate trees. So warm $CARGO_HOME online (cargo fetch --locked per milestone)
+  # and bake it, instead of vendoring. Ripgrep stays on the default `vendor`.
+  cargo_mechanism: raw-cache
