@@ -368,6 +368,7 @@ def test_evaluation_result_fail_loud_defaults():
         "enabled": False,
         "extensions": [],
         "keep_list": [],
+        "start_guard_exempt": [],
         "policy_source": "",
         "policy_sha256": "",
         "enablement_source": "",
@@ -724,3 +725,121 @@ def test_all_language_scikit_pyx_prunable_data_protected():
     assert not is_prunable("sklearn/utils/tests/test_unique.py", f, frozenset())
     assert not is_prunable("sklearn/datasets/data/iris.csv", f, frozenset())
     assert not is_prunable("sklearn/datasets/descr/iris.rst", f, frozenset())
+
+
+# ---------------------------------------------------------------------------
+# START-guard exemption for registration directories (prune_start_guard_exempt)
+# ---------------------------------------------------------------------------
+
+from harness.e2e.residue_prune import normalize_dir_prefixes  # noqa: E402
+
+MIG_GT = "db/migrations/20250701010108_add_multi_library_support.go"
+MIG_AGENT = "db/migrations/20250801000000_support_multiple_libraries.go"
+
+
+def test_dir_prefix_normalization():
+    assert normalize_dir_prefixes(["db/migrations", "./db/migrations/", " db/migrations// "]) == frozenset(
+        {"db/migrations/"}
+    )
+    assert normalize_dir_prefixes([]) == frozenset()
+    for bad in ["", "/", "../outside", "db/../../x"]:
+        with pytest.raises(ValueError):
+            normalize_dir_prefixes([bad])
+
+
+def test_start_guard_keeps_milestone_added_migration_by_default():
+    # navidrome milestone_003_sub-01: the reference adds MIG_GT at this very milestone;
+    # the agent wrote its own migration under another name.
+    f = make_filter()
+    start = {"db/migrations/20250701010107_add_mbid_indexes.go", "core/a.go"}
+    base = start | {MIG_GT}
+    tar = {"db/migrations/20250701010107_add_mbid_indexes.go", "core/a.go", MIG_AGENT}
+    assert compute_prune_set(base, tar, start, f, frozenset(), GO_ONLY) == []
+
+
+def test_start_guard_exempt_prunes_milestone_added_file_in_exempt_dir_only():
+    f = make_filter()
+    start = {"core/a.go", "plugins/wasm_base_plugin.go"}
+    base = start | {MIG_GT, "core/library.go"}  # both added by the reference at this milestone
+    tar = {"core/a.go", MIG_AGENT}
+    got = compute_prune_set(
+        base, tar, start, f, frozenset(), GO_ONLY,
+        start_guard_exempt=normalize_dir_prefixes(["db/migrations"]),
+    )
+    # the exempt directory loses the reference migration; core/library.go outside it is still guarded;
+    # START-tree residue is pruned as before
+    assert got == sorted([MIG_GT, "plugins/wasm_base_plugin.go"])
+
+
+def test_start_guard_exempt_keeps_never_delete_classes():
+    f = make_filter()
+    start = {"core/a.go"}
+    base = start | {
+        "db/migrations/20250701010108_add_multi_library_support.sql",  # non-code asset (go:embed)
+        "db/migrations/migration_test.go",                             # test file
+        "db/migrations/keep_me.go",                                    # keep-list
+    }
+    got = compute_prune_set(
+        base, {"core/a.go"}, start, f, frozenset({"db/migrations/keep_me.go"}), GO_ONLY,
+        start_guard_exempt=normalize_dir_prefixes(["db/migrations"]),
+    )
+    assert got == []
+
+
+def test_start_guard_exempt_does_not_match_sibling_prefix():
+    f = make_filter(src_dirs=["db/"])
+    start = set()
+    base = {"db/migrations_old/x.go", "db/migrations/y.go"}
+    got = compute_prune_set(
+        base, set(), start, f, frozenset(), GO_ONLY,
+        start_guard_exempt=normalize_dir_prefixes(["db/migrations"]),
+    )
+    assert got == ["db/migrations/y.go"]
+
+
+def test_pinned_repo_config_carries_start_guard_exempt():
+    from harness.e2e.evaluator import resolve_residue_prune_config
+
+    repo_config = {
+        "repo_src_dirs": ["db/", "core/"],
+        "test_dirs": ["**/*_test.go"],
+        "residue_prune": True,
+        "prune_extensions": [".go"],
+        "prune_keep_list": ["core/mock_library_service.go"],
+        "prune_start_guard_exempt": ["db/migrations"],
+    }
+    resolved = resolve_residue_prune_config(
+        repo_config, {}, repo_config_binding_mode="trial-pinned", repo_config_sha256="b" * 64
+    )
+    assert resolved.policy_source == "repo-config-pinned"
+    assert resolved.start_guard_exempt == frozenset({"db/migrations/"})
+
+    # declaring only the exemption still migrates authority to the frozen config
+    only = {"repo_src_dirs": ["db/"], "test_dirs": ["**/*_test.go"], "prune_start_guard_exempt": ["db/migrations"]}
+    resolved = resolve_residue_prune_config(
+        only, {"residue_prune": True}, repo_config_binding_mode="trial-pinned", repo_config_sha256="b" * 64
+    )
+    assert resolved.policy_source == "repo-config-pinned"
+    assert resolved.requested is False  # flag absent in the frozen config -> default-off
+
+    # absent everywhere -> empty exemption (historical behaviour)
+    legacy = resolve_residue_prune_config(
+        {}, {"repo_src_dirs": ["db/"], "test_dirs": ["**/*_test.go"], "residue_prune": True},
+        repo_config_binding_mode="trial-pinned", repo_config_sha256="b" * 64,
+    )
+    assert legacy.start_guard_exempt == frozenset()
+
+    with pytest.raises(ValueError):
+        resolve_residue_prune_config(
+            dict(repo_config, prune_start_guard_exempt="db/migrations"), {},
+            repo_config_binding_mode="trial-pinned", repo_config_sha256="b" * 64,
+        )
+
+
+def test_evaluation_result_round_trips_start_guard_exempt():
+    from harness.e2e.evaluator import EvaluationResult
+
+    d = _mk_result(residue_prune_enabled=True, residue_prune_start_guard_exempt=["db/migrations/"]).to_dict()
+    assert d["residue_prune"]["start_guard_exempt"] == ["db/migrations/"]
+    restored = EvaluationResult.from_result_dict(d)
+    assert restored.residue_prune_start_guard_exempt == ["db/migrations/"]

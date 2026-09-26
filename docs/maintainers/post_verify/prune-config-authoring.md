@@ -31,6 +31,7 @@ layer. This skill exists to author the fields.
 | `modifiable_test_patterns` | tests agents may legally rewrite | missed → agent's legal test edit is discarded at capture |
 | `prune_keep_list` | named fixture warts (exact paths, no globs) | missed → package-level collateral (navidrome `mock_library_service.go`: ~20 P2P unfairly lost) |
 | `prune_extensions` | optional language narrowing | normally omit — the multi-language default plus the non-code-extension guard is the intended universal behavior |
+| `prune_start_guard_exempt` | directories (exact repo-relative dirs, no globs) where the START provenance guard is lifted, so a milestone-added source file absent from the snapshot is pruned too | only for registration directories whose every file is live behaviour (goose migrations registered from `init()`); listing an ordinary package dir re-opens the contract-gap risk the guard exists for (spec §4) |
 | `residue_prune` | explicit enablement switch | absent or `false` → additive overlay (pruning disabled); set `true` only after the acceptance gate passes |
 
 ## Authoring procedure (per new range; all static, zero agent cost)
