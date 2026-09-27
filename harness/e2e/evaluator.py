@@ -56,6 +56,7 @@ from harness.e2e.residue_prune import (
     capture_filter_config,
     check_snapshot_integrity,
     compute_prune_set,
+    normalize_dir_prefixes,
     normalize_extensions,
     normalize_keep_list,
     normalize_tar_members,
@@ -756,6 +757,7 @@ class ResolvedResiduePruneConfig:
     src_filter: Optional[SrcFileFilter]
     policy_source: str
     policy_sha256: str
+    start_guard_exempt: FrozenSet[str] = frozenset()
 
 
 def _residue_string_list(config: dict, field: str) -> List[str]:
@@ -823,6 +825,9 @@ def resolve_residue_prune_config(
         else normalized_extensions
     )
     keep_list = normalize_keep_list(_residue_string_list(config, "prune_keep_list"))
+    start_guard_exempt = normalize_dir_prefixes(
+        _residue_string_list(config, "prune_start_guard_exempt")
+    )
 
     if has_partition:
         exclude_key = (
@@ -848,6 +853,7 @@ def resolve_residue_prune_config(
         src_filter=src_filter,
         policy_source=policy_source,
         policy_sha256=policy_sha256,
+        start_guard_exempt=start_guard_exempt,
     )
 
 
@@ -1842,6 +1848,7 @@ class EvaluationResult:
     residue_prune_enabled: bool = False
     residue_prune_extensions: List[str] = field(default_factory=list)
     residue_prune_keep_list: List[str] = field(default_factory=list)
+    residue_prune_start_guard_exempt: List[str] = field(default_factory=list)
     residue_prune_policy_source: str = ""
     residue_prune_policy_sha256: str = ""
     residue_prune_enablement_source: str = ""
@@ -2053,6 +2060,7 @@ class EvaluationResult:
             "enabled": self.residue_prune_enabled,
             "extensions": self.residue_prune_extensions,
             "keep_list": self.residue_prune_keep_list,
+            "start_guard_exempt": self.residue_prune_start_guard_exempt,
             "policy_source": self.residue_prune_policy_source,
             "policy_sha256": self.residue_prune_policy_sha256,
             "enablement_source": self.residue_prune_enablement_source,
@@ -2213,6 +2221,9 @@ class EvaluationResult:
             residue_prune_enabled=bool(residue.get("enabled") or False),
             residue_prune_extensions=list(residue.get("extensions") or []),
             residue_prune_keep_list=list(residue.get("keep_list") or []),
+            residue_prune_start_guard_exempt=list(
+                residue.get("start_guard_exempt") or []
+            ),
             residue_prune_policy_source=str(residue.get("policy_source") or ""),
             residue_prune_policy_sha256=str(residue.get("policy_sha256") or ""),
             residue_prune_enablement_source=str(
@@ -3035,6 +3046,7 @@ class PatchEvaluator:
         )
         prune_requested = residue_config.requested
         self.prune_keep_list = residue_config.keep_list
+        self.prune_start_guard_exempt = residue_config.start_guard_exempt
         self.prune_extensions = residue_config.extensions
         self._prune_filter = residue_config.src_filter
         self.residue_prune_policy_source = residue_config.policy_source
@@ -3085,6 +3097,7 @@ class PatchEvaluator:
             "residue_prune_enabled": self.residue_prune_enabled,
             "residue_prune_extensions": sorted(self.prune_extensions),
             "residue_prune_keep_list": sorted(self.prune_keep_list),
+            "residue_prune_start_guard_exempt": sorted(self.prune_start_guard_exempt),
             "residue_prune_policy_source": self.residue_prune_policy_source,
             "residue_prune_policy_sha256": self.residue_prune_policy_sha256,
             "residue_prune_enablement_source": self.residue_prune_enablement_source,
@@ -4678,7 +4691,10 @@ printf 'merged\n'
                 f"files missing from tar — recorded; pruning proceeds (if this is capture loss, re-capture)"
             )
 
-        # START provenance guard is active in phase 1b: GT-added files survive.
+        # START provenance guard is active in phase 1b: GT-added files survive,
+        # except under the configured registration directories
+        # (prune_start_guard_exempt), where a GT-added file the agent did not
+        # write is pruned too.
         prune_set = compute_prune_set(
             base_files,
             tar_files,
@@ -4687,6 +4703,7 @@ printf 'merged\n'
             self.prune_keep_list,
             extensions=self.prune_extensions,
             capture_excluded=capture_excluded,
+            start_guard_exempt=self.prune_start_guard_exempt,
         )
         meta["keep_list_hits"] = sorted((base_files - tar_files) & set(self.prune_keep_list))
         meta["pruned_files_count"] = 0
@@ -7104,6 +7121,9 @@ fi
             residue_prune_enabled=self._eval_meta["residue_prune_enabled"],
             residue_prune_extensions=self._eval_meta["residue_prune_extensions"],
             residue_prune_keep_list=self._eval_meta["residue_prune_keep_list"],
+            residue_prune_start_guard_exempt=self._eval_meta[
+                "residue_prune_start_guard_exempt"
+            ],
             residue_prune_policy_source=self._eval_meta[
                 "residue_prune_policy_source"
             ],
@@ -7555,6 +7575,9 @@ Example:
             "residue_prune_extensions", []
         )
         result.residue_prune_keep_list = meta.get("residue_prune_keep_list", [])
+        result.residue_prune_start_guard_exempt = meta.get(
+            "residue_prune_start_guard_exempt", []
+        )
         result.residue_prune_policy_source = meta.get(
             "residue_prune_policy_source", ""
         )

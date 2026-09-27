@@ -60,7 +60,7 @@ DEFAULT_PRUNE_EXTENSIONS: FrozenSet[str] = frozenset(
 # retain the legacy metadata.json policy so existing trials keep their original
 # semantics.
 RESIDUE_PRUNE_POLICY_FIELDS: FrozenSet[str] = frozenset(
-    {"residue_prune", "prune_extensions", "prune_keep_list"}
+    {"residue_prune", "prune_extensions", "prune_keep_list", "prune_start_guard_exempt"}
 )
 
 # Back-compat alias (old name).
@@ -175,6 +175,29 @@ def normalize_keep_list(entries: Iterable[str]) -> FrozenSet[str]:
         e = e.rstrip("/")
         if e:
             out.add(e)
+    return frozenset(out)
+
+
+def normalize_dir_prefixes(entries: Iterable[str]) -> FrozenSet[str]:
+    """Normalize START-guard exemption entries to repo-relative directory prefixes.
+
+    Each entry names a directory (``db/migrations`` or ``./db/migrations/``);
+    the result always ends with ``/`` so ``db/migrations/`` never matches a
+    sibling such as ``db/migrations_old/``. Empty entries, absolute paths and
+    ``..`` components are rejected: an exemption must stay inside the
+    repository's own tree.
+    """
+    out = set()
+    for e in entries:
+        e = e.strip()
+        if e.startswith("./"):
+            e = e[2:]
+        e = e.strip("/")
+        if not e:
+            raise ValueError("prune_start_guard_exempt entries must name a directory")
+        if e.startswith("/") or ".." in e.split("/"):
+            raise ValueError(f"prune_start_guard_exempt entry escapes the repository: {e!r}")
+        out.add(e + "/")
     return frozenset(out)
 
 
@@ -315,6 +338,7 @@ def compute_prune_set(
     keep_list: FrozenSet[str],
     extensions: FrozenSet[str] = DEFAULT_PRUNE_EXTENSIONS,
     capture_excluded: Optional[FrozenSet[str]] = None,
+    start_guard_exempt: FrozenSet[str] = frozenset(),
 ) -> List[str]:
     """Compute the files to delete from the assembled eval tree.
 
@@ -333,13 +357,25 @@ def compute_prune_set(
             agent deletion, so they must never be pruned — this is the
             independent witness that survives eval-vs-capture filter drift
             (review F2). None = no witness available (legacy tars).
+        start_guard_exempt: normalized directory prefixes (see
+            ``normalize_dir_prefixes``) where the START provenance guard is
+            lifted: a snapshot-absent source file under one of them is pruned
+            even when the milestone itself added it. Meant for registration
+            directories whose every file is loaded implicitly (goose
+            migrations registered from ``init()``), where a reference file the
+            agent did not write is live behaviour, not a passive library. The
+            v2 predicate, keep-list and V3b assertion still apply.
 
     Returns:
         Sorted list of paths to delete.
     """
     candidates = base_files - tar_files
     if start_files is not None:
-        candidates &= start_files
+        candidates = {
+            p
+            for p in candidates
+            if p in start_files or any(p.startswith(d) for d in start_guard_exempt)
+        }
     if capture_excluded:
         candidates -= capture_excluded
     return sorted(p for p in candidates if is_prunable(p, src_filter, keep_list, extensions))
